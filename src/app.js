@@ -10,6 +10,12 @@ const AUTH_TOKEN = process.env.AUTH_TOKEN || "change-me";
 const STORAGE_ROOT =
   process.env.STORAGE_ROOT || path.join(__dirname, "..", "storage");
 const TMP_DIR = path.join(STORAGE_ROOT, "_tmp");
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
+const ALLOWED_HEADERS =
+  process.env.ALLOWED_HEADERS || "content-type, x-api-key, authorization";
 
 const allowedTypes = ["kitap", "gazete", "dergi"];
 
@@ -94,6 +100,24 @@ const resolveType = (req) => {
 };
 
 app.use(express.json());
+
+app.use((req, res, next) => {
+  const requestOrigin = req.get("origin");
+  const originAllowed =
+    ALLOWED_ORIGINS.includes("*") ||
+    (requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin));
+
+  if (originAllowed) {
+    res.set("Access-Control-Allow-Origin", requestOrigin || "*");
+  }
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", ALLOWED_HEADERS);
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 const moveToFinal = (file, targetDir) =>
   new Promise((resolve, reject) => {

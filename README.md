@@ -8,6 +8,7 @@ Fotoğraf ve PDF yükleyebileceğiniz, public ve private alanları olan minimal 
 ```bash
 cp .env.example .env
 # AUTH_TOKEN'ı değiştir
+# Origin yetkisi için ALLOWED_ORIGINS'i kendi domainlerinle doldur (virgülle ayır)
 ```
 3) Bağımlılıklar:
 ```bash
@@ -38,6 +39,7 @@ npm run dev
 - İzin verilen MIME: `application/pdf`, `image/jpeg`, `image/png`, `image/webp`.
 - 20MB üstü dosyalar reddedilir.
 - Private dosyalar yalnızca `kitap` tipinde tutulur (`storage/kitap/private`).
+- CORS: `.env` içinde `ALLOWED_ORIGINS` (örn. `http://localhost:3000,https://cdn.yeniasyadigital.com`) ve `ALLOWED_HEADERS` (varsayılan `content-type,x-api-key,authorization`).
 
 ## Örnek istekler
 ```bash
