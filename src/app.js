@@ -7,7 +7,7 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
-const AUTH_TOKEN = "kPPm8b-12kA-9PxQ-YY822L";
+const AUTH_TOKEN = process.env.AUTH_TOKEN;
 // Resolve to absolute path so sendFile receives an absolute path.
 const STORAGE_ROOT = path.resolve(
   process.env.STORAGE_ROOT || path.join(__dirname, "..", "storage")
