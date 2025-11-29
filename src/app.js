@@ -7,7 +7,7 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
-const AUTH_TOKEN = process.env.AUTH_TOKEN;
+const AUTH_TOKEN = process.env.AUTH_TOKEN || "kPPm8b-12kA-9PxQ-YY822L";
 const STORAGE_ROOT =
   process.env.STORAGE_ROOT || path.join(__dirname, "..", "storage");
 const TMP_DIR = path.join(STORAGE_ROOT, "_tmp");
