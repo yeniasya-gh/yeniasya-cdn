@@ -22,6 +22,18 @@ const ALLOWED_HEADERS =
 
 const allowedTypes = ["kitap", "gazete", "dergi"];
 
+const parsePrivatePath = (input) => {
+  if (!input) return null;
+  const cleaned = String(input).trim();
+  const match = cleaned.match(/^\/?private\/([a-z]+)\/([^/]+)$/i);
+  if (!match) return null;
+  const type = match[1].toLowerCase();
+  if (!allowedTypes.includes(type)) return null;
+  const filename = path.basename(match[2]);
+  if (!filename.toLowerCase().endsWith(".pdf")) return null;
+  return { type, filename };
+};
+
 const paths = {
   kitap: {
     public: path.join(STORAGE_ROOT, "kitap", "public"),
@@ -218,6 +230,37 @@ app.get("/private/:type/:filename", requireAuth, (req, res) => {
     if (err) {
       return res.status(404).json({ ok: false, error: "File not found." });
     }
+    res.sendFile(filePath);
+  });
+});
+
+app.post("/private/view", requireAuth, (req, res) => {
+  const rawPath = req.body?.path || req.body?.pdf || req.body?.file;
+  const parsed = parsePrivatePath(rawPath);
+  if (!parsed) {
+    return res.status(400).json({
+      ok: false,
+      error: "path must be like /private/<type>/<file.pdf>",
+    });
+  }
+  const targetDir = paths[parsed.type]?.private;
+  if (!targetDir) {
+    return res.status(404).json({ ok: false, error: "Unknown type." });
+  }
+  const filePath = path.join(targetDir, parsed.filename);
+  fs.access(filePath, fs.constants.R_OK, (err) => {
+    if (err) {
+      return res.status(404).json({ ok: false, error: "File not found." });
+    }
+    res.set({
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `inline; filename="${parsed.filename}"`,
+      "Cache-Control": "no-store, no-cache, must-revalidate, private",
+      Pragma: "no-cache",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "SAMEORIGIN",
+      "Content-Security-Policy": "frame-ancestors 'self'",
+    });
     res.sendFile(filePath);
   });
 });

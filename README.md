@@ -33,6 +33,10 @@ npm run dev
   - Direkt erişim, auth yok.
 - `GET /private/:type/:filename`  
   - Header: `x-api-key: <AUTH_TOKEN>` veya `Authorization: Bearer <AUTH_TOKEN>`.
+- `POST /private/view`  
+  - JSON body: `{"path": "/private/<type>/<file.pdf>"}` (pdf uzantısı zorunlu).  
+  - Header: `x-api-key: <AUTH_TOKEN>` veya `Authorization: Bearer <AUTH_TOKEN>`.  
+  - PDF inline açılır, cache kapalı, frame-ancestors 'self'.
 - `GET /health` durumu kontrol eder.
 
 ## Kurallar
