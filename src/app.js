@@ -26,9 +26,11 @@ const paths = {
   },
   gazete: {
     public: path.join(STORAGE_ROOT, "gazete", "public"),
+    private: path.join(STORAGE_ROOT, "gazete", "private"),
   },
   dergi: {
     public: path.join(STORAGE_ROOT, "dergi", "public"),
+    private: path.join(STORAGE_ROOT, "dergi", "private"),
   },
 };
 
@@ -163,22 +165,22 @@ app.post("/upload/private", upload.single("file"), async (req, res, next) => {
         .status(400)
         .json({ ok: false, error: `type is required: ${allowedTypes.join(", ")}` });
     }
-    if (type !== "kitap") {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Private uploads allowed only for type kitap." });
-    }
     if (!req.file) {
       return res.status(400).json({ ok: false, error: "File is required." });
     }
-    const targetDir = paths.kitap.private;
+    const targetDir = paths[type]?.private;
+    if (!targetDir) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Private destination not configured for type." });
+    }
     const { filename } = await moveToFinal(req.file, targetDir);
     return res.json({
       ok: true,
       scope: "private",
       type,
       file: filename,
-      url: `/private/${filename}`,
+      url: `/private/${type}/${filename}`,
     });
   } catch (err) {
     next(err);
@@ -199,8 +201,16 @@ app.get("/public/:type/:filename", (req, res) => {
   });
 });
 
-app.get("/private/:filename", requireAuth, (req, res) => {
-  const filePath = path.join(paths.kitap.private, req.params.filename);
+app.get("/private/:type/:filename", requireAuth, (req, res) => {
+  const type = (req.params.type || "").toLowerCase();
+  if (!allowedTypes.includes(type)) {
+    return res.status(404).json({ ok: false, error: "Unknown type." });
+  }
+  const targetDir = paths[type]?.private;
+  if (!targetDir) {
+    return res.status(404).json({ ok: false, error: "Private destination missing." });
+  }
+  const filePath = path.join(targetDir, req.params.filename);
   fs.access(filePath, fs.constants.R_OK, (err) => {
     if (err) {
       return res.status(404).json({ ok: false, error: "File not found." });

@@ -26,19 +26,19 @@ npm run dev
   - Form-data alanları: `file` (foto/pdf), `type` (kitap|gazete|dergi).  
   - Dosya yolları: `storage/<type>/public/`.
 - `POST /upload/private`  
-  - Form-data: `file` ve `type=kitap` zorunlu.  
-  - Dosya yolu: `storage/kitap/private/`.  
-  - Yanıt `url` değeri: `/private/<filename>`.
+  - Form-data: `file` ve `type` (kitap|gazete|dergi).  
+  - Dosya yolu: `storage/<type>/private/`.  
+  - Yanıt `url` değeri: `/private/<type>/<filename>`.
 - `GET /public/:type/:filename`  
   - Direkt erişim, auth yok.
-- `GET /private/:filename`  
+- `GET /private/:type/:filename`  
   - Header: `x-api-key: <AUTH_TOKEN>` veya `Authorization: Bearer <AUTH_TOKEN>`.
 - `GET /health` durumu kontrol eder.
 
 ## Kurallar
 - İzin verilen MIME: `application/pdf`, `image/jpeg`, `image/png`, `image/webp`.
 - 20MB üstü dosyalar reddedilir.
-- Private dosyalar yalnızca `kitap` tipinde tutulur (`storage/kitap/private`).
+- Private dosyalar `storage/<type>/private` dizinlerine yazılır.
 - CORS: `.env` içinde `ALLOWED_ORIGINS` (örn. `http://localhost:3000,https://cdn.yeniasyadigital.com`) ve `ALLOWED_HEADERS` (varsayılan `content-type,x-api-key,authorization`).
 
 ## Örnek istekler
