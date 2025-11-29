@@ -1,12 +1,13 @@
 "use strict";
 
+require("dotenv").config();
 const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
-const AUTH_TOKEN = process.env.AUTH_TOKEN || "change-me";
+const AUTH_TOKEN = process.env.AUTH_TOKEN;
 const STORAGE_ROOT =
   process.env.STORAGE_ROOT || path.join(__dirname, "..", "storage");
 const TMP_DIR = path.join(STORAGE_ROOT, "_tmp");
