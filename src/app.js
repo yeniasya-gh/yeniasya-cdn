@@ -9,6 +9,7 @@ const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "change-me";
 const STORAGE_ROOT =
   process.env.STORAGE_ROOT || path.join(__dirname, "..", "storage");
+const TMP_DIR = path.join(STORAGE_ROOT, "_tmp");
 
 const allowedTypes = ["kitap", "gazete", "dergi"];
 
@@ -33,6 +34,7 @@ function ensureDirs() {
       fs.mkdirSync(dirPath, { recursive: true });
     });
   });
+  fs.mkdirSync(TMP_DIR, { recursive: true });
 }
 
 ensureDirs();
@@ -54,11 +56,8 @@ const fileFilter = (req, file, cb) => {
 };
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    if (!req.uploadDest) {
-      return cb(new Error("Upload destination not set."));
-    }
-    cb(null, req.uploadDest);
+  destination: (_req, _file, cb) => {
+    cb(null, TMP_DIR);
   },
   filename: (req, file, cb) => {
     const safeName = file.originalname.replace(/\s+/g, "_");
@@ -87,74 +86,80 @@ const requireAuth = (req, res, next) => {
 };
 
 const resolveType = (req) => {
-  const type = (req.body.type || req.query.type || "").toLowerCase();
+  const type = (req.body?.type || req.query?.type || "").toLowerCase();
   if (!allowedTypes.includes(type)) {
     return null;
   }
   return type;
 };
 
-const prepareUpload = (destResolver) => (req, res, next) => {
-  const type = resolveType(req);
-  if (!type) {
-    return res
-      .status(400)
-      .json({ ok: false, error: `type is required: ${allowedTypes.join(", ")}` });
-  }
-  const dest = destResolver(type);
-  if (!dest) {
-    return res.status(400).json({ ok: false, error: "Invalid destination." });
-  }
-  fs.mkdirSync(dest, { recursive: true });
-  req.uploadDest = dest;
-  req.uploadType = type;
-  next();
-};
-
 app.use(express.json());
 
-app.post(
-  "/upload/public",
-  prepareUpload((type) => paths[type].public),
-  upload.single("file"),
-  (req, res) => {
+const moveToFinal = (file, targetDir) =>
+  new Promise((resolve, reject) => {
+    const tmpPath = file.path || path.join(file.destination, file.filename);
+    const finalPath = path.join(targetDir, file.filename);
+    fs.mkdirSync(targetDir, { recursive: true });
+    fs.rename(tmpPath, finalPath, (err) => {
+      if (err) return reject(err);
+      resolve({ finalPath, filename: path.basename(finalPath) });
+    });
+  });
+
+app.post("/upload/public", upload.single("file"), async (req, res, next) => {
+  try {
+    const type = resolveType(req);
+    if (!type) {
+      return res
+        .status(400)
+        .json({ ok: false, error: `type is required: ${allowedTypes.join(", ")}` });
+    }
     if (!req.file) {
       return res.status(400).json({ ok: false, error: "File is required." });
     }
-
+    const targetDir = paths[type].public;
+    const { filename } = await moveToFinal(req.file, targetDir);
     return res.json({
       ok: true,
       scope: "public",
-      type: req.uploadType,
-      file: req.file.filename,
-      url: `/public/${req.uploadType}/${req.file.filename}`,
+      type,
+      file: filename,
+      url: `/public/${type}/${filename}`,
     });
+  } catch (err) {
+    next(err);
   }
-);
+});
 
-app.post(
-  "/upload/private",
-  prepareUpload((type) => {
-    if (type !== "kitap") {
-      return null;
+app.post("/upload/private", upload.single("file"), async (req, res, next) => {
+  try {
+    const type = resolveType(req);
+    if (!type) {
+      return res
+        .status(400)
+        .json({ ok: false, error: `type is required: ${allowedTypes.join(", ")}` });
     }
-    return paths.kitap.private;
-  }),
-  upload.single("file"),
-  (req, res) => {
+    if (type !== "kitap") {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Private uploads allowed only for type kitap." });
+    }
     if (!req.file) {
       return res.status(400).json({ ok: false, error: "File is required." });
     }
-
+    const targetDir = paths.kitap.private;
+    const { filename } = await moveToFinal(req.file, targetDir);
     return res.json({
       ok: true,
       scope: "private",
-      type: req.uploadType,
-      file: req.file.filename,
-      url: `/private/${req.file.filename}`,
+      type,
+      file: filename,
+      url: `/private/${filename}`,
     });
+  } catch (err) {
+    next(err);
   }
-);
+});
 
 app.get("/public/:type/:filename", (req, res) => {
   const type = (req.params.type || "").toLowerCase();
