@@ -22,6 +22,20 @@ const ALLOWED_HEADERS =
 
 const allowedTypes = ["kitap", "gazete", "dergi"];
 
+// Basic request/response logger to surface hung/slow requests.
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on("finish", () => {
+    const durationMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+    console.log(
+      `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${durationMs.toFixed(
+        1
+      )}ms)`
+    );
+  });
+  next();
+});
+
 const parsePrivatePath = (input) => {
   if (!input) return null;
   const cleaned = String(input).trim();
@@ -212,7 +226,14 @@ app.get("/public/:type/:filename", (req, res) => {
     if (err) {
       return res.status(404).json({ ok: false, error: "File not found." });
     }
-    res.sendFile(filePath);
+    res.sendFile(filePath, (sendErr) => {
+      if (sendErr) {
+        console.error(sendErr);
+        if (!res.headersSent) {
+          res.status(500).json({ ok: false, error: "File send failed." });
+        }
+      }
+    });
   });
 });
 
@@ -230,7 +251,14 @@ app.get("/private/:type/:filename", requireAuth, (req, res) => {
     if (err) {
       return res.status(404).json({ ok: false, error: "File not found." });
     }
-    res.sendFile(filePath);
+    res.sendFile(filePath, (sendErr) => {
+      if (sendErr) {
+        console.error(sendErr);
+        if (!res.headersSent) {
+          res.status(500).json({ ok: false, error: "File send failed." });
+        }
+      }
+    });
   });
 });
 
@@ -261,7 +289,14 @@ app.post("/private/view", requireAuth, (req, res) => {
       "X-Frame-Options": "SAMEORIGIN",
       "Content-Security-Policy": "frame-ancestors 'self'",
     });
-    res.sendFile(filePath);
+    res.sendFile(filePath, (sendErr) => {
+      if (sendErr) {
+        console.error(sendErr);
+        if (!res.headersSent) {
+          res.status(500).json({ ok: false, error: "File send failed." });
+        }
+      }
+    });
   });
 });
 
