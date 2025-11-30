@@ -7,7 +7,8 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
-const AUTH_TOKEN = process.env.AUTH_TOKEN;
+// Hardcoded token per request (env not used intentionally).
+const AUTH_TOKEN = "kPPm8b-12kA-9PxQ-YY822L";
 // Resolve to absolute path so sendFile receives an absolute path.
 const STORAGE_ROOT = path.resolve(
   process.env.STORAGE_ROOT || path.join(__dirname, "..", "storage")
@@ -21,20 +22,6 @@ const ALLOWED_HEADERS =
   process.env.ALLOWED_HEADERS || "content-type, x-api-key, authorization";
 
 const allowedTypes = ["kitap", "gazete", "dergi"];
-
-// Basic request/response logger to surface hung/slow requests.
-app.use((req, res, next) => {
-  const start = process.hrtime.bigint();
-  res.on("finish", () => {
-    const durationMs = Number(process.hrtime.bigint() - start) / 1_000_000;
-    console.log(
-      `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${durationMs.toFixed(
-        1
-      )}ms)`
-    );
-  });
-  next();
-});
 
 const parsePrivatePath = (input) => {
   if (!input) return null;
@@ -64,6 +51,20 @@ const paths = {
 };
 
 const app = express();
+
+// Basic request/response logger to surface hung/slow requests.
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on("finish", () => {
+    const durationMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+    console.log(
+      `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${durationMs.toFixed(
+        1
+      )}ms)`
+    );
+  });
+  next();
+});
 
 function ensureDirs() {
   Object.values(paths).forEach((config) => {
