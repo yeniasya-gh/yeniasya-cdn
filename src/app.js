@@ -5,6 +5,7 @@ const express = require("express");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const PORT = process.env.PORT || 3000;
 // Hardcoded token per request (env not used intentionally).
@@ -98,9 +99,12 @@ const storage = multer.diskStorage({
     cb(null, TMP_DIR);
   },
   filename: (req, file, cb) => {
-    const safeName = file.originalname.replace(/\s+/g, "_");
+    // Add a UUID to avoid collisions when multiple uploads land in the same ms.
+    const ext = path.extname(file.originalname);
+    const base = path.basename(file.originalname, ext).replace(/\s+/g, "_");
+    const unique = crypto.randomUUID();
     const stamp = Date.now();
-    cb(null, `${stamp}-${safeName}`);
+    cb(null, `${stamp}-${unique}-${base}${ext}`);
   },
 });
 
@@ -150,6 +154,18 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+const serveFile = (filePath, res, extraHeaders = {}) => {
+  Object.entries(extraHeaders).forEach(([key, value]) => res.set(key, value));
+  res.sendFile(filePath, (sendErr) => {
+    if (sendErr) {
+      console.error(`sendFile error for ${filePath}:`, sendErr);
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: "File send failed." });
+      }
+    }
+  });
+};
 
 const moveToFinal = (file, targetDir) =>
   new Promise((resolve, reject) => {
@@ -223,18 +239,34 @@ app.get("/public/:type/:filename", (req, res) => {
     return res.status(404).json({ ok: false, error: "Unknown type." });
   }
   const filePath = path.join(paths[type].public, req.params.filename);
-  fs.access(filePath, fs.constants.R_OK, (err) => {
+  fs.stat(filePath, (err, stats) => {
     if (err) {
+      console.warn(`Public file missing: ${filePath}`);
       return res.status(404).json({ ok: false, error: "File not found." });
     }
-    res.sendFile(filePath, (sendErr) => {
-      if (sendErr) {
-        console.error(sendErr);
-        if (!res.headersSent) {
-          res.status(500).json({ ok: false, error: "File send failed." });
-        }
-      }
-    });
+
+    const etag = `W/"${stats.size}-${stats.mtimeMs}"`;
+    const lastModified = stats.mtime.toUTCString();
+    const ifNoneMatch = req.get("if-none-match");
+    const ifModifiedSince = req.get("if-modified-since");
+    const notModifiedByEtag = ifNoneMatch && ifNoneMatch === etag;
+    const notModifiedByDate =
+      ifModifiedSince &&
+      !Number.isNaN(Date.parse(ifModifiedSince)) &&
+      new Date(ifModifiedSince).getTime() >= stats.mtimeMs;
+
+    const cacheHeaders = {
+      "Cache-Control": "public, max-age=3600, must-revalidate",
+      ETag: etag,
+      "Last-Modified": lastModified,
+    };
+
+    if (notModifiedByEtag || notModifiedByDate) {
+      res.set(cacheHeaders);
+      return res.status(304).end();
+    }
+
+    serveFile(filePath, res, cacheHeaders);
   });
 });
 
@@ -250,16 +282,10 @@ app.get("/private/:type/:filename", requireAuth, (req, res) => {
   const filePath = path.join(targetDir, req.params.filename);
   fs.access(filePath, fs.constants.R_OK, (err) => {
     if (err) {
+      console.warn(`Private file missing: ${filePath}`);
       return res.status(404).json({ ok: false, error: "File not found." });
     }
-    res.sendFile(filePath, (sendErr) => {
-      if (sendErr) {
-        console.error(sendErr);
-        if (!res.headersSent) {
-          res.status(500).json({ ok: false, error: "File send failed." });
-        }
-      }
-    });
+    serveFile(filePath, res);
   });
 });
 
