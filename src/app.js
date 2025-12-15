@@ -22,6 +22,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
 const ALLOWED_HEADERS =
   process.env.ALLOWED_HEADERS || "content-type, x-api-key, authorization";
 const ALLOWED_METHODS = "GET, POST, OPTIONS";
+const VIEW_TOKEN_SECRET = process.env.VIEW_TOKEN_SECRET || AUTH_TOKEN;
+const VIEW_TOKEN_TTL_MIN = Number(process.env.VIEW_TOKEN_TTL_MIN || "5");
 
 const allowedTypes = ["kitap", "gazete", "dergi"];
 
@@ -169,6 +171,41 @@ const buildCorsHeaders = (req) => {
     "Access-Control-Allow-Methods": ALLOWED_METHODS,
     "Access-Control-Allow-Headers": ALLOWED_HEADERS,
   };
+};
+
+const signViewToken = (payload) => {
+  const serialized = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto
+    .createHmac("sha256", VIEW_TOKEN_SECRET)
+    .update(serialized)
+    .digest("base64url");
+  return `${serialized}.${signature}`;
+};
+
+const verifyViewToken = (token) => {
+  if (!token || typeof token !== "string" || !token.includes(".")) {
+    return { ok: false, error: "Invalid token." };
+  }
+  const [payloadB64, signature] = token.split(".");
+  const expectedSig = crypto
+    .createHmac("sha256", VIEW_TOKEN_SECRET)
+    .update(payloadB64)
+    .digest("base64url");
+  if (signature !== expectedSig) {
+    return { ok: false, error: "Signature mismatch." };
+  }
+  try {
+    const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString());
+    if (!payload?.path || !payload?.exp) {
+      return { ok: false, error: "Token payload missing fields." };
+    }
+    if (Date.now() > Number(payload.exp)) {
+      return { ok: false, error: "Token expired." };
+    }
+    return { ok: true, payload };
+  } catch (err) {
+    return { ok: false, error: "Token parse failed." };
+  }
 };
 
 const serveFile = (filePath, res, extraHeaders = {}) => {
@@ -405,6 +442,76 @@ app.get("/private/view-file", requireAuth, (req, res) => {
 </html>`;
 
     res.send(html);
+  });
+});
+
+app.post("/private/view-token", requireAuth, (req, res) => {
+  const rawPath = req.body?.path || req.body?.pdf || req.body?.file;
+  const parsed = parsePrivatePath(rawPath);
+  if (!parsed) {
+    return res.status(400).json({
+      ok: false,
+      error: "path must be like /private/<type>/<file.pdf>",
+    });
+  }
+  if (!VIEW_TOKEN_SECRET) {
+    return res.status(500).json({ ok: false, error: "VIEW_TOKEN_SECRET missing." });
+  }
+  const ttlMinutes =
+    Number.isFinite(VIEW_TOKEN_TTL_MIN) && VIEW_TOKEN_TTL_MIN > 0
+      ? VIEW_TOKEN_TTL_MIN
+      : 5;
+  const exp = Date.now() + ttlMinutes * 60_000;
+  const payload = { path: `/private/${parsed.type}/${parsed.filename}`, exp };
+  const token = signViewToken(payload);
+  const url = `/private/view-secure?token=${encodeURIComponent(token)}`;
+  return res.json({
+    ok: true,
+    url,
+    token,
+    expiresAt: new Date(exp).toISOString(),
+    ttlMinutes,
+  });
+});
+
+app.get("/private/view-secure", (req, res) => {
+  const token = req.query?.token;
+  const validation = verifyViewToken(token);
+  if (!validation.ok) {
+    return res.status(401).json({ ok: false, error: validation.error || "Unauthorized." });
+  }
+  const parsed = parsePrivatePath(validation.payload.path);
+  if (!parsed) {
+    return res.status(400).json({ ok: false, error: "Invalid token path." });
+  }
+  const targetDir = paths[parsed.type]?.private;
+  if (!targetDir) {
+    return res.status(404).json({ ok: false, error: "Unknown type." });
+  }
+  const filePath = path.join(targetDir, parsed.filename);
+  fs.access(filePath, fs.constants.R_OK, (err) => {
+    if (err) {
+      return res.status(404).json({ ok: false, error: "File not found." });
+    }
+    const corsHeaders = buildCorsHeaders(req);
+    res.set({
+      ...corsHeaders,
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `inline; filename=\"${parsed.filename}\"`,
+      "Cache-Control": "no-store, no-cache, must-revalidate, private",
+      Pragma: "no-cache",
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "SAMEORIGIN",
+      "Content-Security-Policy": "frame-ancestors 'self'",
+    });
+    res.sendFile(filePath, (sendErr) => {
+      if (sendErr) {
+        console.error(sendErr);
+        if (!res.headersSent) {
+          res.status(500).json({ ok: false, error: "File send failed." });
+        }
+      }
+    });
   });
 });
 
