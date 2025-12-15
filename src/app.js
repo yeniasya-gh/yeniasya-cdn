@@ -21,6 +21,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
   .filter(Boolean);
 const ALLOWED_HEADERS =
   process.env.ALLOWED_HEADERS || "content-type, x-api-key, authorization";
+const ALLOWED_METHODS = "GET, POST, OPTIONS";
 
 const allowedTypes = ["kitap", "gazete", "dergi"];
 
@@ -146,7 +147,7 @@ app.use((req, res, next) => {
   if (originAllowed) {
     res.set("Access-Control-Allow-Origin", requestOrigin || "*");
   }
-  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.set("Access-Control-Allow-Methods", ALLOWED_METHODS);
   res.set("Access-Control-Allow-Headers", ALLOWED_HEADERS);
 
   if (req.method === "OPTIONS") {
@@ -285,7 +286,20 @@ app.get("/private/:type/:filename", requireAuth, (req, res) => {
       console.warn(`Private file missing: ${filePath}`);
       return res.status(404).json({ ok: false, error: "File not found." });
     }
-    serveFile(filePath, res);
+    const requestOrigin = req.get("origin");
+    const originAllowed =
+      ALLOWED_ORIGINS.includes("*") ||
+      (requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin));
+
+    const corsHeaders = originAllowed
+      ? {
+          "Access-Control-Allow-Origin": requestOrigin || "*",
+          "Access-Control-Allow-Methods": ALLOWED_METHODS,
+          "Access-Control-Allow-Headers": ALLOWED_HEADERS,
+        }
+      : {};
+
+    serveFile(filePath, res, corsHeaders);
   });
 });
 
@@ -307,7 +321,21 @@ app.post("/private/view", requireAuth, (req, res) => {
     if (err) {
       return res.status(404).json({ ok: false, error: "File not found." });
     }
+    const requestOrigin = req.get("origin");
+    const originAllowed =
+      ALLOWED_ORIGINS.includes("*") ||
+      (requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin));
+
+    const corsHeaders = originAllowed
+      ? {
+          "Access-Control-Allow-Origin": requestOrigin || "*",
+          "Access-Control-Allow-Methods": ALLOWED_METHODS,
+          "Access-Control-Allow-Headers": ALLOWED_HEADERS,
+        }
+      : {};
+
     res.set({
+      ...corsHeaders,
       "Content-Type": "application/pdf",
       "Content-Disposition": `inline; filename="${parsed.filename}"`,
       "Cache-Control": "no-store, no-cache, must-revalidate, private",
