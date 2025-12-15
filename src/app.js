@@ -156,6 +156,21 @@ app.use((req, res, next) => {
   next();
 });
 
+const buildCorsHeaders = (req) => {
+  const requestOrigin = req.get("origin");
+  const originAllowed =
+    ALLOWED_ORIGINS.includes("*") ||
+    (requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin));
+
+  if (!originAllowed) return {};
+
+  return {
+    "Access-Control-Allow-Origin": requestOrigin || "*",
+    "Access-Control-Allow-Methods": ALLOWED_METHODS,
+    "Access-Control-Allow-Headers": ALLOWED_HEADERS,
+  };
+};
+
 const serveFile = (filePath, res, extraHeaders = {}) => {
   Object.entries(extraHeaders).forEach(([key, value]) => res.set(key, value));
   res.sendFile(filePath, (sendErr) => {
@@ -286,19 +301,7 @@ app.get("/private/:type/:filename", requireAuth, (req, res) => {
       console.warn(`Private file missing: ${filePath}`);
       return res.status(404).json({ ok: false, error: "File not found." });
     }
-    const requestOrigin = req.get("origin");
-    const originAllowed =
-      ALLOWED_ORIGINS.includes("*") ||
-      (requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin));
-
-    const corsHeaders = originAllowed
-      ? {
-          "Access-Control-Allow-Origin": requestOrigin || "*",
-          "Access-Control-Allow-Methods": ALLOWED_METHODS,
-          "Access-Control-Allow-Headers": ALLOWED_HEADERS,
-        }
-      : {};
-
+    const corsHeaders = buildCorsHeaders(req);
     serveFile(filePath, res, corsHeaders);
   });
 });
@@ -321,18 +324,7 @@ app.post("/private/view", requireAuth, (req, res) => {
     if (err) {
       return res.status(404).json({ ok: false, error: "File not found." });
     }
-    const requestOrigin = req.get("origin");
-    const originAllowed =
-      ALLOWED_ORIGINS.includes("*") ||
-      (requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin));
-
-    const corsHeaders = originAllowed
-      ? {
-          "Access-Control-Allow-Origin": requestOrigin || "*",
-          "Access-Control-Allow-Methods": ALLOWED_METHODS,
-          "Access-Control-Allow-Headers": ALLOWED_HEADERS,
-        }
-      : {};
+    const corsHeaders = buildCorsHeaders(req);
 
     res.set({
       ...corsHeaders,
@@ -352,6 +344,67 @@ app.post("/private/view", requireAuth, (req, res) => {
         }
       }
     });
+  });
+});
+
+app.get("/private/view-file", requireAuth, (req, res) => {
+  const rawPath = req.query?.path || req.query?.pdf || req.query?.file;
+  const parsed = parsePrivatePath(rawPath);
+  if (!parsed) {
+    return res.status(400).json({
+      ok: false,
+      error: "path must be like /private/<type>/<file.pdf>",
+    });
+  }
+  const targetDir = paths[parsed.type]?.private;
+  if (!targetDir) {
+    return res.status(404).json({ ok: false, error: "Unknown type." });
+  }
+
+  const filePath = path.join(targetDir, parsed.filename);
+  fs.readFile(filePath, (err, data) => {
+    if (err) {
+      console.warn(`Private file missing for view-file: ${filePath}`);
+      return res.status(404).json({ ok: false, error: "File not found." });
+    }
+
+    const corsHeaders = buildCorsHeaders(req);
+    const base64 = data.toString("base64");
+    const dataUrl = `data:application/pdf;base64,${base64}`;
+    const safeTitle = parsed.filename.replace(/"/g, "");
+
+    res.set({
+      ...corsHeaders,
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store, no-cache, must-revalidate, private",
+      Pragma: "no-cache",
+      "X-Content-Type-Options": "nosniff",
+    });
+
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${safeTitle}</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #111; }
+    .viewer { position: fixed; inset: 0; background: #1b1b1b; }
+    .viewer embed, .viewer object, .viewer iframe { width: 100%; height: 100%; border: none; }
+    .fallback { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #eee; font-family: sans-serif; text-align: center; }
+    .link { color: #7fd7ff; }
+  </style>
+</head>
+<body>
+  <div class="viewer">
+    <embed src="${dataUrl}" type="application/pdf" />
+    <div class="fallback">PDF görüntülenemedi. <a class="link" href="${dataUrl}" download="${safeTitle}">İndir</a></div>
+  </div>
+</body>
+</html>`;
+
+    res.send(html);
   });
 });
 
