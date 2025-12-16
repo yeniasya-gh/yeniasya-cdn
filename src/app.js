@@ -31,6 +31,7 @@ const FRAME_ANCESTORS = (process.env.ALLOWED_FRAME_ANCESTORS || "*")
   .filter(Boolean);
 const FRAME_ANCESTORS_DIRECTIVE =
   FRAME_ANCESTORS.length === 0 ? "'none'" : FRAME_ANCESTORS.join(" ");
+const PUBLIC_ROOT = path.join(__dirname, "..", "public");
 const MAIL_SETTINGS = {
   host: process.env.MAIL_HOST || "mail.yeniasya.com.tr",
   port: Number(process.env.MAIL_PORT || "587"),
@@ -184,6 +185,7 @@ const mailTransporter = nodemailer.createTransport({
 });
 
 app.use(express.json());
+app.use(express.static(PUBLIC_ROOT));
 
 app.use((req, res, next) => {
   const requestOrigin = req.get("origin");
@@ -568,14 +570,14 @@ app.get("/private/view-secure", (req, res) => {
     .label { font-size: 12px; opacity: 0.7; }
     .controls { display: inline-flex; align-items: center; gap: 8px; }
   </style>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.min.js" integrity="sha512-u+I4/7jqOPxw6c2FQ93IggvAN8lsq5w5+nx1CCPpnvEmPaoxriq8IV3UzjpuQZHRYdFJX0E2wzKtzew/1/veaw==" crossorigin="anonymous"></script>
-  <script>
+  <script type="module">
+    import * as pdfjsLib from "/pdfjs/pdf.min.mjs";
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs";
+
     const rawUrl = ${JSON.stringify(rawUrl)};
     const docKey = "pdf-progress:" + ${JSON.stringify(parsed.filename)};
     const startPage = ${pageParam || "null"};
     const startZoom = ${initialZoom};
-    const pdfjsLib = window["pdfjs-dist/build/pdf"];
-    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.min.js";
 
     let pdfDoc = null;
     let pageNum = startPage || Number(localStorage.getItem(docKey)) || 1;
