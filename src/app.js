@@ -539,13 +539,7 @@ app.get("/private/view-secure", (req, res) => {
     }
     const corsHeaders = buildCorsHeaders(req);
     if (preferViewer) {
-      const fragmentParts = [];
-      if (pageParam) fragmentParts.push(`page=${pageParam}`);
-      fragmentParts.push("toolbar=0", "navpanes=0", "scrollbar=1");
-      const fragment = `#${fragmentParts.join("&")}`;
-      const rawUrl = `${req.path}?token=${encodeURIComponent(token)}&render=raw${
-        pageParam ? `&page=${pageParam}` : ""
-      }${fragment}`;
+      const rawUrl = `${req.path}?token=${encodeURIComponent(token)}&render=raw`;
       const html = `<!doctype html>
 <html lang="tr">
 <head>
@@ -553,14 +547,113 @@ app.get("/private/view-secure", (req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>${parsed.filename}</title>
   <style>
-    html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #0f1115; }
-    .viewer { position: fixed; inset: 0; background: #0f1115; }
-    .viewer embed { width: 100%; height: 100%; border: none; }
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #0f1115; color: #dfe7ff; font-family: "Inter", "Segoe UI", sans-serif; }
+    .chrome { position: fixed; top: 0; left: 0; right: 0; height: 56px; display: flex; align-items: center; gap: 12px; padding: 0 16px; background: rgba(12,14,20,0.9); border-bottom: 1px solid #1f2533; backdrop-filter: blur(6px); z-index: 10; }
+    .title { font-size: 14px; font-weight: 600; color: #9fb4ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .spacer { flex: 1; }
+    .pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; background: #1a2232; border: 1px solid #202a3d; font-size: 13px; color: #c7d2ff; }
+    button { cursor: pointer; background: #2b3650; border: 1px solid #3a4670; color: #dfe7ff; padding: 6px 10px; border-radius: 8px; font-size: 13px; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .canvas-wrap { position: absolute; inset: 56px 0 0 0; overflow: auto; display: flex; justify-content: center; background: #0f1115; }
+    #pdf-canvas { margin: 16px auto 32px auto; box-shadow: 0 16px 48px rgba(0,0,0,0.35); border-radius: 6px; }
   </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.min.js" integrity="sha512-u+I4/7jqOPxw6c2FQ93IggvAN8lsq5w5+nx1CCPpnvEmPaoxriq8IV3UzjpuQZHRYdFJX0E2wzKtzew/1/veaw==" crossorigin="anonymous"></script>
+  <script>
+    const rawUrl = ${JSON.stringify(rawUrl)};
+    const docKey = "pdf-progress:" + ${JSON.stringify(parsed.filename)};
+    const startPage = ${pageParam || "null"};
+    const pdfjsLib = window["pdfjs-dist/build/pdf"];
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.min.js";
+
+    let pdfDoc = null;
+    let pageNum = startPage || Number(localStorage.getItem(docKey)) || 1;
+    let pageRendering = false;
+    let pageNumPending = null;
+    const scale = 1.2;
+
+    async function fetchPdf() {
+      const resp = await fetch(rawUrl);
+      if (!resp.ok) throw new Error("PDF fetch failed");
+      const data = await resp.arrayBuffer();
+      return pdfjsLib.getDocument({ data }).promise;
+    }
+
+    function renderPage(num) {
+      pageRendering = true;
+      pdfDoc.getPage(num).then(function(page) {
+        const viewport = page.getViewport({ scale });
+        const canvas = document.getElementById("pdf-canvas");
+        const ctx = canvas.getContext("2d");
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+
+        const renderContext = { canvasContext: ctx, viewport };
+        const renderTask = page.render(renderContext);
+
+        renderTask.promise.then(function() {
+          pageRendering = false;
+          document.getElementById("page-num").textContent = num;
+          document.getElementById("page-count").textContent = pdfDoc.numPages;
+          document.getElementById("prev").disabled = num <= 1;
+          document.getElementById("next").disabled = num >= pdfDoc.numPages;
+          localStorage.setItem(docKey, String(num));
+          if (pageNumPending !== null) {
+            renderPage(pageNumPending);
+            pageNumPending = null;
+          }
+        });
+      });
+    }
+
+    function queueRenderPage(num) {
+      if (pageRendering) {
+        pageNumPending = num;
+      } else {
+        renderPage(num);
+      }
+    }
+
+    function onPrevPage() {
+      if (pageNum <= 1) return;
+      pageNum--;
+      queueRenderPage(pageNum);
+    }
+
+    function onNextPage() {
+      if (pageNum >= pdfDoc.numPages) return;
+      pageNum++;
+      queueRenderPage(pageNum);
+    }
+
+    window.addEventListener("DOMContentLoaded", async () => {
+      document.getElementById("prev").addEventListener("click", onPrevPage);
+      document.getElementById("next").addEventListener("click", onNextPage);
+      try {
+        pdfDoc = await fetchPdf();
+        if (pageNum > pdfDoc.numPages) pageNum = pdfDoc.numPages;
+        renderPage(pageNum);
+      } catch (err) {
+        document.getElementById("status").textContent = "PDF yüklenemedi";
+        console.error(err);
+      }
+    });
+  </script>
 </head>
 <body>
-  <div class="viewer">
-    <embed src="${rawUrl}" type="application/pdf" />
+  <div class="chrome">
+    <div class="title">${parsed.filename}</div>
+    <div class="spacer"></div>
+    <div class="pill">
+      <button id="prev">&#8592;</button>
+      <span>Sayfa <span id="page-num">-</span>/<span id="page-count">-</span></span>
+      <button id="next">&#8594;</button>
+    </div>
+    <div id="status" style="font-size:12px; color:#7da5ff; padding-left:12px;"></div>
+  </div>
+  <div class="canvas-wrap">
+    <canvas id="pdf-canvas"></canvas>
   </div>
 </body>
 </html>`;
