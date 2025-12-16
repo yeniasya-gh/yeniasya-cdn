@@ -6,6 +6,7 @@ const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const nodemailer = require("nodemailer");
 
 const PORT = process.env.PORT || 3000;
 // Hardcoded token per request (env not used intentionally).
@@ -24,6 +25,14 @@ const ALLOWED_HEADERS =
 const ALLOWED_METHODS = "GET, POST, OPTIONS";
 const VIEW_TOKEN_SECRET = process.env.VIEW_TOKEN_SECRET || AUTH_TOKEN;
 const VIEW_TOKEN_TTL_MIN = Number(process.env.VIEW_TOKEN_TTL_MIN || "5");
+const MAIL_SETTINGS = {
+  host: process.env.MAIL_HOST || "mail.yeniasya.com.tr",
+  port: Number(process.env.MAIL_PORT || "587"),
+  user: process.env.MAIL_USER || "app@yeniasya.com.tr",
+  pass: process.env.MAIL_PASS || "Asya1970@1",
+  from: process.env.MAIL_FROM || "app@yeniasya.com.tr",
+  token: process.env.MAIL_API_TOKEN || AUTH_TOKEN,
+};
 
 const allowedTypes = ["kitap", "gazete", "dergi"];
 
@@ -130,6 +139,17 @@ const requireAuth = (req, res, next) => {
   next();
 };
 
+const requireMailAuth = (req, res, next) => {
+  const raw = req.get("x-mail-token") || req.get("authorization") || req.get("x-api-key") || "";
+  const token = raw.toLowerCase().startsWith("bearer ")
+    ? raw.slice(7)
+    : raw;
+  if (!token || token !== MAIL_SETTINGS.token) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  next();
+};
+
 const resolveType = (req) => {
   const type = (req.body?.type || req.query?.type || "").toLowerCase();
   if (!allowedTypes.includes(type)) {
@@ -137,6 +157,16 @@ const resolveType = (req) => {
   }
   return type;
 };
+
+const mailTransporter = nodemailer.createTransport({
+  host: MAIL_SETTINGS.host,
+  port: MAIL_SETTINGS.port,
+  secure: MAIL_SETTINGS.port === 465,
+  auth: {
+    user: MAIL_SETTINGS.user,
+    pass: MAIL_SETTINGS.pass,
+  },
+});
 
 app.use(express.json());
 
@@ -513,6 +543,42 @@ app.get("/private/view-secure", (req, res) => {
       }
     });
   });
+});
+
+app.post("/mail/send", requireMailAuth, async (req, res) => {
+  const { to, cc, bcc, subject, text, html, replyTo, from } = req.body || {};
+
+  if (!to || !subject || (!text && !html)) {
+    return res.status(400).json({
+      ok: false,
+      error: "to, subject and at least one of text or html are required.",
+    });
+  }
+
+  const message = {
+    from: from || MAIL_SETTINGS.from,
+    to,
+    cc,
+    bcc,
+    subject: String(subject),
+    text,
+    html,
+    replyTo,
+  };
+
+  try {
+    const info = await mailTransporter.sendMail(message);
+    return res.json({
+      ok: true,
+      messageId: info.messageId,
+      accepted: info.accepted,
+      rejected: info.rejected,
+      envelope: info.envelope,
+    });
+  } catch (err) {
+    console.error("Mail send failed:", err);
+    return res.status(500).json({ ok: false, error: "Mail send failed." });
+  }
 });
 
 app.get("/health", (req, res) => {
