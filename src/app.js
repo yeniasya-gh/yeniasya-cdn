@@ -191,9 +191,6 @@ app.use((req, res, next) => {
   res.set("Access-Control-Allow-Methods", ALLOWED_METHODS);
   res.set("Access-Control-Allow-Headers", ALLOWED_HEADERS);
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
   next();
 });
 
@@ -519,6 +516,14 @@ app.get("/private/view-secure", (req, res) => {
   if (!validation.ok) {
     return res.status(401).json({ ok: false, error: validation.error || "Unauthorized." });
   }
+  const requestedPage = Number.parseInt(req.query?.page, 10);
+  const pageParam = Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : null;
+  const renderMode = (req.query?.render || "").toLowerCase();
+  const preferViewer =
+    renderMode === "viewer" ||
+    renderMode === "embed" ||
+    req.query?.viewer === "1" ||
+    req.query?.viewer === "true";
   const parsed = parsePrivatePath(validation.payload.path);
   if (!parsed) {
     return res.status(400).json({ ok: false, error: "Invalid token path." });
@@ -533,6 +538,44 @@ app.get("/private/view-secure", (req, res) => {
       return res.status(404).json({ ok: false, error: "File not found." });
     }
     const corsHeaders = buildCorsHeaders(req);
+    if (preferViewer) {
+      const fragmentParts = [];
+      if (pageParam) fragmentParts.push(`page=${pageParam}`);
+      fragmentParts.push("toolbar=0", "navpanes=0", "scrollbar=1");
+      const fragment = `#${fragmentParts.join("&")}`;
+      const rawUrl = `${req.path}?token=${encodeURIComponent(token)}&render=raw${
+        pageParam ? `&page=${pageParam}` : ""
+      }${fragment}`;
+      const html = `<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${parsed.filename}</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #0f1115; }
+    .viewer { position: fixed; inset: 0; background: #0f1115; }
+    .viewer embed { width: 100%; height: 100%; border: none; }
+  </style>
+</head>
+<body>
+  <div class="viewer">
+    <embed src="${rawUrl}" type="application/pdf" />
+  </div>
+</body>
+</html>`;
+
+      res.set({
+        ...corsHeaders,
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        Pragma: "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "SAMEORIGIN",
+        "Content-Security-Policy": "frame-ancestors 'self'",
+      });
+      return res.send(html);
+    }
     res.set({
       ...corsHeaders,
       "Content-Type": "application/pdf",
@@ -589,6 +632,8 @@ app.post("/mail/send", requireMailAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "Mail send failed." });
   }
 });
+
+app.options("/mail/send", requireMailAuth);
 
 app.get("/health", (req, res) => {
   res.json({ ok: true, message: "alive" });
