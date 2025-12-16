@@ -158,13 +158,22 @@ const resolveType = (req) => {
   return type;
 };
 
+const smtpHost = (MAIL_SETTINGS.host || "").trim().replace(/\.$/, "");
 const mailTransporter = nodemailer.createTransport({
-  host: MAIL_SETTINGS.host,
+  host: smtpHost,
   port: MAIL_SETTINGS.port,
   secure: MAIL_SETTINGS.port === 465,
   auth: {
     user: MAIL_SETTINGS.user,
     pass: MAIL_SETTINGS.pass,
+  },
+  tls: {
+    // Allow self-signed / mismatched certs (needed for current smtp cert).
+    rejectUnauthorized:
+      process.env.MAIL_TLS_REJECT_UNAUTHORIZED === "true"
+        ? true
+        : false,
+    servername: smtpHost,
   },
 });
 
