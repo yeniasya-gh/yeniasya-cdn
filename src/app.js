@@ -559,7 +559,6 @@ app.get("/private/view-secure", (req, res) => {
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #0f1115; color: #dfe7ff; font-family: "Inter", "Segoe UI", sans-serif; }
     .chrome { position: fixed; top: 0; left: 0; right: 0; height: 64px; display: flex; align-items: center; gap: 12px; padding: 0 16px; background: rgba(12,14,20,0.92); border-bottom: 1px solid #1f2533; backdrop-filter: blur(8px); z-index: 10; }
-    .title { font-size: 14px; font-weight: 700; color: #9fb4ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 30vw; }
     .spacer { flex: 1; }
     .pill { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 999px; background: #1a2232; border: 1px solid #202a3d; font-size: 13px; color: #c7d2ff; }
     button { cursor: pointer; background: #2b3650; border: 1px solid #3a4670; color: #dfe7ff; padding: 8px 12px; border-radius: 8px; font-size: 13px; }
@@ -584,6 +583,7 @@ app.get("/private/view-secure", (req, res) => {
     let pageRendering = false;
     let pageNumPending = null;
     let scale = startZoom;
+    let lastWheelTs = 0;
 
     async function fetchPdf() {
       const resp = await fetch(rawUrl);
@@ -606,7 +606,7 @@ app.get("/private/view-secure", (req, res) => {
 
         renderTask.promise.then(function() {
           pageRendering = false;
-          document.getElementById("page-num").textContent = num;
+          document.getElementById("page-input").value = num;
           document.getElementById("page-count").textContent = pdfDoc.numPages;
           document.getElementById("prev").disabled = num <= 1;
           document.getElementById("next").disabled = num >= pdfDoc.numPages;
@@ -655,13 +655,29 @@ app.get("/private/view-secure", (req, res) => {
       queueRenderPage(pageNum);
     }
 
+    function onWheelScroll(event) {
+      const now = Date.now();
+      if (now - lastWheelTs < 350) return;
+      if (Math.abs(event.deltaY) < 80) return;
+      if (event.deltaY > 0 && pageNum < pdfDoc.numPages) {
+        pageNum++;
+        queueRenderPage(pageNum);
+        lastWheelTs = now;
+      } else if (event.deltaY < 0 && pageNum > 1) {
+        pageNum--;
+        queueRenderPage(pageNum);
+        lastWheelTs = now;
+      }
+    }
+
     window.addEventListener("DOMContentLoaded", async () => {
       document.getElementById("prev").addEventListener("click", onPrevPage);
       document.getElementById("next").addEventListener("click", onNextPage);
-      document.getElementById("zoom-in").addEventListener("click", () => setScale(scale + 0.1));
-      document.getElementById("zoom-out").addEventListener("click", () => setScale(scale - 0.1));
+      document.getElementById("zoom-in").addEventListener("click", () => setScale(scale + 0.15));
+      document.getElementById("zoom-out").addEventListener("click", () => setScale(scale - 0.15));
       document.getElementById("zoom-reset").addEventListener("click", () => setScale(startZoom));
       document.getElementById("page-form").addEventListener("submit", onJump);
+      document.getElementById("canvas-wrap").addEventListener("wheel", onWheelScroll, { passive: true });
       try {
         pdfDoc = await fetchPdf();
         if (pageNum > pdfDoc.numPages) pageNum = pdfDoc.numPages;
@@ -677,7 +693,6 @@ app.get("/private/view-secure", (req, res) => {
 </head>
 <body>
   <div class="chrome">
-    <div class="title">${parsed.filename}</div>
     <div class="spacer"></div>
     <div class="pill controls">
       <button id="prev">&#8592;</button>
@@ -695,7 +710,7 @@ app.get("/private/view-secure", (req, res) => {
     </div>
     <div id="status" style="font-size:12px; color:#7da5ff; padding-left:12px;"></div>
   </div>
-  <div class="canvas-wrap">
+  <div class="canvas-wrap" id="canvas-wrap">
     <canvas id="pdf-canvas"></canvas>
   </div>
 </body>
