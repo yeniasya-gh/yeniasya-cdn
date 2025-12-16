@@ -25,6 +25,12 @@ const ALLOWED_HEADERS =
 const ALLOWED_METHODS = "GET, POST, OPTIONS";
 const VIEW_TOKEN_SECRET = process.env.VIEW_TOKEN_SECRET || AUTH_TOKEN;
 const VIEW_TOKEN_TTL_MIN = Number(process.env.VIEW_TOKEN_TTL_MIN || "5");
+const FRAME_ANCESTORS = (process.env.ALLOWED_FRAME_ANCESTORS || "*")
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
+const FRAME_ANCESTORS_DIRECTIVE =
+  FRAME_ANCESTORS.length === 0 ? "'none'" : FRAME_ANCESTORS.join(" ");
 const MAIL_SETTINGS = {
   host: process.env.MAIL_HOST || "mail.yeniasya.com.tr",
   port: Number(process.env.MAIL_PORT || "587"),
@@ -406,8 +412,7 @@ app.post("/private/view", requireAuth, (req, res) => {
       "Cache-Control": "no-store, no-cache, must-revalidate, private",
       Pragma: "no-cache",
       "X-Content-Type-Options": "nosniff",
-      "X-Frame-Options": "SAMEORIGIN",
-      "Content-Security-Policy": "frame-ancestors 'self'",
+      "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
     });
     res.sendFile(filePath, (sendErr) => {
       if (sendErr) {
@@ -519,11 +524,12 @@ app.get("/private/view-secure", (req, res) => {
   const requestedPage = Number.parseInt(req.query?.page, 10);
   const pageParam = Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : null;
   const renderMode = (req.query?.render || "").toLowerCase();
-  const preferViewer =
-    renderMode === "viewer" ||
-    renderMode === "embed" ||
-    req.query?.viewer === "1" ||
-    req.query?.viewer === "true";
+  const preferViewer = renderMode !== "raw";
+  const requestedZoom = Number.parseFloat(req.query?.zoom);
+  const initialZoom =
+    Number.isFinite(requestedZoom) && requestedZoom > 0.3 && requestedZoom <= 3
+      ? requestedZoom
+      : 1.1;
   const parsed = parsePrivatePath(validation.payload.path);
   if (!parsed) {
     return res.status(400).json({ ok: false, error: "Invalid token path." });
@@ -550,20 +556,24 @@ app.get("/private/view-secure", (req, res) => {
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #0f1115; color: #dfe7ff; font-family: "Inter", "Segoe UI", sans-serif; }
-    .chrome { position: fixed; top: 0; left: 0; right: 0; height: 56px; display: flex; align-items: center; gap: 12px; padding: 0 16px; background: rgba(12,14,20,0.9); border-bottom: 1px solid #1f2533; backdrop-filter: blur(6px); z-index: 10; }
-    .title { font-size: 14px; font-weight: 600; color: #9fb4ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chrome { position: fixed; top: 0; left: 0; right: 0; height: 64px; display: flex; align-items: center; gap: 12px; padding: 0 16px; background: rgba(12,14,20,0.92); border-bottom: 1px solid #1f2533; backdrop-filter: blur(8px); z-index: 10; }
+    .title { font-size: 14px; font-weight: 700; color: #9fb4ff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 30vw; }
     .spacer { flex: 1; }
-    .pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; background: #1a2232; border: 1px solid #202a3d; font-size: 13px; color: #c7d2ff; }
-    button { cursor: pointer; background: #2b3650; border: 1px solid #3a4670; color: #dfe7ff; padding: 6px 10px; border-radius: 8px; font-size: 13px; }
+    .pill { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 999px; background: #1a2232; border: 1px solid #202a3d; font-size: 13px; color: #c7d2ff; }
+    button { cursor: pointer; background: #2b3650; border: 1px solid #3a4670; color: #dfe7ff; padding: 8px 12px; border-radius: 8px; font-size: 13px; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .canvas-wrap { position: absolute; inset: 56px 0 0 0; overflow: auto; display: flex; justify-content: center; background: #0f1115; }
+    .canvas-wrap { position: absolute; inset: 64px 0 0 0; overflow: auto; display: flex; justify-content: center; background: #0f1115; }
     #pdf-canvas { margin: 16px auto 32px auto; box-shadow: 0 16px 48px rgba(0,0,0,0.35); border-radius: 6px; }
+    .input { background: #101520; border: 1px solid #1f2738; color: #cfd9ff; padding: 8px 10px; border-radius: 8px; width: 72px; text-align: center; }
+    .label { font-size: 12px; opacity: 0.7; }
+    .controls { display: inline-flex; align-items: center; gap: 8px; }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.min.js" integrity="sha512-u+I4/7jqOPxw6c2FQ93IggvAN8lsq5w5+nx1CCPpnvEmPaoxriq8IV3UzjpuQZHRYdFJX0E2wzKtzew/1/veaw==" crossorigin="anonymous"></script>
   <script>
     const rawUrl = ${JSON.stringify(rawUrl)};
     const docKey = "pdf-progress:" + ${JSON.stringify(parsed.filename)};
     const startPage = ${pageParam || "null"};
+    const startZoom = ${initialZoom};
     const pdfjsLib = window["pdfjs-dist/build/pdf"];
     pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.min.js";
 
@@ -571,7 +581,7 @@ app.get("/private/view-secure", (req, res) => {
     let pageNum = startPage || Number(localStorage.getItem(docKey)) || 1;
     let pageRendering = false;
     let pageNumPending = null;
-    const scale = 1.2;
+    let scale = startZoom;
 
     async function fetchPdf() {
       const resp = await fetch(rawUrl);
@@ -607,6 +617,12 @@ app.get("/private/view-secure", (req, res) => {
       });
     }
 
+    function setScale(next) {
+      scale = Math.max(0.5, Math.min(3.0, next));
+      queueRenderPage(pageNum);
+      document.getElementById("zoom").textContent = Math.round(scale * 100) + "%";
+    }
+
     function queueRenderPage(num) {
       if (pageRendering) {
         pageNumPending = num;
@@ -627,12 +643,28 @@ app.get("/private/view-secure", (req, res) => {
       queueRenderPage(pageNum);
     }
 
+    function onJump(event) {
+      event.preventDefault();
+      const input = document.getElementById("page-input");
+      const val = Number.parseInt(input.value, 10);
+      if (!Number.isFinite(val)) return;
+      const next = Math.min(Math.max(1, val), pdfDoc.numPages);
+      pageNum = next;
+      queueRenderPage(pageNum);
+    }
+
     window.addEventListener("DOMContentLoaded", async () => {
       document.getElementById("prev").addEventListener("click", onPrevPage);
       document.getElementById("next").addEventListener("click", onNextPage);
+      document.getElementById("zoom-in").addEventListener("click", () => setScale(scale + 0.1));
+      document.getElementById("zoom-out").addEventListener("click", () => setScale(scale - 0.1));
+      document.getElementById("zoom-reset").addEventListener("click", () => setScale(startZoom));
+      document.getElementById("page-form").addEventListener("submit", onJump);
       try {
         pdfDoc = await fetchPdf();
         if (pageNum > pdfDoc.numPages) pageNum = pdfDoc.numPages;
+        document.getElementById("page-count").textContent = pdfDoc.numPages;
+        document.getElementById("zoom").textContent = Math.round(scale * 100) + "%";
         renderPage(pageNum);
       } catch (err) {
         document.getElementById("status").textContent = "PDF yüklenemedi";
@@ -645,10 +677,19 @@ app.get("/private/view-secure", (req, res) => {
   <div class="chrome">
     <div class="title">${parsed.filename}</div>
     <div class="spacer"></div>
-    <div class="pill">
+    <div class="pill controls">
       <button id="prev">&#8592;</button>
-      <span>Sayfa <span id="page-num">-</span>/<span id="page-count">-</span></span>
+      <form id="page-form" style="display:inline-flex;align-items:center;gap:6px;">
+        <input class="input" id="page-input" type="number" min="1" value="${pageParam || 1}" />
+        <span class="label">/ <span id="page-count">-</span></span>
+      </form>
       <button id="next">&#8594;</button>
+    </div>
+    <div class="pill controls">
+      <button id="zoom-out">-</button>
+      <span id="zoom">100%</span>
+      <button id="zoom-in">+</button>
+      <button id="zoom-reset">=</button>
     </div>
     <div id="status" style="font-size:12px; color:#7da5ff; padding-left:12px;"></div>
   </div>
@@ -664,8 +705,7 @@ app.get("/private/view-secure", (req, res) => {
         "Cache-Control": "no-store, no-cache, must-revalidate, private",
         Pragma: "no-cache",
         "X-Content-Type-Options": "nosniff",
-        "X-Frame-Options": "SAMEORIGIN",
-        "Content-Security-Policy": "frame-ancestors 'self'",
+        "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
       });
       return res.send(html);
     }
@@ -676,8 +716,7 @@ app.get("/private/view-secure", (req, res) => {
       "Cache-Control": "no-store, no-cache, must-revalidate, private",
       Pragma: "no-cache",
       "X-Content-Type-Options": "nosniff",
-      "X-Frame-Options": "SAMEORIGIN",
-      "Content-Security-Policy": "frame-ancestors 'self'",
+      "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
     });
     res.sendFile(filePath, (sendErr) => {
       if (sendErr) {
