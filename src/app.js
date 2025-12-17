@@ -41,7 +41,7 @@ const MAIL_SETTINGS = {
   token: process.env.MAIL_API_TOKEN || AUTH_TOKEN,
 };
 
-const allowedTypes = ["kitap", "gazete", "dergi"];
+const allowedTypes = ["kitap", "gazete", "dergi", "ek"];
 
 const parsePrivatePath = (input) => {
   if (!input) return null;
@@ -67,6 +67,10 @@ const paths = {
   dergi: {
     public: path.join(STORAGE_ROOT, "dergi", "public"),
     private: path.join(STORAGE_ROOT, "dergi", "private"),
+  },
+  ek: {
+    public: path.join(STORAGE_ROOT, "ek", "public"),
+    private: path.join(STORAGE_ROOT, "ek", "private"),
   },
 };
 
