@@ -23,10 +23,10 @@ npm run dev
 
 ## Endpoint'ler
 - `POST /upload/public`  
-  - Form-data alanları: `file` (foto/pdf), `type` (kitap|gazete|dergi).  
+  - Form-data alanları: `file` (foto/pdf), `type` (kitap|gazete|dergi|ek|slider).  
   - Dosya yolları: `storage/<type>/public/`.
 - `POST /upload/private`  
-  - Form-data: `file` ve `type` (kitap|gazete|dergi).  
+  - Form-data: `file` ve `type` (kitap|gazete|dergi|ek).  
   - Dosya yolu: `storage/<type>/private/`.  
   - Yanıt `url` değeri: `/private/<type>/<filename>`.
 - `GET /public/:type/:filename`  

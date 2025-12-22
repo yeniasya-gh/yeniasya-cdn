@@ -41,7 +41,8 @@ const MAIL_SETTINGS = {
   token: process.env.MAIL_API_TOKEN || AUTH_TOKEN,
 };
 
-const allowedTypes = ["kitap", "gazete", "dergi", "ek"];
+const PUBLIC_TYPES = ["kitap", "gazete", "dergi", "ek", "slider"];
+const PRIVATE_TYPES = ["kitap", "gazete", "dergi", "ek"];
 
 const parsePrivatePath = (input) => {
   if (!input) return null;
@@ -49,7 +50,7 @@ const parsePrivatePath = (input) => {
   const match = cleaned.match(/^\/?private\/([a-z]+)\/([^/]+)$/i);
   if (!match) return null;
   const type = match[1].toLowerCase();
-  if (!allowedTypes.includes(type)) return null;
+  if (!PRIVATE_TYPES.includes(type)) return null;
   const filename = path.basename(match[2]);
   if (!filename.toLowerCase().endsWith(".pdf")) return null;
   return { type, filename };
@@ -71,6 +72,9 @@ const paths = {
   ek: {
     public: path.join(STORAGE_ROOT, "ek", "public"),
     private: path.join(STORAGE_ROOT, "ek", "private"),
+  },
+  slider: {
+    public: path.join(STORAGE_ROOT, "slider", "public"),
   },
 };
 
@@ -161,7 +165,7 @@ const requireMailAuth = (req, res, next) => {
   next();
 };
 
-const resolveType = (req) => {
+const resolveType = (req, allowedTypes) => {
   const type = (req.body?.type || req.query?.type || "").toLowerCase();
   if (!allowedTypes.includes(type)) {
     return null;
@@ -281,11 +285,11 @@ const moveToFinal = (file, targetDir) =>
 
 app.post("/upload/public", upload.single("file"), async (req, res, next) => {
   try {
-    const type = resolveType(req);
+    const type = resolveType(req, PUBLIC_TYPES);
     if (!type) {
       return res
         .status(400)
-        .json({ ok: false, error: `type is required: ${allowedTypes.join(", ")}` });
+        .json({ ok: false, error: `type is required: ${PUBLIC_TYPES.join(", ")}` });
     }
     if (!req.file) {
       return res.status(400).json({ ok: false, error: "File is required." });
@@ -306,11 +310,11 @@ app.post("/upload/public", upload.single("file"), async (req, res, next) => {
 
 app.post("/upload/private", upload.single("file"), async (req, res, next) => {
   try {
-    const type = resolveType(req);
+    const type = resolveType(req, PRIVATE_TYPES);
     if (!type) {
       return res
         .status(400)
-        .json({ ok: false, error: `type is required: ${allowedTypes.join(", ")}` });
+        .json({ ok: false, error: `type is required: ${PRIVATE_TYPES.join(", ")}` });
     }
     if (!req.file) {
       return res.status(400).json({ ok: false, error: "File is required." });
@@ -336,7 +340,7 @@ app.post("/upload/private", upload.single("file"), async (req, res, next) => {
 
 app.get("/public/:type/:filename", (req, res) => {
   const type = (req.params.type || "").toLowerCase();
-  if (!allowedTypes.includes(type)) {
+  if (!PUBLIC_TYPES.includes(type)) {
     return res.status(404).json({ ok: false, error: "Unknown type." });
   }
   const filePath = path.join(paths[type].public, req.params.filename);
@@ -373,7 +377,7 @@ app.get("/public/:type/:filename", (req, res) => {
 
 app.get("/private/:type/:filename", requireAuth, (req, res) => {
   const type = (req.params.type || "").toLowerCase();
-  if (!allowedTypes.includes(type)) {
+  if (!PRIVATE_TYPES.includes(type)) {
     return res.status(404).json({ ok: false, error: "Unknown type." });
   }
   const targetDir = paths[type]?.private;
