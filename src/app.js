@@ -1114,16 +1114,39 @@ app.post("/payment/pay/redirect", requireAuth, async (req, res, next) => {
 app.all("/payment/return", (req, res) => {
   const payload = { ...req.query, ...req.body };
   console.log("Payment return payload:", payload);
-  if (PAYMENT_RETURN_REDIRECT_URL) {
-    const redirectUrl = new URL(PAYMENT_RETURN_REDIRECT_URL);
-    Object.entries(payload).forEach(([key, value]) => {
-      if (value !== undefined && value !== null && value !== "") {
-        redirectUrl.searchParams.set(key, String(value));
-      }
-    });
-    return res.redirect(302, redirectUrl.toString());
+  const decodeValue = (value) => {
+    if (value === undefined || value === null) return null;
+    const raw = String(value);
+    try {
+      return decodeURIComponent(raw.replace(/\+/g, " "));
+    } catch (err) {
+      return raw;
+    }
+  };
+
+  const responseCode = payload.responseCode ?? payload.responsecode;
+  const responseMsgRaw = payload.responseMsg ?? payload.responsemsg;
+  const responseMsg = decodeValue(responseMsgRaw);
+  const isApproved =
+    String(responseCode || "") === "00" &&
+    String(responseMsg || "").trim().toLowerCase() === "approved";
+
+  const normalized = {
+    merchantPaymentId:
+      payload.merchantPaymentId || payload.merchantpaymentid || null,
+    customerId: payload.customerId || payload.customerid || null,
+    sessionToken: payload.sessionToken || payload.sessiontoken || null,
+    responseCode: responseCode || null,
+    responseMsg: responseMsg || null,
+    errorCode: payload.errorCode || payload.errorcode || null,
+    errorMsg: decodeValue(payload.errorMsg || payload.errormsg),
+    raw: payload,
+  };
+
+  if (isApproved) {
+    return res.status(200).json({ ok: true, approved: true, ...normalized });
   }
-  return res.status(200).json({ ok: true, payload });
+  return res.status(200).json({ ok: false, approved: false, ...normalized });
 });
 
 app.post("/payment/test-session", requireAuth, async (req, res, next) => {
