@@ -7,6 +7,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
+const axios = require("axios");
 
 const PORT = process.env.PORT || 3000;
 // Hardcoded token per request (env not used intentionally).
@@ -40,6 +41,14 @@ const MAIL_SETTINGS = {
   from: process.env.MAIL_FROM || "app@yeniasya.com.tr",
   token: process.env.MAIL_API_TOKEN || AUTH_TOKEN,
 };
+const PAYMENT_RETURN_REDIRECT_URL = process.env.PAYMENT_RETURN_REDIRECT_URL || "";
+const PARATIKA_BASE_URL =
+  process.env.PARATIKA_BASE_URL || "https://vpos.paratika.com.tr/paratika/api/v2";
+const PARATIKA_MERCHANTUSER = process.env.PARATIKA_MERCHANTUSER || "";
+const PARATIKA_MERCHANTPASSWORD = process.env.PARATIKA_MERCHANTPASSWORD || "";
+const PARATIKA_MERCHANT = process.env.PARATIKA_MERCHANT || "";
+const PARATIKA_RETURNURL = process.env.PARATIKA_RETURNURL || "";
+const PARATIKA_COOKIE = process.env.PARATIKA_COOKIE || "";
 
 const PUBLIC_TYPES = ["kitap", "gazete", "dergi", "ek", "slider"];
 const PRIVATE_TYPES = ["kitap", "gazete", "dergi", "ek"];
@@ -173,6 +182,202 @@ const resolveType = (req, allowedTypes) => {
   return type;
 };
 
+const normalizeJsonField = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    // Allow pre-encoded JSON strings from x-www-form-urlencoded clients.
+    if (/%[0-9A-Fa-f]{2}/.test(trimmed)) {
+      try {
+        const decoded = decodeURIComponent(trimmed);
+        if (decoded) return decoded;
+      } catch (err) {
+        return trimmed;
+      }
+    }
+    return trimmed;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch (err) {
+    return null;
+  }
+};
+
+const formEncode = (payload) =>
+  Object.entries(payload)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(
+      ([key, value]) =>
+        `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`
+    )
+    .join("&");
+
+const buildPayPayload = (body) => {
+  const pick = (...keys) => {
+    for (const key of keys) {
+      const value = body[key];
+      if (value !== undefined && value !== null && value !== "") {
+        return value;
+      }
+    }
+    return undefined;
+  };
+
+  const sessionToken = pick("SESSIONTOKEN", "sessionToken", "token");
+  const cardPanRaw = pick("CARDPAN", "cardPan", "pan");
+  const cardExpiryRaw = pick("CARDEXPIRY", "cardExpiry");
+  const cardExpiryMonth = pick("expiryMonth", "EXPIRYMONTH");
+  const cardExpiryYear = pick("expiryYear", "EXPIRYYEAR");
+  const cardCvv = pick("CARDCVV", "cardCvv", "cvv");
+  const nameOnCard = pick("NAMEONCARD", "nameOnCard", "cardOwner");
+  const cardToken = pick("cardToken", "CARDTOKEN");
+
+  const missing = [];
+  if (!sessionToken) missing.push("SESSIONTOKEN");
+  if (!cardToken && !cardPanRaw) missing.push("CARDPAN");
+  if (!cardToken && !cardExpiryRaw && !(cardExpiryMonth && cardExpiryYear))
+    missing.push("CARDEXPIRY");
+  if (!cardToken && !cardCvv) missing.push("CARDCVV");
+  if (!cardToken && !nameOnCard) missing.push("NAMEONCARD");
+
+  if (missing.length) {
+    return { ok: false, error: `Missing required fields: ${missing.join(", ")}` };
+  }
+
+  const cardPan = cardPanRaw ? String(cardPanRaw).replace(/\s+/g, "") : "";
+  let cardExpiry = cardExpiryRaw ? String(cardExpiryRaw) : "";
+  if (!cardExpiry && cardExpiryMonth && cardExpiryYear) {
+    const month = String(cardExpiryMonth).padStart(2, "0");
+    const yearRaw = String(cardExpiryYear);
+    const year = yearRaw.length === 4 ? yearRaw.slice(-2) : yearRaw;
+    cardExpiry = `${month}${year}`;
+  }
+
+  const requestPayload = {
+    CARDPAN: cardPan,
+    CARDEXPIRY: cardExpiry,
+    CARDCVV: cardCvv,
+    NAMEONCARD: nameOnCard,
+    pan: cardPan,
+    cvv: cardCvv,
+    cardOwner: nameOnCard,
+    expiryMonth: cardExpiry ? cardExpiry.slice(0, 2) : undefined,
+    expiryYear: cardExpiry ? `20${cardExpiry.slice(2)}` : undefined,
+    cardToken: cardToken,
+    installmentCount: pick("installmentCount", "INSTALLMENTCOUNT"),
+    saveCard: pick("saveCard", "SAVECARD"),
+    cardName: pick("cardName", "CARDNAME"),
+    points: pick("points", "POINTS"),
+    paymentSystem: pick("paymentSystem", "PAYMENTSYSTEM"),
+  };
+
+  return { ok: true, sessionToken, requestPayload };
+};
+
+const requestParatikaPay = async (sessionToken, requestPayload) => {
+  const endpoint = new URL(PARATIKA_BASE_URL);
+  endpoint.pathname = `${endpoint.pathname.replace(
+    /\/+$/,
+    ""
+  )}/post/sale3d/${encodeURIComponent(String(sessionToken))}`;
+
+  const data = formEncode(requestPayload);
+  return axios.request({
+    method: "post",
+    maxBodyLength: Infinity,
+    url: endpoint.toString(),
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      ...(PARATIKA_COOKIE ? { Cookie: PARATIKA_COOKIE } : {}),
+      Accept: "*/*",
+      "Accept-Encoding": "gzip, deflate, br",
+      Connection: "keep-alive",
+      "User-Agent": "PostmanRuntime/7.36.0",
+    },
+    data,
+  });
+};
+
+const requestParatika = (payload, extraHeaders = {}) => {
+  const endpoint = new URL(PARATIKA_BASE_URL);
+  const body = payload.toString();
+  const transport = endpoint.protocol === "http:" ? require("http") : require("https");
+
+  const options = {
+    method: "POST",
+    hostname: endpoint.hostname,
+    port: endpoint.port || (endpoint.protocol === "http:" ? 80 : 443),
+    path: endpoint.pathname,
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Content-Length": Buffer.byteLength(body),
+      ...extraHeaders,
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = transport.request(options, (resp) => {
+      let data = "";
+      resp.on("data", (chunk) => {
+        data += chunk;
+      });
+      resp.on("end", () => {
+        if (!data) {
+          return resolve({ status: resp.statusCode, raw: "" });
+        }
+        try {
+          return resolve({ status: resp.statusCode, data: JSON.parse(data) });
+        } catch (err) {
+          return resolve({ status: resp.statusCode, raw: data });
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+};
+
+const postLocalJson = (pathName, payload, headers = {}) =>
+  new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload || {});
+    const req = require("http").request(
+      {
+        method: "POST",
+        hostname: "127.0.0.1",
+        port: PORT,
+        path: pathName,
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+          ...headers,
+        },
+      },
+      (resp) => {
+        let data = "";
+        resp.on("data", (chunk) => {
+          data += chunk;
+        });
+        resp.on("end", () => {
+          if (!data) {
+            return resolve({ status: resp.statusCode, raw: "" });
+          }
+          try {
+            return resolve({ status: resp.statusCode, data: JSON.parse(data) });
+          } catch (err) {
+            return resolve({ status: resp.statusCode, raw: data });
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+
 const smtpHost = (MAIL_SETTINGS.host || "").trim().replace(/\.$/, "");
 const mailTransporter = nodemailer.createTransport({
   host: smtpHost,
@@ -193,6 +398,7 @@ const mailTransporter = nodemailer.createTransport({
 });
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 app.use(express.static(PUBLIC_ROOT));
 
 app.use((req, res, next) => {
@@ -752,6 +958,250 @@ app.get("/private/view-secure", (req, res) => {
       }
     });
   });
+});
+
+app.post("/payment/session", requireAuth, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const pick = (...keys) => {
+      for (const key of keys) {
+        const value = body[key];
+        if (value !== undefined && value !== null && value !== "") {
+          return value;
+        }
+      }
+      return undefined;
+    };
+
+    const merchantUser = PARATIKA_MERCHANTUSER || pick("MERCHANTUSER", "merchantUser");
+    const merchantPassword =
+      PARATIKA_MERCHANTPASSWORD || pick("MERCHANTPASSWORD", "merchantPassword");
+    const merchant = PARATIKA_MERCHANT || pick("MERCHANT", "merchant");
+    const returnUrl = PARATIKA_RETURNURL || pick("RETURNURL", "returnUrl");
+    const sessionType = pick("SESSIONTYPE", "sessionType") || "PAYMENTSESSION";
+
+    const missing = [];
+    if (!PARATIKA_BASE_URL) missing.push("PARATIKA_BASE_URL");
+    if (!merchantUser) missing.push("MERCHANTUSER");
+    if (!merchantPassword) missing.push("MERCHANTPASSWORD");
+    if (!merchant) missing.push("MERCHANT");
+    if (!returnUrl) missing.push("RETURNURL");
+
+    if (missing.length) {
+      return res.status(400).json({
+        ok: false,
+        error: `Missing required fields: ${missing.join(", ")}`,
+      });
+    }
+
+    const orderItemsRaw = pick("ORDERITEMS", "orderItems");
+    const orderItems = normalizeJsonField(orderItemsRaw);
+    if (orderItemsRaw && !orderItems) {
+      return res.status(400).json({
+        ok: false,
+        error: "ORDERITEMS must be valid JSON or a JSON string.",
+      });
+    }
+
+    const extraRaw = pick("EXTRA", "extra");
+    const extra = normalizeJsonField(extraRaw);
+    if (extraRaw && !extra) {
+      return res.status(400).json({
+        ok: false,
+        error: "EXTRA must be valid JSON or a JSON string.",
+      });
+    }
+
+    const requestPayload = {
+      ACTION: "SESSIONTOKEN",
+      MERCHANTUSER: String(merchantUser),
+      MERCHANTPASSWORD: String(merchantPassword),
+      MERCHANT: String(merchant),
+      RETURNURL: String(returnUrl),
+      SESSIONTYPE: String(sessionType),
+      AMOUNT: pick("AMOUNT", "amount"),
+      CURRENCY: pick("CURRENCY", "currency"),
+      MERCHANTPAYMENTID: pick("MERCHANTPAYMENTID", "merchantPaymentId"),
+      CUSTOMER: pick("CUSTOMER", "customer"),
+      CUSTOMERNAME: pick("CUSTOMERNAME", "customerName"),
+      CUSTOMEREMAIL: pick("CUSTOMEREMAIL", "customerEmail"),
+      CUSTOMERIP: pick("CUSTOMERIP", "customerIp"),
+      CUSTOMERUSERAGENT: pick("CUSTOMERUSERAGENT", "customerUserAgent"),
+      NAMEONCARD: pick("NAMEONCARD", "nameOnCard"),
+      CUSTOMERPHONE: pick("CUSTOMERPHONE", "customerPhone"),
+      DISCOUNTAMOUNT: pick("DISCOUNTAMOUNT", "discountAmount"),
+      BILLTOADDRESSLINE: pick("BILLTOADDRESSLINE", "billToAddressLine"),
+      BILLTOCITY: pick("BILLTOCITY", "billToCity"),
+      BILLTOCOUNTRY: pick("BILLTOCOUNTRY", "billToCountry"),
+      BILLTOPOSTALCODE: pick("BILLTOPOSTALCODE", "billToPostalCode"),
+      BILLTOPHONE: pick("BILLTOPHONE", "billToPhone"),
+      SHIPTOADDRESSLINE: pick("SHIPTOADDRESSLINE", "shipToAddressLine"),
+      SHIPTOCITY: pick("SHIPTOCITY", "shipToCity"),
+      SHIPTOCOUNTRY: pick("SHIPTOCOUNTRY", "shipToCountry"),
+      SHIPTOPOSTALCODE: pick("SHIPTOPOSTALCODE", "shipToPostalCode"),
+      SHIPTOPHONE: pick("SHIPTOPHONE", "shipToPhone"),
+      SELLERID: pick("SELLERID", "sellerId"),
+      COMMISSIONAMOUNT: pick("COMMISSIONAMOUNT", "commissionAmount"),
+      SESSIONEXPIRY: pick("SESSIONEXPIRY", "sessionExpiry"),
+      LANGUAGE: pick("LANGUAGE", "language"),
+      ORDERITEMS: orderItems || undefined,
+      EXTRA: extra || undefined,
+    };
+
+    const data = formEncode(requestPayload);
+    const response = await axios.request({
+      method: "post",
+      maxBodyLength: Infinity,
+      url: PARATIKA_BASE_URL,
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        ...(PARATIKA_COOKIE ? { Cookie: PARATIKA_COOKIE } : {}),
+        Accept: "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        Connection: "keep-alive",
+        "User-Agent": "PostmanRuntime/7.36.0",
+      },
+      data,
+    });
+    const payload = { data: response.data };
+    return res.status(200).json({
+      ok: true,
+      status: 200,
+      paratika: payload,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/payment/pay", requireAuth, async (req, res, next) => {
+  try {
+    const payloadResult = buildPayPayload(req.body || {});
+    if (!payloadResult.ok) {
+      return res.status(400).json({ ok: false, error: payloadResult.error });
+    }
+    const response = await requestParatikaPay(
+      payloadResult.sessionToken,
+      payloadResult.requestPayload
+    );
+
+    return res.status(200).json({
+      ok: true,
+      response: response.data,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/payment/pay/redirect", requireAuth, async (req, res, next) => {
+  try {
+    const payloadResult = buildPayPayload(req.body || {});
+    if (!payloadResult.ok) {
+      return res.status(400).json({ ok: false, error: payloadResult.error });
+    }
+    const response = await requestParatikaPay(
+      payloadResult.sessionToken,
+      payloadResult.requestPayload
+    );
+    res.set("Content-Type", "text/html; charset=utf-8");
+    return res.status(200).send(response.data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.all("/payment/return", (req, res) => {
+  const payload = { ...req.query, ...req.body };
+  console.log("Payment return payload:", payload);
+  if (PAYMENT_RETURN_REDIRECT_URL) {
+    const redirectUrl = new URL(PAYMENT_RETURN_REDIRECT_URL);
+    Object.entries(payload).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") {
+        redirectUrl.searchParams.set(key, String(value));
+      }
+    });
+    return res.redirect(302, redirectUrl.toString());
+  }
+  return res.status(200).json({ ok: true, payload });
+});
+
+app.post("/payment/test-session", requireAuth, async (req, res, next) => {
+  try {
+    const requestPayload = {
+      MERCHANT: "10001831",
+      MERCHANTUSER: "yasinaydin@yeniasya.com.tr",
+      MERCHANTPASSWORD: "YENIasya111..",
+      SESSIONTYPE: "PAYMENTSESSION",
+      ACTION: "SESSIONTOKEN",
+      AMOUNT: "1049.93",
+      CURRENCY: "TRY",
+      MERCHANTPAYMENTID: "PaymentId-1232132132131",
+      RETURNURL: "http://localhost:3000/payment/return",
+      CUSTOMER: "Customer-21321312",
+      CUSTOMERNAME: "Test User",
+      CUSTOMEREMAIL: "test.user@example.com",
+      CUSTOMERIP: "127.0.0.1",
+      CUSTOMERUSERAGENT: "Android",
+      NAMEONCARD: "Test User",
+      CUSTOMERPHONE: "5387401003",
+      ORDERITEMS: JSON.stringify([
+        {
+          productCode: "T00D3AITCC",
+          name: "Galaxy Note 3",
+          description: "Description of Galaxy Note 3",
+          quantity: 2,
+          amount: 449.99,
+        },
+        {
+          productCode: "B00D9AVYBM",
+          name: "Samsung Galaxy S III",
+          description: "Samsung Galaxy S III (S3) Triband White (Boost Mobile)",
+          quantity: 1,
+          amount: 149.95,
+        },
+      ]),
+      BILLTOADDRESSLINE: "Road",
+      BILLTOCITY: "Istanbul",
+      BILLTOCOUNTRY: "TUR",
+      BILLTOPOSTALCODE: "34200",
+      BILLTOPHONE: "123456789",
+      SHIPTOADDRESSLINE: "Road",
+      SHIPTOCITY: "Ankara",
+      SHIPTOCOUNTRY: "TUR",
+      SHIPTOPOSTALCODE: "1105",
+      SHIPTOPHONE: "987654321",
+    };
+
+    console.log("Payment session test request:", requestPayload);
+    const data = formEncode(requestPayload);
+    console.log("Payment session test encoded body:", data);
+
+    const response = await axios.request({
+      method: "post",
+      maxBodyLength: Infinity,
+      url: PARATIKA_BASE_URL,
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        ...(PARATIKA_COOKIE ? { Cookie: PARATIKA_COOKIE } : {}),
+        Accept: "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        Connection: "keep-alive",
+        "User-Agent": "PostmanRuntime/7.36.0",
+      },
+      data,
+    });
+    console.log("Payment session test response:", response.data);
+
+    return res.status(200).json({
+      ok: true,
+      request: requestPayload,
+      encodedBody: data,
+      response: response.data,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 app.post("/mail/send", requireMailAuth, async (req, res) => {
