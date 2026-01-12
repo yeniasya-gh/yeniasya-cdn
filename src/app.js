@@ -1013,6 +1013,12 @@ app.post("/payment/session", requireAuth, async (req, res, next) => {
       });
     }
 
+    const discountAmountFromExtra =
+      extra && typeof extra === "object"
+        ? extra.discountAmount ?? extra.DISCOUNTAMOUNT
+        : undefined;
+    const discountAmount = pick("DISCOUNTAMOUNT", "discountAmount") ?? discountAmountFromExtra;
+
     const requestPayload = {
       ACTION: "SESSIONTOKEN",
       MERCHANTUSER: String(merchantUser),
@@ -1030,7 +1036,7 @@ app.post("/payment/session", requireAuth, async (req, res, next) => {
       CUSTOMERUSERAGENT: pick("CUSTOMERUSERAGENT", "customerUserAgent"),
       NAMEONCARD: pick("NAMEONCARD", "nameOnCard"),
       CUSTOMERPHONE: pick("CUSTOMERPHONE", "customerPhone"),
-      DISCOUNTAMOUNT: pick("DISCOUNTAMOUNT", "discountAmount"),
+      DISCOUNTAMOUNT: discountAmount,
       BILLTOADDRESSLINE: pick("BILLTOADDRESSLINE", "billToAddressLine"),
       BILLTOCITY: pick("BILLTOCITY", "billToCity"),
       BILLTOCOUNTRY: pick("BILLTOCOUNTRY", "billToCountry"),
