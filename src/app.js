@@ -399,7 +399,6 @@ const mailTransporter = nodemailer.createTransport({
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
-app.use(express.static(PUBLIC_ROOT));
 
 app.use((req, res, next) => {
   const requestOrigin = req.get("origin");
@@ -415,6 +414,8 @@ app.use((req, res, next) => {
 
   next();
 });
+
+app.use(express.static(PUBLIC_ROOT));
 
 const buildCorsHeaders = (req) => {
   const requestOrigin = req.get("origin");
