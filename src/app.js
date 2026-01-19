@@ -9,7 +9,7 @@ const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const axios = require("axios");
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 // Hardcoded token per request (env not used intentionally).
 const AUTH_TOKEN = "kPPm8b-12kA-9PxQ-YY822L";
 // Resolve to absolute path so sendFile receives an absolute path.
@@ -1138,6 +1138,8 @@ app.all("/payment/return", (req, res) => {
     String(responseCode || "") === "00" &&
     String(responseMsg || "").trim().toLowerCase() === "approved";
 
+  const pgOrderId = payload.pgOrderId || payload.pgorderid || null;
+
   const normalized = {
     merchantPaymentId:
       payload.merchantPaymentId || payload.merchantpaymentid || null,
@@ -1145,15 +1147,24 @@ app.all("/payment/return", (req, res) => {
     sessionToken: payload.sessionToken || payload.sessiontoken || null,
     responseCode: responseCode || null,
     responseMsg: responseMsg || null,
+    pgOrderId: pgOrderId || null,
     errorCode: payload.errorCode || payload.errorcode || null,
     errorMsg: decodeValue(payload.errorMsg || payload.errormsg),
     raw: payload,
   };
 
-  if (isApproved) {
-    return res.status(200).json({ ok: true, approved: true, ...normalized });
-  }
-  return res.status(200).json({ ok: false, approved: false, ...normalized });
+  const params = new URLSearchParams({
+    responseCode: normalized.responseCode || "",
+    responseMsg: normalized.responseMsg || "",
+    merchantPaymentId: normalized.merchantPaymentId || "",
+    pgOrderId: normalized.pgOrderId || "",
+  });
+
+  const redirectTarget = isApproved
+    ? `/payment/pay/success?${params.toString()}`
+    : `/payment/pay/error?${params.toString()}`;
+
+  return res.redirect(redirectTarget);
 });
 
 app.post("/payment/test-session", requireAuth, async (req, res, next) => {
