@@ -65,6 +65,47 @@ const parsePrivatePath = (input) => {
   return { type, filename };
 };
 
+const logPdfRequest = ({
+  req,
+  scope,
+  route,
+  action,
+  type,
+  filename,
+  status,
+  outcome,
+  message,
+  error,
+}) => {
+  const header = (key) =>
+    req && typeof req.get === "function" ? req.get(key) : undefined;
+  const payload = {
+    ts: new Date().toISOString(),
+    scope,
+    route,
+    action,
+    method: req?.method,
+    path: req?.originalUrl || req?.url,
+    status,
+    type,
+    filename,
+    ip: req?.ip,
+    referer: header("referer") || header("origin"),
+    ua: header("user-agent"),
+    message: message || error?.message,
+  };
+  const line = `[pdf] ${JSON.stringify(payload)}`;
+  if (outcome === "error") {
+    if (error?.stack) {
+      console.error(line, error.stack);
+    } else {
+      console.error(line);
+    }
+  } else {
+    console.log(line);
+  }
+};
+
 const paths = {
   kitap: {
     public: path.join(STORAGE_ROOT, "kitap", "public"),
@@ -157,6 +198,17 @@ const requireAuth = (req, res, next) => {
     : raw;
 
   if (!token || token !== AUTH_TOKEN) {
+    if ((req.path || "").startsWith("/private")) {
+      logPdfRequest({
+        req,
+        scope: "private",
+        route: req.path,
+        action: "auth-check",
+        status: 401,
+        outcome: "error",
+        message: "Unauthorized request.",
+      });
+    }
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
 
@@ -467,14 +519,30 @@ const verifyViewToken = (token) => {
   }
 };
 
-const serveFile = (filePath, res, extraHeaders = {}) => {
+const serveFile = (filePath, res, extraHeaders = {}, logContext = null) => {
   Object.entries(extraHeaders).forEach(([key, value]) => res.set(key, value));
   res.sendFile(filePath, (sendErr) => {
     if (sendErr) {
       console.error(`sendFile error for ${filePath}:`, sendErr);
+      if (logContext) {
+        logPdfRequest({
+          ...logContext,
+          status: sendErr.status || sendErr.statusCode || 500,
+          outcome: "error",
+          message: "File send failed.",
+          error: sendErr,
+        });
+      }
       if (!res.headersSent) {
         res.status(500).json({ ok: false, error: "File send failed." });
       }
+    } else if (logContext) {
+      logPdfRequest({
+        ...logContext,
+        status: logContext.status || res.statusCode || 200,
+        outcome: "success",
+        message: logContext.message || "PDF delivered.",
+      });
     }
   });
 };
@@ -548,12 +616,38 @@ app.post("/upload/private", upload.single("file"), async (req, res, next) => {
 app.get("/public/:type/:filename", (req, res) => {
   const type = (req.params.type || "").toLowerCase();
   if (!PUBLIC_TYPES.includes(type)) {
+    logPdfRequest({
+      req,
+      scope: "public",
+      route: "/public/:type/:filename",
+      action: "serve-public-file",
+      type,
+      filename: req.params.filename,
+      status: 404,
+      outcome: "error",
+      message: "Unknown type.",
+    });
     return res.status(404).json({ ok: false, error: "Unknown type." });
   }
   const filePath = path.join(paths[type].public, req.params.filename);
+  const logBase = {
+    req,
+    scope: "public",
+    route: "/public/:type/:filename",
+    action: "serve-public-file",
+    type,
+    filename: req.params.filename,
+  };
   fs.stat(filePath, (err, stats) => {
     if (err) {
       console.warn(`Public file missing: ${filePath}`);
+      logPdfRequest({
+        ...logBase,
+        status: 404,
+        outcome: "error",
+        message: "File not found.",
+        error: err,
+      });
       return res.status(404).json({ ok: false, error: "File not found." });
     }
 
@@ -575,30 +669,73 @@ app.get("/public/:type/:filename", (req, res) => {
 
     if (notModifiedByEtag || notModifiedByDate) {
       res.set(cacheHeaders);
+      logPdfRequest({
+        ...logBase,
+        status: 304,
+        outcome: "success",
+        message: "Not modified (cache).",
+      });
       return res.status(304).end();
     }
 
-    serveFile(filePath, res, cacheHeaders);
+    serveFile(filePath, res, cacheHeaders, { ...logBase, status: 200 });
   });
 });
 
 app.get("/private/:type/:filename", requireAuth, (req, res) => {
   const type = (req.params.type || "").toLowerCase();
   if (!PRIVATE_TYPES.includes(type)) {
+    logPdfRequest({
+      req,
+      scope: "private",
+      route: "/private/:type/:filename",
+      action: "serve-private-file",
+      type,
+      filename: req.params.filename,
+      status: 404,
+      outcome: "error",
+      message: "Unknown type.",
+    });
     return res.status(404).json({ ok: false, error: "Unknown type." });
   }
   const targetDir = paths[type]?.private;
   if (!targetDir) {
+    logPdfRequest({
+      req,
+      scope: "private",
+      route: "/private/:type/:filename",
+      action: "serve-private-file",
+      type,
+      filename: req.params.filename,
+      status: 404,
+      outcome: "error",
+      message: "Private destination missing.",
+    });
     return res.status(404).json({ ok: false, error: "Private destination missing." });
   }
   const filePath = path.join(targetDir, req.params.filename);
+  const logBase = {
+    req,
+    scope: "private",
+    route: "/private/:type/:filename",
+    action: "serve-private-file",
+    type,
+    filename: req.params.filename,
+  };
   fs.access(filePath, fs.constants.R_OK, (err) => {
     if (err) {
       console.warn(`Private file missing: ${filePath}`);
+      logPdfRequest({
+        ...logBase,
+        status: 404,
+        outcome: "error",
+        message: "File not found.",
+        error: err,
+      });
       return res.status(404).json({ ok: false, error: "File not found." });
     }
     const corsHeaders = buildCorsHeaders(req);
-    serveFile(filePath, res, corsHeaders);
+    serveFile(filePath, res, corsHeaders, { ...logBase, status: 200 });
   });
 });
 
@@ -606,6 +743,16 @@ app.post("/private/view", requireAuth, (req, res) => {
   const rawPath = req.body?.path || req.body?.pdf || req.body?.file;
   const parsed = parsePrivatePath(rawPath);
   if (!parsed) {
+    logPdfRequest({
+      req,
+      scope: "private",
+      route: "/private/view",
+      action: "view-inline",
+      filename: rawPath,
+      status: 400,
+      outcome: "error",
+      message: "Invalid path format.",
+    });
     return res.status(400).json({
       ok: false,
       error: "path must be like /private/<type>/<file.pdf>",
@@ -613,16 +760,42 @@ app.post("/private/view", requireAuth, (req, res) => {
   }
   const targetDir = paths[parsed.type]?.private;
   if (!targetDir) {
+    logPdfRequest({
+      req,
+      scope: "private",
+      route: "/private/view",
+      action: "view-inline",
+      type: parsed.type,
+      filename: parsed.filename,
+      status: 404,
+      outcome: "error",
+      message: "Unknown type.",
+    });
     return res.status(404).json({ ok: false, error: "Unknown type." });
   }
   const filePath = path.join(targetDir, parsed.filename);
+  const logBase = {
+    req,
+    scope: "private",
+    route: "/private/view",
+    action: "view-inline",
+    type: parsed.type,
+    filename: parsed.filename,
+  };
   fs.access(filePath, fs.constants.R_OK, (err) => {
     if (err) {
+      logPdfRequest({
+        ...logBase,
+        status: 404,
+        outcome: "error",
+        message: "File not found.",
+        error: err,
+      });
       return res.status(404).json({ ok: false, error: "File not found." });
     }
     const corsHeaders = buildCorsHeaders(req);
 
-    res.set({
+    const headers = {
       ...corsHeaders,
       "Content-Type": "application/pdf",
       "Content-Disposition": `inline; filename="${parsed.filename}"`,
@@ -630,15 +803,9 @@ app.post("/private/view", requireAuth, (req, res) => {
       Pragma: "no-cache",
       "X-Content-Type-Options": "nosniff",
       "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
-    });
-    res.sendFile(filePath, (sendErr) => {
-      if (sendErr) {
-        console.error(sendErr);
-        if (!res.headersSent) {
-          res.status(500).json({ ok: false, error: "File send failed." });
-        }
-      }
-    });
+    };
+
+    serveFile(filePath, res, headers, { ...logBase, status: 200 });
   });
 });
 
@@ -646,6 +813,16 @@ app.get("/private/view-file", requireAuth, (req, res) => {
   const rawPath = req.query?.path || req.query?.pdf || req.query?.file;
   const parsed = parsePrivatePath(rawPath);
   if (!parsed) {
+    logPdfRequest({
+      req,
+      scope: "private",
+      route: "/private/view-file",
+      action: "view-file-html",
+      filename: rawPath,
+      status: 400,
+      outcome: "error",
+      message: "Invalid path format.",
+    });
     return res.status(400).json({
       ok: false,
       error: "path must be like /private/<type>/<file.pdf>",
@@ -653,13 +830,39 @@ app.get("/private/view-file", requireAuth, (req, res) => {
   }
   const targetDir = paths[parsed.type]?.private;
   if (!targetDir) {
+    logPdfRequest({
+      req,
+      scope: "private",
+      route: "/private/view-file",
+      action: "view-file-html",
+      type: parsed.type,
+      filename: parsed.filename,
+      status: 404,
+      outcome: "error",
+      message: "Unknown type.",
+    });
     return res.status(404).json({ ok: false, error: "Unknown type." });
   }
 
   const filePath = path.join(targetDir, parsed.filename);
+  const logBase = {
+    req,
+    scope: "private",
+    route: "/private/view-file",
+    action: "view-file-html",
+    type: parsed.type,
+    filename: parsed.filename,
+  };
   fs.readFile(filePath, (err, data) => {
     if (err) {
       console.warn(`Private file missing for view-file: ${filePath}`);
+      logPdfRequest({
+        ...logBase,
+        status: 404,
+        outcome: "error",
+        message: "File not found.",
+        error: err,
+      });
       return res.status(404).json({ ok: false, error: "File not found." });
     }
 
@@ -700,6 +903,12 @@ app.get("/private/view-file", requireAuth, (req, res) => {
 </html>`;
 
     res.send(html);
+    logPdfRequest({
+      ...logBase,
+      status: 200,
+      outcome: "success",
+      message: "Inline base64 viewer served.",
+    });
   });
 });
 
@@ -736,6 +945,15 @@ app.get("/private/view-secure", (req, res) => {
   const token = req.query?.token;
   const validation = verifyViewToken(token);
   if (!validation.ok) {
+    logPdfRequest({
+      req,
+      scope: "private",
+      route: "/private/view-secure",
+      action: "view-secure",
+      status: 401,
+      outcome: "error",
+      message: validation.error || "Unauthorized.",
+    });
     return res.status(401).json({ ok: false, error: validation.error || "Unauthorized." });
   }
   const requestedPage = Number.parseInt(req.query?.page, 10);
@@ -749,15 +967,50 @@ app.get("/private/view-secure", (req, res) => {
       : 1.1;
   const parsed = parsePrivatePath(validation.payload.path);
   if (!parsed) {
+    logPdfRequest({
+      req,
+      scope: "private",
+      route: "/private/view-secure",
+      action: "view-secure",
+      status: 400,
+      outcome: "error",
+      message: "Invalid token path.",
+    });
     return res.status(400).json({ ok: false, error: "Invalid token path." });
   }
   const targetDir = paths[parsed.type]?.private;
   if (!targetDir) {
+    logPdfRequest({
+      req,
+      scope: "private",
+      route: "/private/view-secure",
+      action: "view-secure",
+      type: parsed.type,
+      filename: parsed.filename,
+      status: 404,
+      outcome: "error",
+      message: "Unknown type.",
+    });
     return res.status(404).json({ ok: false, error: "Unknown type." });
   }
   const filePath = path.join(targetDir, parsed.filename);
+  const logBase = {
+    req,
+    scope: "private",
+    route: "/private/view-secure",
+    action: "view-secure",
+    type: parsed.type,
+    filename: parsed.filename,
+  };
   fs.access(filePath, fs.constants.R_OK, (err) => {
     if (err) {
+      logPdfRequest({
+        ...logBase,
+        status: 404,
+        outcome: "error",
+        message: "File not found.",
+        error: err,
+      });
       return res.status(404).json({ ok: false, error: "File not found." });
     }
     const corsHeaders = buildCorsHeaders(req);
@@ -939,7 +1192,14 @@ app.get("/private/view-secure", (req, res) => {
         "X-Content-Type-Options": "nosniff",
         "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
       });
-      return res.send(html);
+      res.send(html);
+      logPdfRequest({
+        ...logBase,
+        status: 200,
+        outcome: "success",
+        message: "Secure viewer HTML served.",
+      });
+      return;
     }
     res.set({
       ...corsHeaders,
@@ -950,14 +1210,7 @@ app.get("/private/view-secure", (req, res) => {
       "X-Content-Type-Options": "nosniff",
       "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
     });
-    res.sendFile(filePath, (sendErr) => {
-      if (sendErr) {
-        console.error(sendErr);
-        if (!res.headersSent) {
-          res.status(500).json({ ok: false, error: "File send failed." });
-        }
-      }
-    });
+    serveFile(filePath, res, {}, { ...logBase, status: 200, message: "Secure PDF delivered." });
   });
 });
 
