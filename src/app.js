@@ -49,6 +49,11 @@ const PARATIKA_MERCHANTPASSWORD = process.env.PARATIKA_MERCHANTPASSWORD || "";
 const PARATIKA_MERCHANT = process.env.PARATIKA_MERCHANT || "";
 const PARATIKA_RETURNURL = process.env.PARATIKA_RETURNURL || "";
 const PARATIKA_COOKIE = process.env.PARATIKA_COOKIE || "";
+const BUNNY_SETTINGS = {
+  cdnUrl: process.env.BUNNY_CDN_URL || "yeniasya.b-cdn.net",
+  storageZone: process.env.BUNNY_STORAGE_ZONE || "yeniasya",
+  accessKey: process.env.BUNNY_ACCESS_KEY || "",
+};
 
 const PUBLIC_TYPES = ["kitap", "gazete", "dergi", "ek", "slider"];
 const PRIVATE_TYPES = ["kitap", "gazete", "dergi", "ek"];
@@ -171,24 +176,12 @@ const fileFilter = (req, file, cb) => {
   cb(null, true);
 };
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, TMP_DIR);
-  },
-  filename: (req, file, cb) => {
-    // Add a UUID to avoid collisions when multiple uploads land in the same ms.
-    const ext = path.extname(file.originalname);
-    const base = path.basename(file.originalname, ext).replace(/\s+/g, "_");
-    const unique = crypto.randomUUID();
-    const stamp = Date.now();
-    cb(null, `${stamp}-${unique}-${base}${ext}`);
-  },
-});
+const storage = multer.memoryStorage();
 
 const upload = multer({
   storage,
   fileFilter,
-  limits: { fileSize: 20 * 1024 * 1024 },
+  limits: { fileSize: 50 * 1024 * 1024 }, // Increased limit for BunnyCDN uploads
 });
 
 const requireAuth = (req, res, next) => {
@@ -547,6 +540,25 @@ const serveFile = (filePath, res, extraHeaders = {}, logContext = null) => {
   });
 };
 
+const generateUniqueFilename = (originalName) => {
+  const ext = path.extname(originalName);
+  const base = path.basename(originalName, ext).replace(/\s+/g, "_");
+  const unique = crypto.randomUUID();
+  const stamp = Date.now();
+  return `${stamp}-${unique}-${base}${ext}`;
+};
+
+const uploadToBunny = async (fileBuffer, type, scope, filename) => {
+  const url = `https://storage.bunnycdn.com/${BUNNY_SETTINGS.storageZone}/${type}/${scope}/${filename}`;
+  const response = await axios.put(url, fileBuffer, {
+    headers: {
+      AccessKey: BUNNY_SETTINGS.accessKey,
+      "Content-Type": "application/octet-stream",
+    },
+  });
+  return response.data;
+};
+
 const moveToFinal = (file, targetDir) =>
   new Promise((resolve, reject) => {
     const tmpPath = file.path || path.join(file.destination, file.filename);
@@ -569,14 +581,16 @@ app.post("/upload/public", upload.single("file"), async (req, res, next) => {
     if (!req.file) {
       return res.status(400).json({ ok: false, error: "File is required." });
     }
-    const targetDir = paths[type].public;
-    const { filename } = await moveToFinal(req.file, targetDir);
+
+    const filename = generateUniqueFilename(req.file.originalname);
+    await uploadToBunny(req.file.buffer, type, "public", filename);
+
     return res.json({
       ok: true,
       scope: "public",
       type,
       file: filename,
-      url: `/public/${type}/${filename}`,
+      url: `https://${BUNNY_SETTINGS.cdnUrl}/${type}/public/${filename}`,
     });
   } catch (err) {
     next(err);
@@ -594,19 +608,16 @@ app.post("/upload/private", upload.single("file"), async (req, res, next) => {
     if (!req.file) {
       return res.status(400).json({ ok: false, error: "File is required." });
     }
-    const targetDir = paths[type]?.private;
-    if (!targetDir) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Private destination not configured for type." });
-    }
-    const { filename } = await moveToFinal(req.file, targetDir);
+
+    const filename = generateUniqueFilename(req.file.originalname);
+    await uploadToBunny(req.file.buffer, type, "private", filename);
+
     return res.json({
       ok: true,
       scope: "private",
       type,
       file: filename,
-      url: `/private/${type}/${filename}`,
+      url: `https://${BUNNY_SETTINGS.cdnUrl}/${type}/private/${filename}`,
     });
   } catch (err) {
     next(err);
