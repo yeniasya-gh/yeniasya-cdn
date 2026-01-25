@@ -970,167 +970,161 @@ app.get("/private/view-secure", async (req, res) => {
 <html lang="tr">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>${parsed.filename}</title>
   <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #0f1115; color: #dfe7ff; font-family: "Inter", "Segoe UI", sans-serif; }
-    .chrome { position: fixed; top: 0; left: 0; right: 0; height: 64px; display: flex; align-items: center; gap: 12px; padding: 0 16px; background: rgba(12,14,20,0.92); border-bottom: 1px solid #1f2533; backdrop-filter: blur(8px); z-index: 10; }
-    .spacer { flex: 1; }
-    .pill { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 999px; background: #1a2232; border: 1px solid #202a3d; font-size: 13px; color: #c7d2ff; }
-    button { cursor: pointer; background: #2b3650; border: 1px solid #3a4670; color: #dfe7ff; padding: 8px 12px; border-radius: 8px; font-size: 13px; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .canvas-wrap { position: absolute; inset: 64px 0 0 0; overflow: auto; display: flex; justify-content: center; background: #0f1115; }
-    #pdf-canvas { margin: 16px auto 32px auto; box-shadow: 0 16px 48px rgba(0,0,0,0.35); border-radius: 6px; }
-    .input { background: #101520; border: 1px solid #1f2738; color: #cfd9ff; padding: 8px 10px; border-radius: 8px; width: 72px; text-align: center; }
-    .label { font-size: 12px; opacity: 0.7; }
-    .controls { display: inline-flex; align-items: center; gap: 8px; }
+    :root { color-scheme: dark; --chrome-bg: rgba(18,22,30,0.95); --border: #2a3345; --pill-bg: #1e2533; --accent: #4f8cff; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #0b0d11; color: #e2e8f0; font-family: "Inter", system-ui, -apple-system, sans-serif; overflow: hidden; }
+    .chrome { position: fixed; top: 0; left: 0; right: 0; height: 60px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; background: var(--chrome-bg); border-bottom: 1px solid var(--border); backdrop-filter: blur(12px); z-index: 100; }
+    .title { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; opacity: 0.8; }
+    .pill-group { display: flex; align-items: center; gap: 8px; background: var(--pill-bg); padding: 4px; border-radius: 12px; border: 1px solid var(--border); }
+    button { cursor: pointer; background: transparent; border: none; color: #fff; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; border-radius: 8px; transition: all 0.2s; font-size: 18px; }
+    button:hover { background: rgba(255,255,255,0.1); }
+    button:active { transform: scale(0.92); }
+    button:disabled { opacity: 0.3; cursor: not-allowed; }
+    .zoom-val { font-size: 13px; font-weight: 600; min-width: 45px; text-align: center; color: var(--accent); }
+    .canvas-wrap { position: absolute; inset: 60px 0 0 0; overflow: auto; display: flex; justify-content: center; align-items: flex-start; scroll-behavior: smooth; -webkit-overflow-scrolling: touch; }
+    #pdf-canvas { margin: 20px auto 40px auto; box-shadow: 0 20px 50px rgba(0,0,0,0.5); border-radius: 4px; background: #fff; transition: transform 0.1s ease-out; }
+    .page-info { display: flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 500; }
+    #page-input { background: rgba(255,255,255,0.05); border: 1px solid var(--border); color: #fff; padding: 4px 0; border-radius: 6px; width: 40px; text-align: center; font-size: 13px; }
+    #status { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--accent); color: white; padding: 8px 16px; border-radius: 20px; font-size: 12px; font-weight: 600; box-shadow: 0 10px 20px rgba(0,0,0,0.3); display: none; z-index: 1000; }
   </style>
   <script type="module">
     import * as pdfjsLib from "/pdfjs/pdf.min.mjs";
     pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs";
 
     const rawUrl = ${JSON.stringify(rawUrl)};
-    const docKey = "pdf-progress:" + ${JSON.stringify(parsed.filename)};
+    const docKey = "pdf-prog:" + ${JSON.stringify(parsed.filename)};
     const startPage = ${pageParam || "null"};
-    const startZoom = ${initialZoom};
-
+    
     let pdfDoc = null;
     let pageNum = startPage || Number(localStorage.getItem(docKey)) || 1;
-    let pageRendering = false;
-    let pageNumPending = null;
-    let scale = startZoom;
-    let lastWheelTs = 0;
+    let isRendering = false;
+    let renderTask = null;
+    let scale = 1.25;
+    let currentRotation = 0;
 
-    async function fetchPdf() {
-      const resp = await fetch(rawUrl);
-      if (!resp.ok) throw new Error("PDF fetch failed");
-      const data = await resp.arrayBuffer();
-      return pdfjsLib.getDocument({ data }).promise;
-    }
+    const canvas = document.getElementById("pdf-canvas");
+    const ctx = canvas.getContext("2d", { alpha: false });
 
-    function renderPage(num) {
-      pageRendering = true;
-      pdfDoc.getPage(num).then(function(page) {
-        const viewport = page.getViewport({ scale });
-        const canvas = document.getElementById("pdf-canvas");
-        const ctx = canvas.getContext("2d");
-        canvas.height = viewport.height;
-        canvas.width = viewport.width;
-
-        const renderContext = { canvasContext: ctx, viewport };
-        const renderTask = page.render(renderContext);
-
-        renderTask.promise.then(function() {
-          pageRendering = false;
-          document.getElementById("page-input").value = num;
-          document.getElementById("page-count").textContent = pdfDoc.numPages;
-          document.getElementById("prev").disabled = num <= 1;
-          document.getElementById("next").disabled = num >= pdfDoc.numPages;
-          localStorage.setItem(docKey, String(num));
-          if (pageNumPending !== null) {
-            renderPage(pageNumPending);
-            pageNumPending = null;
-          }
-        });
-      });
-    }
-
-    function setScale(next) {
-      scale = Math.max(0.5, Math.min(3.0, next));
-      queueRenderPage(pageNum);
-      document.getElementById("zoom").textContent = Math.round(scale * 100) + "%";
-    }
-
-    function queueRenderPage(num) {
-      if (pageRendering) {
-        pageNumPending = num;
-      } else {
-        renderPage(num);
-      }
-    }
-
-    function onPrevPage() {
-      if (pageNum <= 1) return;
-      pageNum--;
-      queueRenderPage(pageNum);
-    }
-
-    function onNextPage() {
-      if (pageNum >= pdfDoc.numPages) return;
-      pageNum++;
-      queueRenderPage(pageNum);
-    }
-
-    function onJump(event) {
-      event.preventDefault();
-      const input = document.getElementById("page-input");
-      const val = Number.parseInt(input.value, 10);
-      if (!Number.isFinite(val)) return;
-      const next = Math.min(Math.max(1, val), pdfDoc.numPages);
-      pageNum = next;
-      queueRenderPage(pageNum);
-    }
-
-    function onWheelScroll(event) {
-      const now = Date.now();
-      if (now - lastWheelTs < 350) return;
-      if (Math.abs(event.deltaY) < 80) return;
-      if (event.deltaY > 0 && pageNum < pdfDoc.numPages) {
-        pageNum++;
-        queueRenderPage(pageNum);
-        lastWheelTs = now;
-      } else if (event.deltaY < 0 && pageNum > 1) {
-        pageNum--;
-        queueRenderPage(pageNum);
-        lastWheelTs = now;
-      }
-    }
-
-    window.addEventListener("DOMContentLoaded", async () => {
-      document.getElementById("prev").addEventListener("click", onPrevPage);
-      document.getElementById("next").addEventListener("click", onNextPage);
-      document.getElementById("zoom-in").addEventListener("click", () => setScale(scale + 0.15));
-      document.getElementById("zoom-out").addEventListener("click", () => setScale(scale - 0.15));
-      document.getElementById("zoom-reset").addEventListener("click", () => setScale(startZoom));
-      document.getElementById("page-form").addEventListener("submit", onJump);
-      document.getElementById("canvas-wrap").addEventListener("wheel", onWheelScroll, { passive: true });
+    async function init() {
       try {
-        pdfDoc = await fetchPdf();
-        if (pageNum > pdfDoc.numPages) pageNum = pdfDoc.numPages;
+        showStatus("Yükleniyor...");
+        const loadingTask = pdfjsLib.getDocument({ url: rawUrl, cMapUrl: "/pdfjs/cmaps/", cMapPacked: true });
+        pdfDoc = await loadingTask.promise;
         document.getElementById("page-count").textContent = pdfDoc.numPages;
-        document.getElementById("zoom").textContent = Math.round(scale * 100) + "%";
+        hideStatus();
+        
+        // Initial auto-scale
+        const page = await pdfDoc.getPage(pageNum);
+        const viewport = page.getViewport({ scale: 1 });
+        const containerWidth = window.innerWidth - 40;
+        scale = containerWidth / viewport.width;
+        if (scale > 2) scale = 1.5;
+        
         renderPage(pageNum);
       } catch (err) {
-        document.getElementById("status").textContent = "PDF yüklenemedi";
+        showStatus("Hata: PDF yüklenemedi", 5000);
         console.error(err);
       }
-    });
+    }
+
+    async function renderPage(num) {
+      if (isRendering && renderTask) {
+        renderTask.cancel();
+      }
+      isRendering = true;
+      pageNum = num;
+      
+      try {
+        const page = await pdfDoc.getPage(num);
+        const pixelRatio = window.devicePixelRatio || 1;
+        const viewport = page.getViewport({ scale: scale, rotation: currentRotation });
+
+        canvas.height = viewport.height * pixelRatio;
+        canvas.width = viewport.width * pixelRatio;
+        canvas.style.height = viewport.height + "px";
+        canvas.style.width = viewport.width + "px";
+
+        const renderContext = {
+          canvasContext: ctx,
+          viewport: viewport,
+          transform: [pixelRatio, 0, 0, pixelRatio, 0, 0]
+        };
+
+        renderTask = page.render(renderContext);
+        await renderTask.promise;
+        
+        isRendering = false;
+        document.getElementById("page-input").value = num;
+        document.getElementById("zoom-val").textContent = Math.round(scale * 100) + "%";
+        document.getElementById("prev").disabled = num <= 1;
+        document.getElementById("next").disabled = num >= pdfDoc.numPages;
+        localStorage.setItem(docKey, String(num));
+      } catch (err) {
+        if (err.name === "RenderingCancelledException") return;
+        isRendering = false;
+        console.error(err);
+      }
+    }
+
+    function changeScale(delta) {
+      scale = Math.min(Math.max(0.5, scale + delta), 4.0);
+      renderPage(pageNum);
+    }
+
+    function showStatus(msg, duration) {
+      const el = document.getElementById("status");
+      el.textContent = msg;
+      el.style.display = "block";
+      if (duration) setTimeout(hideStatus, duration);
+    }
+
+    function hideStatus() {
+      document.getElementById("status").style.display = "none";
+    }
+
+    // Events
+    document.getElementById("prev").onclick = () => pageNum > 1 && renderPage(pageNum - 1);
+    document.getElementById("next").onclick = () => pageNum < pdfDoc.numPages && renderPage(pageNum + 1);
+    document.getElementById("zoom-in").onclick = () => changeScale(0.25);
+    document.getElementById("zoom-out").onclick = () => changeScale(-0.25);
+    document.getElementById("page-form").onsubmit = (e) => {
+      e.preventDefault();
+      const val = parseInt(document.getElementById("page-input").value);
+      if (val > 0 && val <= pdfDoc.numPages) renderPage(val);
+    };
+
+    window.onresize = () => {
+      // Re-render to adjust for pixel ratio or container changes if needed
+      // But avoid heavy re-renders on simple mobile keyboard pops
+    };
+
+    init();
   </script>
 </head>
 <body>
   <div class="chrome">
-    <div class="spacer"></div>
-    <div class="pill controls">
-      <button id="prev">&#8592;</button>
-      <form id="page-form" style="display:inline-flex;align-items:center;gap:6px;">
-        <input class="input" id="page-input" type="number" min="1" value="${pageParam || 1}" />
-        <span class="label">/ <span id="page-count">-</span></span>
+    <div class="title">${parsed.filename}</div>
+    <div class="pill-group">
+      <button id="prev" title="Önceki">&#8592;</button>
+      <form id="page-form" class="page-info">
+        <input id="page-input" type="number" value="1" />
+        <span>/ <span id="page-count">-</span></span>
       </form>
-      <button id="next">&#8594;</button>
+      <button id="next" title="Sonraki">&#8594;</button>
     </div>
-    <div class="pill controls">
-      <button id="zoom-out">-</button>
-      <span id="zoom">100%</span>
-      <button id="zoom-in">+</button>
-      <button id="zoom-reset">=</button>
+    <div class="pill-group">
+      <button id="zoom-out" title="Uzaklaştır">&#8722;</button>
+      <div class="zoom-val" id="zoom-val">100%</div>
+      <button id="zoom-in" title="Yakınlaştır">&#43;</button>
     </div>
-    <div id="status" style="font-size:12px; color:#7da5ff; padding-left:12px;"></div>
   </div>
   <div class="canvas-wrap" id="canvas-wrap">
     <canvas id="pdf-canvas"></canvas>
   </div>
+  <div id="status"></div>
 </body>
 </html>`;
 
