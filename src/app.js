@@ -592,14 +592,15 @@ const fetchFromBunny = async (type, scope, filename) => {
       headers: {
         AccessKey: BUNNY_SETTINGS.accessKey,
       },
-      responseType: "arraybuffer", // Important for binary files like PDFs/Images
+      responseType: "arraybuffer",
     });
     return response.data;
   } catch (err) {
     const errorMsg = err.response?.data?.Message || err.response?.data || err.message;
     const statusCode = err.response?.status || 500;
     console.error(`[BunnyCDN Fetch Error] ${statusCode}: ${JSON.stringify(errorMsg)}`);
-    throw new Error(`BunnyCDN fetch failed (${statusCode}): ${JSON.stringify(errorMsg)}`);
+    console.error(`[BunnyCDN Fetch Details] URL: ${url}`);
+    throw new Error(`BunnyCDN fetch failed (${statusCode})`);
   }
 };
 
