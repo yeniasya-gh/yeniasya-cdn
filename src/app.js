@@ -61,12 +61,28 @@ const PRIVATE_TYPES = ["kitap", "gazete", "dergi", "ek"];
 const parsePrivatePath = (input) => {
   if (!input) return null;
   const cleaned = String(input).trim();
-  const match = cleaned.match(/^\/?private\/([a-z]+)\/([^/]+)$/i);
-  if (!match) return null;
-  const type = match[1].toLowerCase();
-  if (!PRIVATE_TYPES.includes(type)) return null;
-  const filename = path.basename(match[2]);
-  if (!filename.toLowerCase().endsWith(".pdf")) return null;
+  // Match /private/type/file OR /type/private/file
+  let type, filename;
+
+  const m1 = cleaned.match(/^\/?private\/([a-z0-9_-]+)\/([^/]+)$/i);
+  const m2 = cleaned.match(/^\/?([a-z0-9_-]+)\/private\/([^/]+)$/i);
+
+  if (m1) {
+    type = m1[1].toLowerCase();
+    filename = m1[2];
+  } else if (m2) {
+    type = m2[1].toLowerCase();
+    filename = m2[2];
+  } else {
+    return null;
+  }
+
+  // Basic validation
+  if (!type || !filename) return null;
+
+  // Optional: check if type is allowed
+  // if (!PRIVATE_TYPES.includes(type)) return null;
+
   return { type, filename };
 };
 
