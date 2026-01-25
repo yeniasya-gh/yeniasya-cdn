@@ -550,13 +550,41 @@ const generateUniqueFilename = (originalName) => {
 
 const uploadToBunny = async (fileBuffer, type, scope, filename) => {
   const url = `https://storage.bunnycdn.com/${BUNNY_SETTINGS.storageZone}/${type}/${scope}/${filename}`;
-  const response = await axios.put(url, fileBuffer, {
-    headers: {
-      AccessKey: BUNNY_SETTINGS.accessKey,
-      "Content-Type": "application/octet-stream",
-    },
-  });
-  return response.data;
+  try {
+    const response = await axios.put(url, fileBuffer, {
+      headers: {
+        AccessKey: BUNNY_SETTINGS.accessKey,
+        "Content-Type": "application/octet-stream",
+      },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    });
+    return response.data;
+  } catch (err) {
+    const errorMsg = err.response?.data?.Message || err.response?.data || err.message;
+    const statusCode = err.response?.status || 500;
+    console.error(`[BunnyCDN Upload Error] ${statusCode}: ${JSON.stringify(errorMsg)}`);
+    console.error(`[BunnyCDN Request Details] URL: ${url}, Zone: ${BUNNY_SETTINGS.storageZone}`);
+    throw new Error(`BunnyCDN upload failed (${statusCode}): ${JSON.stringify(errorMsg)}`);
+  }
+};
+
+const fetchFromBunny = async (type, scope, filename) => {
+  const url = `https://storage.bunnycdn.com/${BUNNY_SETTINGS.storageZone}/${type}/${scope}/${filename}`;
+  try {
+    const response = await axios.get(url, {
+      headers: {
+        AccessKey: BUNNY_SETTINGS.accessKey,
+      },
+      responseType: "arraybuffer", // Important for binary files like PDFs/Images
+    });
+    return response.data;
+  } catch (err) {
+    const errorMsg = err.response?.data?.Message || err.response?.data || err.message;
+    const statusCode = err.response?.status || 500;
+    console.error(`[BunnyCDN Fetch Error] ${statusCode}: ${JSON.stringify(errorMsg)}`);
+    throw new Error(`BunnyCDN fetch failed (${statusCode}): ${JSON.stringify(errorMsg)}`);
+  }
 };
 
 const moveToFinal = (file, targetDir) =>
@@ -693,7 +721,7 @@ app.get("/public/:type/:filename", (req, res) => {
   });
 });
 
-app.get("/private/:type/:filename", requireAuth, (req, res) => {
+app.get("/private/:type/:filename", requireAuth, async (req, res) => {
   const type = (req.params.type || "").toLowerCase();
   if (!PRIVATE_TYPES.includes(type)) {
     logPdfRequest({
@@ -709,22 +737,7 @@ app.get("/private/:type/:filename", requireAuth, (req, res) => {
     });
     return res.status(404).json({ ok: false, error: "Unknown type." });
   }
-  const targetDir = paths[type]?.private;
-  if (!targetDir) {
-    logPdfRequest({
-      req,
-      scope: "private",
-      route: "/private/:type/:filename",
-      action: "serve-private-file",
-      type,
-      filename: req.params.filename,
-      status: 404,
-      outcome: "error",
-      message: "Private destination missing.",
-    });
-    return res.status(404).json({ ok: false, error: "Private destination missing." });
-  }
-  const filePath = path.join(targetDir, req.params.filename);
+
   const logBase = {
     req,
     scope: "private",
@@ -733,24 +746,39 @@ app.get("/private/:type/:filename", requireAuth, (req, res) => {
     type,
     filename: req.params.filename,
   };
-  fs.access(filePath, fs.constants.R_OK, (err) => {
-    if (err) {
-      console.warn(`Private file missing: ${filePath}`);
-      logPdfRequest({
-        ...logBase,
-        status: 404,
-        outcome: "error",
-        message: "File not found.",
-        error: err,
-      });
-      return res.status(404).json({ ok: false, error: "File not found." });
-    }
+
+  try {
+    const data = await fetchFromBunny(type, "private", req.params.filename);
     const corsHeaders = buildCorsHeaders(req);
-    serveFile(filePath, res, corsHeaders, { ...logBase, status: 200 });
-  });
+    Object.entries(corsHeaders).forEach(([key, value]) => res.set(key, value));
+
+    // Determine content type based on extension
+    const ext = path.extname(req.params.filename).toLowerCase();
+    const contentType = ext === ".pdf" ? "application/pdf" : "application/octet-stream";
+    res.set("Content-Type", contentType);
+
+    res.send(data);
+
+    logPdfRequest({
+      ...logBase,
+      status: 200,
+      outcome: "success",
+      message: "File delivered from BunnyCDN.",
+    });
+  } catch (err) {
+    logPdfRequest({
+      ...logBase,
+      status: err.message.includes("404") ? 404 : 500,
+      outcome: "error",
+      message: "Fetch from BunnyCDN failed.",
+      error: err,
+    });
+    const status = err.message.includes("404") ? 404 : 500;
+    res.status(status).json({ ok: false, error: "File not found or fetch failed." });
+  }
 });
 
-app.post("/private/view", requireAuth, (req, res) => {
+app.post("/private/view", requireAuth, async (req, res) => {
   const rawPath = req.body?.path || req.body?.pdf || req.body?.file;
   const parsed = parsePrivatePath(rawPath);
   if (!parsed) {
@@ -769,22 +797,7 @@ app.post("/private/view", requireAuth, (req, res) => {
       error: "path must be like /private/<type>/<file.pdf>",
     });
   }
-  const targetDir = paths[parsed.type]?.private;
-  if (!targetDir) {
-    logPdfRequest({
-      req,
-      scope: "private",
-      route: "/private/view",
-      action: "view-inline",
-      type: parsed.type,
-      filename: parsed.filename,
-      status: 404,
-      outcome: "error",
-      message: "Unknown type.",
-    });
-    return res.status(404).json({ ok: false, error: "Unknown type." });
-  }
-  const filePath = path.join(targetDir, parsed.filename);
+
   const logBase = {
     req,
     scope: "private",
@@ -793,20 +806,12 @@ app.post("/private/view", requireAuth, (req, res) => {
     type: parsed.type,
     filename: parsed.filename,
   };
-  fs.access(filePath, fs.constants.R_OK, (err) => {
-    if (err) {
-      logPdfRequest({
-        ...logBase,
-        status: 404,
-        outcome: "error",
-        message: "File not found.",
-        error: err,
-      });
-      return res.status(404).json({ ok: false, error: "File not found." });
-    }
+
+  try {
+    const data = await fetchFromBunny(parsed.type, "private", parsed.filename);
     const corsHeaders = buildCorsHeaders(req);
 
-    const headers = {
+    res.set({
       ...corsHeaders,
       "Content-Type": "application/pdf",
       "Content-Disposition": `inline; filename="${parsed.filename}"`,
@@ -814,10 +819,27 @@ app.post("/private/view", requireAuth, (req, res) => {
       Pragma: "no-cache",
       "X-Content-Type-Options": "nosniff",
       "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
-    };
+    });
 
-    serveFile(filePath, res, headers, { ...logBase, status: 200 });
-  });
+    res.send(data);
+
+    logPdfRequest({
+      ...logBase,
+      status: 200,
+      outcome: "success",
+      message: "Inline PDF served from BunnyCDN.",
+    });
+  } catch (err) {
+    logPdfRequest({
+      ...logBase,
+      status: err.message.includes("404") ? 404 : 500,
+      outcome: "error",
+      message: "Fetch from BunnyCDN failed.",
+      error: err,
+    });
+    const status = err.message.includes("404") ? 404 : 500;
+    res.status(status).json({ ok: false, error: "File not found or fetch failed." });
+  }
 });
 
 app.get("/private/view-file", requireAuth, (req, res) => {
@@ -840,57 +862,51 @@ app.get("/private/view-file", requireAuth, (req, res) => {
     });
   }
   const targetDir = paths[parsed.type]?.private;
-  if (!targetDir) {
-    logPdfRequest({
+  app.get("/private/view-file", requireAuth, async (req, res) => {
+    const rawPath = req.query?.path || req.query?.pdf || req.query?.file;
+    const parsed = parsePrivatePath(rawPath);
+    if (!parsed) {
+      logPdfRequest({
+        req,
+        scope: "private",
+        route: "/private/view-file",
+        action: "view-file-html",
+        filename: rawPath,
+        status: 400,
+        outcome: "error",
+        message: "Invalid path format.",
+      });
+      return res.status(400).json({
+        ok: false,
+        error: "path must be like /private/<type>/<file.pdf>",
+      });
+    }
+
+    const logBase = {
       req,
       scope: "private",
       route: "/private/view-file",
       action: "view-file-html",
       type: parsed.type,
       filename: parsed.filename,
-      status: 404,
-      outcome: "error",
-      message: "Unknown type.",
-    });
-    return res.status(404).json({ ok: false, error: "Unknown type." });
-  }
+    };
 
-  const filePath = path.join(targetDir, parsed.filename);
-  const logBase = {
-    req,
-    scope: "private",
-    route: "/private/view-file",
-    action: "view-file-html",
-    type: parsed.type,
-    filename: parsed.filename,
-  };
-  fs.readFile(filePath, (err, data) => {
-    if (err) {
-      console.warn(`Private file missing for view-file: ${filePath}`);
-      logPdfRequest({
-        ...logBase,
-        status: 404,
-        outcome: "error",
-        message: "File not found.",
-        error: err,
+    try {
+      const buffer = await fetchFromBunny(parsed.type, "private", parsed.filename);
+      const corsHeaders = buildCorsHeaders(req);
+      const base64 = buffer.toString("base64");
+      const dataUrl = `data:application/pdf;base64,${base64}`;
+      const safeTitle = parsed.filename.replace(/"/g, "");
+
+      res.set({
+        ...corsHeaders,
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        Pragma: "no-cache",
+        "X-Content-Type-Options": "nosniff",
       });
-      return res.status(404).json({ ok: false, error: "File not found." });
-    }
 
-    const corsHeaders = buildCorsHeaders(req);
-    const base64 = data.toString("base64");
-    const dataUrl = `data:application/pdf;base64,${base64}`;
-    const safeTitle = parsed.filename.replace(/"/g, "");
-
-    res.set({
-      ...corsHeaders,
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-store, no-cache, must-revalidate, private",
-      Pragma: "no-cache",
-      "X-Content-Type-Options": "nosniff",
-    });
-
-    const html = `<!doctype html>
+      const html = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -913,121 +929,131 @@ app.get("/private/view-file", requireAuth, (req, res) => {
 </body>
 </html>`;
 
-    res.send(html);
-    logPdfRequest({
-      ...logBase,
-      status: 200,
-      outcome: "success",
-      message: "Inline base64 viewer served.",
+      res.send(html);
+      logPdfRequest({
+        ...logBase,
+        status: 200,
+        outcome: "success",
+        message: "Inline base64 viewer served from BunnyCDN.",
+      });
+    } catch (err) {
+      logPdfRequest({
+        ...logBase,
+        status: err.message.includes("404") ? 404 : 500,
+        outcome: "error",
+        message: "Fetch from BunnyCDN failed.",
+        error: err,
+      });
+      const status = err.message.includes("404") ? 404 : 500;
+      res.status(status).json({ ok: false, error: "File not found or fetch failed." });
+    }
+  });
+
+  app.post("/private/view-token", requireAuth, (req, res) => {
+    const rawPath = req.body?.path || req.body?.pdf || req.body?.file;
+    const parsed = parsePrivatePath(rawPath);
+    if (!parsed) {
+      return res.status(400).json({
+        ok: false,
+        error: "path must be like /private/<type>/<file.pdf>",
+      });
+    }
+    if (!VIEW_TOKEN_SECRET) {
+      return res.status(500).json({ ok: false, error: "VIEW_TOKEN_SECRET missing." });
+    }
+    const ttlMinutes =
+      Number.isFinite(VIEW_TOKEN_TTL_MIN) && VIEW_TOKEN_TTL_MIN > 0
+        ? VIEW_TOKEN_TTL_MIN
+        : 5;
+    const exp = Date.now() + ttlMinutes * 60_000;
+    const payload = { path: `/private/${parsed.type}/${parsed.filename}`, exp };
+    const token = signViewToken(payload);
+    const url = `/private/view-secure?token=${encodeURIComponent(token)}`;
+    return res.json({
+      ok: true,
+      url,
+      token,
+      expiresAt: new Date(exp).toISOString(),
+      ttlMinutes,
     });
   });
-});
 
-app.post("/private/view-token", requireAuth, (req, res) => {
-  const rawPath = req.body?.path || req.body?.pdf || req.body?.file;
-  const parsed = parsePrivatePath(rawPath);
-  if (!parsed) {
-    return res.status(400).json({
-      ok: false,
-      error: "path must be like /private/<type>/<file.pdf>",
-    });
-  }
-  if (!VIEW_TOKEN_SECRET) {
-    return res.status(500).json({ ok: false, error: "VIEW_TOKEN_SECRET missing." });
-  }
-  const ttlMinutes =
-    Number.isFinite(VIEW_TOKEN_TTL_MIN) && VIEW_TOKEN_TTL_MIN > 0
-      ? VIEW_TOKEN_TTL_MIN
-      : 5;
-  const exp = Date.now() + ttlMinutes * 60_000;
-  const payload = { path: `/private/${parsed.type}/${parsed.filename}`, exp };
-  const token = signViewToken(payload);
-  const url = `/private/view-secure?token=${encodeURIComponent(token)}`;
-  return res.json({
-    ok: true,
-    url,
-    token,
-    expiresAt: new Date(exp).toISOString(),
-    ttlMinutes,
-  });
-});
-
-app.get("/private/view-secure", (req, res) => {
-  const token = req.query?.token;
-  const validation = verifyViewToken(token);
-  if (!validation.ok) {
-    logPdfRequest({
-      req,
-      scope: "private",
-      route: "/private/view-secure",
-      action: "view-secure",
-      status: 401,
-      outcome: "error",
-      message: validation.error || "Unauthorized.",
-    });
-    return res.status(401).json({ ok: false, error: validation.error || "Unauthorized." });
-  }
-  const requestedPage = Number.parseInt(req.query?.page, 10);
-  const pageParam = Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : null;
-  const renderMode = (req.query?.render || "").toLowerCase();
-  const preferViewer = renderMode !== "raw";
-  const requestedZoom = Number.parseFloat(req.query?.zoom);
-  const initialZoom =
-    Number.isFinite(requestedZoom) && requestedZoom > 0.3 && requestedZoom <= 3
-      ? requestedZoom
-      : 1.1;
-  const parsed = parsePrivatePath(validation.payload.path);
-  if (!parsed) {
-    logPdfRequest({
-      req,
-      scope: "private",
-      route: "/private/view-secure",
-      action: "view-secure",
-      status: 400,
-      outcome: "error",
-      message: "Invalid token path.",
-    });
-    return res.status(400).json({ ok: false, error: "Invalid token path." });
-  }
-  const targetDir = paths[parsed.type]?.private;
-  if (!targetDir) {
-    logPdfRequest({
+  app.get("/private/view-secure", (req, res) => {
+    const token = req.query?.token;
+    const validation = verifyViewToken(token);
+    if (!validation.ok) {
+      logPdfRequest({
+        req,
+        scope: "private",
+        route: "/private/view-secure",
+        action: "view-secure",
+        status: 401,
+        outcome: "error",
+        message: validation.error || "Unauthorized.",
+      });
+      return res.status(401).json({ ok: false, error: validation.error || "Unauthorized." });
+    }
+    const requestedPage = Number.parseInt(req.query?.page, 10);
+    const pageParam = Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : null;
+    const renderMode = (req.query?.render || "").toLowerCase();
+    const preferViewer = renderMode !== "raw";
+    const requestedZoom = Number.parseFloat(req.query?.zoom);
+    const initialZoom =
+      Number.isFinite(requestedZoom) && requestedZoom > 0.3 && requestedZoom <= 3
+        ? requestedZoom
+        : 1.1;
+    const parsed = parsePrivatePath(validation.payload.path);
+    if (!parsed) {
+      logPdfRequest({
+        req,
+        scope: "private",
+        route: "/private/view-secure",
+        action: "view-secure",
+        status: 400,
+        outcome: "error",
+        message: "Invalid token path.",
+      });
+      return res.status(400).json({ ok: false, error: "Invalid token path." });
+    }
+    const targetDir = paths[parsed.type]?.private;
+    if (!targetDir) {
+      logPdfRequest({
+        req,
+        scope: "private",
+        route: "/private/view-secure",
+        action: "view-secure",
+        type: parsed.type,
+        filename: parsed.filename,
+        status: 404,
+        outcome: "error",
+        message: "Unknown type.",
+      });
+      return res.status(404).json({ ok: false, error: "Unknown type." });
+    }
+    const filePath = path.join(targetDir, parsed.filename);
+    const logBase = {
       req,
       scope: "private",
       route: "/private/view-secure",
       action: "view-secure",
       type: parsed.type,
       filename: parsed.filename,
-      status: 404,
-      outcome: "error",
-      message: "Unknown type.",
-    });
-    return res.status(404).json({ ok: false, error: "Unknown type." });
-  }
-  const filePath = path.join(targetDir, parsed.filename);
-  const logBase = {
-    req,
-    scope: "private",
-    route: "/private/view-secure",
-    action: "view-secure",
-    type: parsed.type,
-    filename: parsed.filename,
-  };
-  fs.access(filePath, fs.constants.R_OK, (err) => {
-    if (err) {
-      logPdfRequest({
-        ...logBase,
-        status: 404,
-        outcome: "error",
-        message: "File not found.",
-        error: err,
-      });
-      return res.status(404).json({ ok: false, error: "File not found." });
-    }
-    const corsHeaders = buildCorsHeaders(req);
-    if (preferViewer) {
-      const rawUrl = `${req.path}?token=${encodeURIComponent(token)}&render=raw`;
-      const html = `<!doctype html>
+    };
+    fs.access(filePath, fs.constants.R_OK, (err) => {
+      if (err) {
+        logPdfRequest({
+          ...logBase,
+          status: 404,
+          outcome: "error",
+          message: "File not found.",
+          error: err,
+        });
+        return res.status(404).json({ ok: false, error: "File not found." });
+      }
+      const corsHeaders = buildCorsHeaders(req);
+      if (preferViewer) {
+        const rawUrl = `${req.path}?token=${encodeURIComponent(token)}&render=raw`;
+        const html = `<!doctype html>
 <html lang="tr">
 <head>
   <meta charset="UTF-8" />
@@ -1195,368 +1221,368 @@ app.get("/private/view-secure", (req, res) => {
 </body>
 </html>`;
 
+        res.set({
+          ...corsHeaders,
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store, no-cache, must-revalidate, private",
+          Pragma: "no-cache",
+          "X-Content-Type-Options": "nosniff",
+          "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
+        });
+        res.send(html);
+        logPdfRequest({
+          ...logBase,
+          status: 200,
+          outcome: "success",
+          message: "Secure viewer HTML served.",
+        });
+        return;
+      }
       res.set({
         ...corsHeaders,
-        "Content-Type": "text/html; charset=utf-8",
+        "Content-Type": "application/pdf",
+        "Content-Disposition": `inline; filename=\"${parsed.filename}\"`,
         "Cache-Control": "no-store, no-cache, must-revalidate, private",
         Pragma: "no-cache",
         "X-Content-Type-Options": "nosniff",
         "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
       });
-      res.send(html);
-      logPdfRequest({
-        ...logBase,
-        status: 200,
-        outcome: "success",
-        message: "Secure viewer HTML served.",
-      });
-      return;
-    }
-    res.set({
-      ...corsHeaders,
-      "Content-Type": "application/pdf",
-      "Content-Disposition": `inline; filename=\"${parsed.filename}\"`,
-      "Cache-Control": "no-store, no-cache, must-revalidate, private",
-      Pragma: "no-cache",
-      "X-Content-Type-Options": "nosniff",
-      "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
+      serveFile(filePath, res, {}, { ...logBase, status: 200, message: "Secure PDF delivered." });
     });
-    serveFile(filePath, res, {}, { ...logBase, status: 200, message: "Secure PDF delivered." });
   });
-});
 
-app.post("/payment/session", requireAuth, async (req, res, next) => {
-  try {
-    const body = req.body || {};
-    const pick = (...keys) => {
-      for (const key of keys) {
-        const value = body[key];
-        if (value !== undefined && value !== null && value !== "") {
-          return value;
-        }
-      }
-      return undefined;
-    };
-
-    const merchantUser = PARATIKA_MERCHANTUSER || pick("MERCHANTUSER", "merchantUser");
-    const merchantPassword =
-      PARATIKA_MERCHANTPASSWORD || pick("MERCHANTPASSWORD", "merchantPassword");
-    const merchant = PARATIKA_MERCHANT || pick("MERCHANT", "merchant");
-    const returnUrl = PARATIKA_RETURNURL || pick("RETURNURL", "returnUrl");
-    const sessionType = pick("SESSIONTYPE", "sessionType") || "PAYMENTSESSION";
-
-    const missing = [];
-    if (!PARATIKA_BASE_URL) missing.push("PARATIKA_BASE_URL");
-    if (!merchantUser) missing.push("MERCHANTUSER");
-    if (!merchantPassword) missing.push("MERCHANTPASSWORD");
-    if (!merchant) missing.push("MERCHANT");
-    if (!returnUrl) missing.push("RETURNURL");
-
-    if (missing.length) {
-      return res.status(400).json({
-        ok: false,
-        error: `Missing required fields: ${missing.join(", ")}`,
-      });
-    }
-
-    const orderItemsRaw = pick("ORDERITEMS", "orderItems");
-    const orderItems = normalizeJsonField(orderItemsRaw);
-    if (orderItemsRaw && !orderItems) {
-      return res.status(400).json({
-        ok: false,
-        error: "ORDERITEMS must be valid JSON or a JSON string.",
-      });
-    }
-
-    const extraRaw = pick("EXTRA", "extra");
-    const extra = normalizeJsonField(extraRaw);
-    if (extraRaw && !extra) {
-      return res.status(400).json({
-        ok: false,
-        error: "EXTRA must be valid JSON or a JSON string.",
-      });
-    }
-
-    const discountAmountFromExtra =
-      extra && typeof extra === "object"
-        ? extra.discountAmount ?? extra.DISCOUNTAMOUNT
-        : undefined;
-    const discountAmount = pick("DISCOUNTAMOUNT", "discountAmount") ?? discountAmountFromExtra;
-
-    const requestPayload = {
-      ACTION: "SESSIONTOKEN",
-      MERCHANTUSER: String(merchantUser),
-      MERCHANTPASSWORD: String(merchantPassword),
-      MERCHANT: String(merchant),
-      RETURNURL: String(returnUrl),
-      SESSIONTYPE: String(sessionType),
-      AMOUNT: pick("AMOUNT", "amount"),
-      CURRENCY: pick("CURRENCY", "currency"),
-      MERCHANTPAYMENTID: pick("MERCHANTPAYMENTID", "merchantPaymentId"),
-      CUSTOMER: pick("CUSTOMER", "customer"),
-      CUSTOMERNAME: pick("CUSTOMERNAME", "customerName"),
-      CUSTOMEREMAIL: pick("CUSTOMEREMAIL", "customerEmail"),
-      CUSTOMERIP: pick("CUSTOMERIP", "customerIp"),
-      CUSTOMERUSERAGENT: pick("CUSTOMERUSERAGENT", "customerUserAgent"),
-      NAMEONCARD: pick("NAMEONCARD", "nameOnCard"),
-      CUSTOMERPHONE: pick("CUSTOMERPHONE", "customerPhone"),
-      DISCOUNTAMOUNT: discountAmount,
-      BILLTOADDRESSLINE: pick("BILLTOADDRESSLINE", "billToAddressLine"),
-      BILLTOCITY: pick("BILLTOCITY", "billToCity"),
-      BILLTOCOUNTRY: pick("BILLTOCOUNTRY", "billToCountry"),
-      BILLTOPOSTALCODE: pick("BILLTOPOSTALCODE", "billToPostalCode"),
-      BILLTOPHONE: pick("BILLTOPHONE", "billToPhone"),
-      SHIPTOADDRESSLINE: pick("SHIPTOADDRESSLINE", "shipToAddressLine"),
-      SHIPTOCITY: pick("SHIPTOCITY", "shipToCity"),
-      SHIPTOCOUNTRY: pick("SHIPTOCOUNTRY", "shipToCountry"),
-      SHIPTOPOSTALCODE: pick("SHIPTOPOSTALCODE", "shipToPostalCode"),
-      SHIPTOPHONE: pick("SHIPTOPHONE", "shipToPhone"),
-      SELLERID: pick("SELLERID", "sellerId"),
-      COMMISSIONAMOUNT: pick("COMMISSIONAMOUNT", "commissionAmount"),
-      SESSIONEXPIRY: pick("SESSIONEXPIRY", "sessionExpiry"),
-      LANGUAGE: pick("LANGUAGE", "language"),
-      ORDERITEMS: orderItems || undefined,
-      EXTRA: extra || undefined,
-    };
-
-    const data = formEncode(requestPayload);
-    const response = await axios.request({
-      method: "post",
-      maxBodyLength: Infinity,
-      url: PARATIKA_BASE_URL,
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        ...(PARATIKA_COOKIE ? { Cookie: PARATIKA_COOKIE } : {}),
-        Accept: "*/*",
-        "Accept-Encoding": "gzip, deflate, br",
-        Connection: "keep-alive",
-        "User-Agent": "PostmanRuntime/7.36.0",
-      },
-      data,
-    });
-    const payload = { data: response.data };
-    return res.status(200).json({
-      ok: true,
-      status: 200,
-      paratika: payload,
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post("/payment/pay", requireAuth, async (req, res, next) => {
-  try {
-    const payloadResult = buildPayPayload(req.body || {});
-    if (!payloadResult.ok) {
-      return res.status(400).json({ ok: false, error: payloadResult.error });
-    }
-    const response = await requestParatikaPay(
-      payloadResult.sessionToken,
-      payloadResult.requestPayload
-    );
-
-    return res.status(200).json({
-      ok: true,
-      response: response.data,
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post("/payment/pay/redirect", requireAuth, async (req, res, next) => {
-  try {
-    const payloadResult = buildPayPayload(req.body || {});
-    if (!payloadResult.ok) {
-      return res.status(400).json({ ok: false, error: payloadResult.error });
-    }
-    const response = await requestParatikaPay(
-      payloadResult.sessionToken,
-      payloadResult.requestPayload
-    );
-    res.set("Content-Type", "text/html; charset=utf-8");
-    return res.status(200).send(response.data);
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.all("/payment/return", (req, res) => {
-  const payload = { ...req.query, ...req.body };
-  console.log("Payment return payload:", payload);
-  const decodeValue = (value) => {
-    if (value === undefined || value === null) return null;
-    const raw = String(value);
+  app.post("/payment/session", requireAuth, async (req, res, next) => {
     try {
-      return decodeURIComponent(raw.replace(/\+/g, " "));
+      const body = req.body || {};
+      const pick = (...keys) => {
+        for (const key of keys) {
+          const value = body[key];
+          if (value !== undefined && value !== null && value !== "") {
+            return value;
+          }
+        }
+        return undefined;
+      };
+
+      const merchantUser = PARATIKA_MERCHANTUSER || pick("MERCHANTUSER", "merchantUser");
+      const merchantPassword =
+        PARATIKA_MERCHANTPASSWORD || pick("MERCHANTPASSWORD", "merchantPassword");
+      const merchant = PARATIKA_MERCHANT || pick("MERCHANT", "merchant");
+      const returnUrl = PARATIKA_RETURNURL || pick("RETURNURL", "returnUrl");
+      const sessionType = pick("SESSIONTYPE", "sessionType") || "PAYMENTSESSION";
+
+      const missing = [];
+      if (!PARATIKA_BASE_URL) missing.push("PARATIKA_BASE_URL");
+      if (!merchantUser) missing.push("MERCHANTUSER");
+      if (!merchantPassword) missing.push("MERCHANTPASSWORD");
+      if (!merchant) missing.push("MERCHANT");
+      if (!returnUrl) missing.push("RETURNURL");
+
+      if (missing.length) {
+        return res.status(400).json({
+          ok: false,
+          error: `Missing required fields: ${missing.join(", ")}`,
+        });
+      }
+
+      const orderItemsRaw = pick("ORDERITEMS", "orderItems");
+      const orderItems = normalizeJsonField(orderItemsRaw);
+      if (orderItemsRaw && !orderItems) {
+        return res.status(400).json({
+          ok: false,
+          error: "ORDERITEMS must be valid JSON or a JSON string.",
+        });
+      }
+
+      const extraRaw = pick("EXTRA", "extra");
+      const extra = normalizeJsonField(extraRaw);
+      if (extraRaw && !extra) {
+        return res.status(400).json({
+          ok: false,
+          error: "EXTRA must be valid JSON or a JSON string.",
+        });
+      }
+
+      const discountAmountFromExtra =
+        extra && typeof extra === "object"
+          ? extra.discountAmount ?? extra.DISCOUNTAMOUNT
+          : undefined;
+      const discountAmount = pick("DISCOUNTAMOUNT", "discountAmount") ?? discountAmountFromExtra;
+
+      const requestPayload = {
+        ACTION: "SESSIONTOKEN",
+        MERCHANTUSER: String(merchantUser),
+        MERCHANTPASSWORD: String(merchantPassword),
+        MERCHANT: String(merchant),
+        RETURNURL: String(returnUrl),
+        SESSIONTYPE: String(sessionType),
+        AMOUNT: pick("AMOUNT", "amount"),
+        CURRENCY: pick("CURRENCY", "currency"),
+        MERCHANTPAYMENTID: pick("MERCHANTPAYMENTID", "merchantPaymentId"),
+        CUSTOMER: pick("CUSTOMER", "customer"),
+        CUSTOMERNAME: pick("CUSTOMERNAME", "customerName"),
+        CUSTOMEREMAIL: pick("CUSTOMEREMAIL", "customerEmail"),
+        CUSTOMERIP: pick("CUSTOMERIP", "customerIp"),
+        CUSTOMERUSERAGENT: pick("CUSTOMERUSERAGENT", "customerUserAgent"),
+        NAMEONCARD: pick("NAMEONCARD", "nameOnCard"),
+        CUSTOMERPHONE: pick("CUSTOMERPHONE", "customerPhone"),
+        DISCOUNTAMOUNT: discountAmount,
+        BILLTOADDRESSLINE: pick("BILLTOADDRESSLINE", "billToAddressLine"),
+        BILLTOCITY: pick("BILLTOCITY", "billToCity"),
+        BILLTOCOUNTRY: pick("BILLTOCOUNTRY", "billToCountry"),
+        BILLTOPOSTALCODE: pick("BILLTOPOSTALCODE", "billToPostalCode"),
+        BILLTOPHONE: pick("BILLTOPHONE", "billToPhone"),
+        SHIPTOADDRESSLINE: pick("SHIPTOADDRESSLINE", "shipToAddressLine"),
+        SHIPTOCITY: pick("SHIPTOCITY", "shipToCity"),
+        SHIPTOCOUNTRY: pick("SHIPTOCOUNTRY", "shipToCountry"),
+        SHIPTOPOSTALCODE: pick("SHIPTOPOSTALCODE", "shipToPostalCode"),
+        SHIPTOPHONE: pick("SHIPTOPHONE", "shipToPhone"),
+        SELLERID: pick("SELLERID", "sellerId"),
+        COMMISSIONAMOUNT: pick("COMMISSIONAMOUNT", "commissionAmount"),
+        SESSIONEXPIRY: pick("SESSIONEXPIRY", "sessionExpiry"),
+        LANGUAGE: pick("LANGUAGE", "language"),
+        ORDERITEMS: orderItems || undefined,
+        EXTRA: extra || undefined,
+      };
+
+      const data = formEncode(requestPayload);
+      const response = await axios.request({
+        method: "post",
+        maxBodyLength: Infinity,
+        url: PARATIKA_BASE_URL,
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          ...(PARATIKA_COOKIE ? { Cookie: PARATIKA_COOKIE } : {}),
+          Accept: "*/*",
+          "Accept-Encoding": "gzip, deflate, br",
+          Connection: "keep-alive",
+          "User-Agent": "PostmanRuntime/7.36.0",
+        },
+        data,
+      });
+      const payload = { data: response.data };
+      return res.status(200).json({
+        ok: true,
+        status: 200,
+        paratika: payload,
+      });
     } catch (err) {
-      return raw;
+      next(err);
     }
-  };
-
-  const responseCode = payload.responseCode ?? payload.responsecode;
-  const responseMsgRaw = payload.responseMsg ?? payload.responsemsg;
-  const responseMsg = decodeValue(responseMsgRaw);
-  const isApproved =
-    String(responseCode || "") === "00" &&
-    String(responseMsg || "").trim().toLowerCase() === "approved";
-
-  const pgOrderId = payload.pgOrderId || payload.pgorderid || null;
-
-  const normalized = {
-    merchantPaymentId:
-      payload.merchantPaymentId || payload.merchantpaymentid || null,
-    customerId: payload.customerId || payload.customerid || null,
-    sessionToken: payload.sessionToken || payload.sessiontoken || null,
-    responseCode: responseCode || null,
-    responseMsg: responseMsg || null,
-    pgOrderId: pgOrderId || null,
-    errorCode: payload.errorCode || payload.errorcode || null,
-    errorMsg: decodeValue(payload.errorMsg || payload.errormsg),
-    raw: payload,
-  };
-
-  const params = new URLSearchParams({
-    responseCode: normalized.responseCode || "",
-    responseMsg: normalized.responseMsg || "",
-    merchantPaymentId: normalized.merchantPaymentId || "",
-    pgOrderId: normalized.pgOrderId || "",
   });
 
-  const redirectTarget = isApproved
-    ? `/payment/pay/success?${params.toString()}`
-    : `/payment/pay/error?${params.toString()}`;
+  app.post("/payment/pay", requireAuth, async (req, res, next) => {
+    try {
+      const payloadResult = buildPayPayload(req.body || {});
+      if (!payloadResult.ok) {
+        return res.status(400).json({ ok: false, error: payloadResult.error });
+      }
+      const response = await requestParatikaPay(
+        payloadResult.sessionToken,
+        payloadResult.requestPayload
+      );
 
-  return res.redirect(redirectTarget);
-});
+      return res.status(200).json({
+        ok: true,
+        response: response.data,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
 
-app.post("/payment/test-session", requireAuth, async (req, res, next) => {
-  try {
-    const requestPayload = {
-      MERCHANT: "10001831",
-      MERCHANTUSER: "yasinaydin@yeniasya.com.tr",
-      MERCHANTPASSWORD: "YENIasya111..",
-      SESSIONTYPE: "PAYMENTSESSION",
-      ACTION: "SESSIONTOKEN",
-      AMOUNT: "1049.93",
-      CURRENCY: "TRY",
-      MERCHANTPAYMENTID: "PaymentId-1232132132131",
-      RETURNURL: "http://localhost:3000/payment/return",
-      CUSTOMER: "Customer-21321312",
-      CUSTOMERNAME: "Test User",
-      CUSTOMEREMAIL: "test.user@example.com",
-      CUSTOMERIP: "127.0.0.1",
-      CUSTOMERUSERAGENT: "Android",
-      NAMEONCARD: "Test User",
-      CUSTOMERPHONE: "5387401003",
-      ORDERITEMS: JSON.stringify([
-        {
-          productCode: "T00D3AITCC",
-          name: "Galaxy Note 3",
-          description: "Description of Galaxy Note 3",
-          quantity: 2,
-          amount: 449.99,
-        },
-        {
-          productCode: "B00D9AVYBM",
-          name: "Samsung Galaxy S III",
-          description: "Samsung Galaxy S III (S3) Triband White (Boost Mobile)",
-          quantity: 1,
-          amount: 149.95,
-        },
-      ]),
-      BILLTOADDRESSLINE: "Road",
-      BILLTOCITY: "Istanbul",
-      BILLTOCOUNTRY: "TUR",
-      BILLTOPOSTALCODE: "34200",
-      BILLTOPHONE: "123456789",
-      SHIPTOADDRESSLINE: "Road",
-      SHIPTOCITY: "Ankara",
-      SHIPTOCOUNTRY: "TUR",
-      SHIPTOPOSTALCODE: "1105",
-      SHIPTOPHONE: "987654321",
+  app.post("/payment/pay/redirect", requireAuth, async (req, res, next) => {
+    try {
+      const payloadResult = buildPayPayload(req.body || {});
+      if (!payloadResult.ok) {
+        return res.status(400).json({ ok: false, error: payloadResult.error });
+      }
+      const response = await requestParatikaPay(
+        payloadResult.sessionToken,
+        payloadResult.requestPayload
+      );
+      res.set("Content-Type", "text/html; charset=utf-8");
+      return res.status(200).send(response.data);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.all("/payment/return", (req, res) => {
+    const payload = { ...req.query, ...req.body };
+    console.log("Payment return payload:", payload);
+    const decodeValue = (value) => {
+      if (value === undefined || value === null) return null;
+      const raw = String(value);
+      try {
+        return decodeURIComponent(raw.replace(/\+/g, " "));
+      } catch (err) {
+        return raw;
+      }
     };
 
-    console.log("Payment session test request:", requestPayload);
-    const data = formEncode(requestPayload);
-    console.log("Payment session test encoded body:", data);
+    const responseCode = payload.responseCode ?? payload.responsecode;
+    const responseMsgRaw = payload.responseMsg ?? payload.responsemsg;
+    const responseMsg = decodeValue(responseMsgRaw);
+    const isApproved =
+      String(responseCode || "") === "00" &&
+      String(responseMsg || "").trim().toLowerCase() === "approved";
 
-    const response = await axios.request({
-      method: "post",
-      maxBodyLength: Infinity,
-      url: PARATIKA_BASE_URL,
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        ...(PARATIKA_COOKIE ? { Cookie: PARATIKA_COOKIE } : {}),
-        Accept: "*/*",
-        "Accept-Encoding": "gzip, deflate, br",
-        Connection: "keep-alive",
-        "User-Agent": "PostmanRuntime/7.36.0",
-      },
-      data,
+    const pgOrderId = payload.pgOrderId || payload.pgorderid || null;
+
+    const normalized = {
+      merchantPaymentId:
+        payload.merchantPaymentId || payload.merchantpaymentid || null,
+      customerId: payload.customerId || payload.customerid || null,
+      sessionToken: payload.sessionToken || payload.sessiontoken || null,
+      responseCode: responseCode || null,
+      responseMsg: responseMsg || null,
+      pgOrderId: pgOrderId || null,
+      errorCode: payload.errorCode || payload.errorcode || null,
+      errorMsg: decodeValue(payload.errorMsg || payload.errormsg),
+      raw: payload,
+    };
+
+    const params = new URLSearchParams({
+      responseCode: normalized.responseCode || "",
+      responseMsg: normalized.responseMsg || "",
+      merchantPaymentId: normalized.merchantPaymentId || "",
+      pgOrderId: normalized.pgOrderId || "",
     });
-    console.log("Payment session test response:", response.data);
 
-    return res.status(200).json({
-      ok: true,
-      request: requestPayload,
-      encodedBody: data,
-      response: response.data,
-    });
-  } catch (err) {
-    next(err);
-  }
-});
+    const redirectTarget = isApproved
+      ? `/payment/pay/success?${params.toString()}`
+      : `/payment/pay/error?${params.toString()}`;
 
-app.post("/mail/send", requireMailAuth, async (req, res) => {
-  const { to, cc, bcc, subject, text, html, replyTo, from } = req.body || {};
+    return res.redirect(redirectTarget);
+  });
 
-  if (!to || !subject || (!text && !html)) {
-    return res.status(400).json({
-      ok: false,
-      error: "to, subject and at least one of text or html are required.",
-    });
-  }
+  app.post("/payment/test-session", requireAuth, async (req, res, next) => {
+    try {
+      const requestPayload = {
+        MERCHANT: "10001831",
+        MERCHANTUSER: "yasinaydin@yeniasya.com.tr",
+        MERCHANTPASSWORD: "YENIasya111..",
+        SESSIONTYPE: "PAYMENTSESSION",
+        ACTION: "SESSIONTOKEN",
+        AMOUNT: "1049.93",
+        CURRENCY: "TRY",
+        MERCHANTPAYMENTID: "PaymentId-1232132132131",
+        RETURNURL: "http://localhost:3000/payment/return",
+        CUSTOMER: "Customer-21321312",
+        CUSTOMERNAME: "Test User",
+        CUSTOMEREMAIL: "test.user@example.com",
+        CUSTOMERIP: "127.0.0.1",
+        CUSTOMERUSERAGENT: "Android",
+        NAMEONCARD: "Test User",
+        CUSTOMERPHONE: "5387401003",
+        ORDERITEMS: JSON.stringify([
+          {
+            productCode: "T00D3AITCC",
+            name: "Galaxy Note 3",
+            description: "Description of Galaxy Note 3",
+            quantity: 2,
+            amount: 449.99,
+          },
+          {
+            productCode: "B00D9AVYBM",
+            name: "Samsung Galaxy S III",
+            description: "Samsung Galaxy S III (S3) Triband White (Boost Mobile)",
+            quantity: 1,
+            amount: 149.95,
+          },
+        ]),
+        BILLTOADDRESSLINE: "Road",
+        BILLTOCITY: "Istanbul",
+        BILLTOCOUNTRY: "TUR",
+        BILLTOPOSTALCODE: "34200",
+        BILLTOPHONE: "123456789",
+        SHIPTOADDRESSLINE: "Road",
+        SHIPTOCITY: "Ankara",
+        SHIPTOCOUNTRY: "TUR",
+        SHIPTOPOSTALCODE: "1105",
+        SHIPTOPHONE: "987654321",
+      };
 
-  const message = {
-    from: from || MAIL_SETTINGS.from,
-    to,
-    cc,
-    bcc,
-    subject: String(subject),
-    text,
-    html,
-    replyTo,
-  };
+      console.log("Payment session test request:", requestPayload);
+      const data = formEncode(requestPayload);
+      console.log("Payment session test encoded body:", data);
 
-  try {
-    const info = await mailTransporter.sendMail(message);
-    return res.json({
-      ok: true,
-      messageId: info.messageId,
-      accepted: info.accepted,
-      rejected: info.rejected,
-      envelope: info.envelope,
-    });
-  } catch (err) {
-    console.error("Mail send failed:", err);
-    return res.status(500).json({ ok: false, error: "Mail send failed." });
-  }
-});
+      const response = await axios.request({
+        method: "post",
+        maxBodyLength: Infinity,
+        url: PARATIKA_BASE_URL,
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          ...(PARATIKA_COOKIE ? { Cookie: PARATIKA_COOKIE } : {}),
+          Accept: "*/*",
+          "Accept-Encoding": "gzip, deflate, br",
+          Connection: "keep-alive",
+          "User-Agent": "PostmanRuntime/7.36.0",
+        },
+        data,
+      });
+      console.log("Payment session test response:", response.data);
 
-app.options("/mail/send", requireMailAuth);
+      return res.status(200).json({
+        ok: true,
+        request: requestPayload,
+        encodedBody: data,
+        response: response.data,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true, message: "alive" });
-});
+  app.post("/mail/send", requireMailAuth, async (req, res) => {
+    const { to, cc, bcc, subject, text, html, replyTo, from } = req.body || {};
 
-app.use((err, req, res, next) => {
-  // Multer and manual errors land here
-  console.error(err);
-  res.status(400).json({ ok: false, error: err.message || "Upload failed." });
-});
+    if (!to || !subject || (!text && !html)) {
+      return res.status(400).json({
+        ok: false,
+        error: "to, subject and at least one of text or html are required.",
+      });
+    }
 
-app.listen(PORT, () => {
-  console.log(`File API listening on http://localhost:${PORT}`);
-});
+    const message = {
+      from: from || MAIL_SETTINGS.from,
+      to,
+      cc,
+      bcc,
+      subject: String(subject),
+      text,
+      html,
+      replyTo,
+    };
+
+    try {
+      const info = await mailTransporter.sendMail(message);
+      return res.json({
+        ok: true,
+        messageId: info.messageId,
+        accepted: info.accepted,
+        rejected: info.rejected,
+        envelope: info.envelope,
+      });
+    } catch (err) {
+      console.error("Mail send failed:", err);
+      return res.status(500).json({ ok: false, error: "Mail send failed." });
+    }
+  });
+
+  app.options("/mail/send", requireMailAuth);
+
+  app.get("/health", (req, res) => {
+    res.json({ ok: true, message: "alive" });
+  });
+
+  app.use((err, req, res, next) => {
+    // Multer and manual errors land here
+    console.error(err);
+    res.status(400).json({ ok: false, error: err.message || "Upload failed." });
+  });
+
+  app.listen(PORT, () => {
+    console.log(`File API listening on http://localhost:${PORT}`);
+  });
