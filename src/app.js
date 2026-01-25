@@ -671,70 +671,10 @@ app.post("/upload/private", upload.single("file"), async (req, res, next) => {
 app.get("/public/:type/:filename", (req, res) => {
   const type = (req.params.type || "").toLowerCase();
   if (!PUBLIC_TYPES.includes(type)) {
-    logPdfRequest({
-      req,
-      scope: "public",
-      route: "/public/:type/:filename",
-      action: "serve-public-file",
-      type,
-      filename: req.params.filename,
-      status: 404,
-      outcome: "error",
-      message: "Unknown type.",
-    });
     return res.status(404).json({ ok: false, error: "Unknown type." });
   }
-  const filePath = path.join(paths[type].public, req.params.filename);
-  const logBase = {
-    req,
-    scope: "public",
-    route: "/public/:type/:filename",
-    action: "serve-public-file",
-    type,
-    filename: req.params.filename,
-  };
-  fs.stat(filePath, (err, stats) => {
-    if (err) {
-      console.warn(`Public file missing: ${filePath}`);
-      logPdfRequest({
-        ...logBase,
-        status: 404,
-        outcome: "error",
-        message: "File not found.",
-        error: err,
-      });
-      return res.status(404).json({ ok: false, error: "File not found." });
-    }
-
-    const etag = `W/"${stats.size}-${stats.mtimeMs}"`;
-    const lastModified = stats.mtime.toUTCString();
-    const ifNoneMatch = req.get("if-none-match");
-    const ifModifiedSince = req.get("if-modified-since");
-    const notModifiedByEtag = ifNoneMatch && ifNoneMatch === etag;
-    const notModifiedByDate =
-      ifModifiedSince &&
-      !Number.isNaN(Date.parse(ifModifiedSince)) &&
-      new Date(ifModifiedSince).getTime() >= stats.mtimeMs;
-
-    const cacheHeaders = {
-      "Cache-Control": "public, max-age=3600, must-revalidate",
-      ETag: etag,
-      "Last-Modified": lastModified,
-    };
-
-    if (notModifiedByEtag || notModifiedByDate) {
-      res.set(cacheHeaders);
-      logPdfRequest({
-        ...logBase,
-        status: 304,
-        outcome: "success",
-        message: "Not modified (cache).",
-      });
-      return res.status(304).end();
-    }
-
-    serveFile(filePath, res, cacheHeaders, { ...logBase, status: 200 });
-  });
+  const cdnUrl = `https://${BUNNY_SETTINGS.cdnUrl}/${type}/public/${req.params.filename}`;
+  return res.redirect(cdnUrl);
 });
 
 app.get("/private/:type/:filename", requireAuth, async (req, res) => {
@@ -974,7 +914,7 @@ app.post("/private/view-token", requireAuth, (req, res) => {
   });
 });
 
-app.get("/private/view-secure", (req, res) => {
+app.get("/private/view-secure", async (req, res) => {
   const token = req.query?.token;
   const validation = verifyViewToken(token);
   if (!validation.ok) {
@@ -1011,22 +951,7 @@ app.get("/private/view-secure", (req, res) => {
     });
     return res.status(400).json({ ok: false, error: "Invalid token path." });
   }
-  const targetDir = paths[parsed.type]?.private;
-  if (!targetDir) {
-    logPdfRequest({
-      req,
-      scope: "private",
-      route: "/private/view-secure",
-      action: "view-secure",
-      type: parsed.type,
-      filename: parsed.filename,
-      status: 404,
-      outcome: "error",
-      message: "Unknown type.",
-    });
-    return res.status(404).json({ ok: false, error: "Unknown type." });
-  }
-  const filePath = path.join(targetDir, parsed.filename);
+
   const logBase = {
     req,
     scope: "private",
@@ -1035,21 +960,12 @@ app.get("/private/view-secure", (req, res) => {
     type: parsed.type,
     filename: parsed.filename,
   };
-  fs.access(filePath, fs.constants.R_OK, (err) => {
-    if (err) {
-      logPdfRequest({
-        ...logBase,
-        status: 404,
-        outcome: "error",
-        message: "File not found.",
-        error: err,
-      });
-      return res.status(404).json({ ok: false, error: "File not found." });
-    }
-    const corsHeaders = buildCorsHeaders(req);
-    if (preferViewer) {
-      const rawUrl = `${req.path}?token=${encodeURIComponent(token)}&render=raw`;
-      const html = `<!doctype html>
+
+  const corsHeaders = buildCorsHeaders(req);
+
+  if (preferViewer) {
+    const rawUrl = `${req.path}?token=${encodeURIComponent(token)}&render=raw`;
+    const html = `<!doctype html>
 <html lang="tr">
 <head>
   <meta charset="UTF-8" />
@@ -1217,23 +1133,26 @@ app.get("/private/view-secure", (req, res) => {
 </body>
 </html>`;
 
-      res.set({
-        ...corsHeaders,
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store, no-cache, must-revalidate, private",
-        Pragma: "no-cache",
-        "X-Content-Type-Options": "nosniff",
-        "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
-      });
-      res.send(html);
-      logPdfRequest({
-        ...logBase,
-        status: 200,
-        outcome: "success",
-        message: "Secure viewer HTML served.",
-      });
-      return;
-    }
+    res.set({
+      ...corsHeaders,
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store, no-cache, must-revalidate, private",
+      Pragma: "no-cache",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
+    });
+    res.send(html);
+    logPdfRequest({
+      ...logBase,
+      status: 200,
+      outcome: "success",
+      message: "Secure viewer HTML served.",
+    });
+    return;
+  }
+
+  try {
+    const data = await fetchFromBunny(parsed.type, "private", parsed.filename);
     res.set({
       ...corsHeaders,
       "Content-Type": "application/pdf",
@@ -1243,8 +1162,24 @@ app.get("/private/view-secure", (req, res) => {
       "X-Content-Type-Options": "nosniff",
       "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
     });
-    serveFile(filePath, res, {}, { ...logBase, status: 200, message: "Secure PDF delivered." });
-  });
+    res.send(data);
+    logPdfRequest({
+      ...logBase,
+      status: 200,
+      outcome: "success",
+      message: "Secure PDF delivered from BunnyCDN.",
+    });
+  } catch (err) {
+    logPdfRequest({
+      ...logBase,
+      status: err.message.includes("404") ? 404 : 500,
+      outcome: "error",
+      message: "Fetch from BunnyCDN failed.",
+      error: err,
+    });
+    const status = err.message.includes("404") ? 404 : 500;
+    res.status(status).json({ ok: false, error: "File not found or fetch failed." });
+  }
 });
 
 app.post("/payment/session", requireAuth, async (req, res, next) => {
