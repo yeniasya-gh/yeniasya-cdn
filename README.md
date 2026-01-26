@@ -9,6 +9,14 @@ Fotoğraf ve PDF yükleyebileceğiniz, public ve private alanları olan minimal 
 cp .env.example .env
 # AUTH_TOKEN'ı değiştir
 # Origin yetkisi için ALLOWED_ORIGINS'i kendi domainlerinle doldur (virgülle ayır)
+# Opsiyonel (BunnyCDN isteklerini daha stabil yapmak için):
+# BUNNY_HTTP_TIMEOUT_MS=20000
+# BUNNY_HTTP_RETRIES=1
+# BUNNY_HTTP_RETRY_BASE_DELAY_MS=400
+# Stream endpoint'lerinde (private/view, private/:type/:filename) ilk byte / idle timeout:
+# BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS=15000
+# BUNNY_STREAM_IDLE_TIMEOUT_MS=30000
+# BUNNY_DEBUG=true
 ```
 3) Bağımlılıklar:
 ```bash

@@ -6,6 +6,8 @@ const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const https = require("https");
+const { setTimeout: sleep } = require("timers/promises");
 const nodemailer = require("nodemailer");
 const axios = require("axios");
 
@@ -53,6 +55,87 @@ const BUNNY_SETTINGS = {
   cdnUrl: process.env.BUNNY_CDN_URL || "yeniasya.b-cdn.net",
   storageZone: process.env.BUNNY_STORAGE_ZONE || "yeniasya",
   accessKey: process.env.BUNNY_ACCESS_KEY || "",
+};
+const BUNNY_HTTP_TIMEOUT_MS = Number(process.env.BUNNY_HTTP_TIMEOUT_MS || "20000");
+const BUNNY_HTTP_RETRIES = Number(process.env.BUNNY_HTTP_RETRIES || "1");
+const BUNNY_HTTP_RETRY_BASE_DELAY_MS = Number(
+  process.env.BUNNY_HTTP_RETRY_BASE_DELAY_MS || "400"
+);
+const BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS = Number(
+  process.env.BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS || "15000"
+);
+const BUNNY_STREAM_IDLE_TIMEOUT_MS = Number(process.env.BUNNY_STREAM_IDLE_TIMEOUT_MS || "30000");
+const BUNNY_DEBUG = (process.env.BUNNY_DEBUG || "").toLowerCase() === "true";
+
+const bunnyHttp = axios.create({
+  baseURL: `https://storage.bunnycdn.com/${BUNNY_SETTINGS.storageZone}`,
+  timeout: BUNNY_HTTP_TIMEOUT_MS,
+  headers: {
+    AccessKey: BUNNY_SETTINGS.accessKey,
+  },
+  httpsAgent: new https.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 30_000,
+    maxSockets: 64,
+    maxFreeSockets: 16,
+  }),
+});
+
+const isRetryableBunnyError = (err) => {
+  const status = err?.response?.status;
+  if (Number.isInteger(status)) {
+    return [429, 500, 502, 503, 504].includes(status);
+  }
+  const code = err?.code;
+  return [
+    "ECONNABORTED",
+    "ECONNRESET",
+    "EAI_AGAIN",
+    "ENOTFOUND",
+    "ETIMEDOUT",
+    "ECONNREFUSED",
+  ].includes(code);
+};
+
+const bunnyRequest = async (config, { retries = BUNNY_HTTP_RETRIES } = {}) => {
+  let attempt = 0;
+  for (;;) {
+    const start = process.hrtime.bigint();
+    try {
+      const response = await bunnyHttp.request({
+        ...config,
+        validateStatus: () => true,
+      });
+
+      const durationMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+      if (BUNNY_DEBUG) {
+        console.log(
+          `[bunny] ${config.method || "GET"} ${config.url} -> ${response.status} (${durationMs.toFixed(
+            1
+          )}ms, attempt ${attempt + 1}/${retries + 1})`
+        );
+      }
+
+      if (response.status >= 200 && response.status < 300) return response;
+      const err = new Error(`BunnyCDN request failed (${response.status})`);
+      err.response = response;
+      throw err;
+    } catch (err) {
+      const durationMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+      const canRetry = attempt < retries && isRetryableBunnyError(err);
+      if (BUNNY_DEBUG) {
+        console.warn(
+          `[bunny] ${config.method || "GET"} ${config.url} failed (${durationMs.toFixed(
+            1
+          )}ms, attempt ${attempt + 1}/${retries + 1}): ${err?.message}`
+        );
+      }
+      if (!canRetry) throw err;
+      const delayMs = BUNNY_HTTP_RETRY_BASE_DELAY_MS * 2 ** attempt;
+      attempt += 1;
+      await sleep(delayMs);
+    }
+  }
 };
 
 const PUBLIC_TYPES = ["kitap", "gazete", "dergi", "ek", "slider"];
@@ -175,6 +258,15 @@ function ensureDirs() {
 }
 
 ensureDirs();
+
+const prewarmBunnyConnection = () => {
+  if (!BUNNY_SETTINGS.accessKey || !BUNNY_SETTINGS.storageZone) return;
+  bunnyHttp
+    .get("/", { validateStatus: () => true })
+    .catch((err) => console.warn("[bunny] prewarm failed:", err?.message));
+};
+
+prewarmBunnyConnection();
 
 const fileFilter = (req, file, cb) => {
   const ok =
@@ -565,33 +657,39 @@ const generateUniqueFilename = (originalName) => {
 };
 
 const uploadToBunny = async (fileBuffer, type, scope, filename) => {
-  const url = `https://storage.bunnycdn.com/${BUNNY_SETTINGS.storageZone}/${type}/${scope}/${filename}`;
+  const url = `/${type}/${scope}/${filename}`;
   try {
-    const response = await axios.put(url, fileBuffer, {
-      headers: {
-        AccessKey: BUNNY_SETTINGS.accessKey,
-        "Content-Type": "application/octet-stream",
+    const response = await bunnyRequest(
+      {
+        method: "PUT",
+        url,
+        data: fileBuffer,
+        headers: {
+          "Content-Type": "application/octet-stream",
+        },
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
       },
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-    });
+      { retries: 0 }
+    );
     return response.data;
   } catch (err) {
     const errorMsg = err.response?.data?.Message || err.response?.data || err.message;
     const statusCode = err.response?.status || 500;
     console.error(`[BunnyCDN Upload Error] ${statusCode}: ${JSON.stringify(errorMsg)}`);
-    console.error(`[BunnyCDN Request Details] URL: ${url}, Zone: ${BUNNY_SETTINGS.storageZone}`);
+    console.error(
+      `[BunnyCDN Request Details] URL: ${bunnyHttp.defaults.baseURL}${url}, Zone: ${BUNNY_SETTINGS.storageZone}`
+    );
     throw new Error(`BunnyCDN upload failed (${statusCode}): ${JSON.stringify(errorMsg)}`);
   }
 };
 
 const fetchFromBunny = async (type, scope, filename) => {
-  const url = `https://storage.bunnycdn.com/${BUNNY_SETTINGS.storageZone}/${type}/${scope}/${filename}`;
+  const url = `/${type}/${scope}/${filename}`;
   try {
-    const response = await axios.get(url, {
-      headers: {
-        AccessKey: BUNNY_SETTINGS.accessKey,
-      },
+    const response = await bunnyRequest({
+      method: "GET",
+      url,
       responseType: "arraybuffer",
     });
     return response.data;
@@ -599,9 +697,172 @@ const fetchFromBunny = async (type, scope, filename) => {
     const errorMsg = err.response?.data?.Message || err.response?.data || err.message;
     const statusCode = err.response?.status || 500;
     console.error(`[BunnyCDN Fetch Error] ${statusCode}: ${JSON.stringify(errorMsg)}`);
-    console.error(`[BunnyCDN Fetch Details] URL: ${url}`);
+    console.error(`[BunnyCDN Fetch Details] URL: ${bunnyHttp.defaults.baseURL}${url}`);
     throw new Error(`BunnyCDN fetch failed (${statusCode})`);
   }
+};
+
+const fetchStreamFromBunny = async (type, scope, filename) => {
+  const url = `/${type}/${scope}/${filename}`;
+  try {
+    return await bunnyRequest({
+      method: "GET",
+      url,
+      responseType: "stream",
+    });
+  } catch (err) {
+    const errorMsg = err.response?.data?.Message || err.response?.data || err.message;
+    const statusCode = err.response?.status || 500;
+    console.error(`[BunnyCDN Stream Error] ${statusCode}: ${JSON.stringify(errorMsg)}`);
+    console.error(`[BunnyCDN Stream Details] URL: ${bunnyHttp.defaults.baseURL}${url}`);
+    throw new Error(`BunnyCDN fetch failed (${statusCode})`);
+  }
+};
+
+const pipeBunnyStreamToResponse = async ({
+  req,
+  res,
+  bunnyResponse,
+  logBase,
+  headers,
+  successMessage,
+}) => {
+  const start = process.hrtime.bigint();
+  const upstream = bunnyResponse.data;
+  let finished = false;
+  let idleTimer = null;
+  const firstByteTimeoutMs =
+    Number.isFinite(BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS) && BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS > 0
+      ? BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS
+      : null;
+  let ttfbMs = null;
+
+  const clearIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = null;
+  };
+
+  const touchIdleTimer = () => {
+    clearIdleTimer();
+    if (!Number.isFinite(BUNNY_STREAM_IDLE_TIMEOUT_MS) || BUNNY_STREAM_IDLE_TIMEOUT_MS <= 0) return;
+    idleTimer = setTimeout(() => {
+      upstream.destroy(new Error("Upstream idle timeout."));
+    }, BUNNY_STREAM_IDLE_TIMEOUT_MS);
+  };
+
+  const finishOnce = () => {
+    if (finished) return;
+    finished = true;
+    clearIdleTimer();
+    upstream.removeListener("data", touchIdleTimer);
+  };
+
+  const fail = (status, message, err) => {
+    finishOnce();
+    logPdfRequest({
+      ...logBase,
+      status,
+      outcome: "error",
+      message,
+      error: err,
+    });
+    if (!res.headersSent) {
+      const corsHeaders = buildCorsHeaders(req);
+      Object.entries(corsHeaders).forEach(([key, value]) => res.set(key, value));
+      res.status(status).json({ ok: false, error: message });
+    } else {
+      res.destroy(err || new Error(message));
+    }
+  };
+
+  res.on("close", () => {
+    if (res.writableEnded) return;
+    upstream.destroy();
+    finishOnce();
+    logPdfRequest({
+      ...logBase,
+      status: 499,
+      outcome: "error",
+      message: "Client aborted.",
+    });
+  });
+
+  let cleanupFirstEventListeners = () => {};
+  const firstEventPromise = new Promise((resolve) => {
+    const onData = (chunk) => {
+      cleanup();
+      upstream.pause();
+      ttfbMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+      resolve({ kind: "data", chunk });
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve({ kind: "end" });
+    };
+    const onError = (err) => {
+      cleanup();
+      resolve({ kind: "error", err });
+    };
+    const cleanup = () => {
+      upstream.removeListener("data", onData);
+      upstream.removeListener("end", onEnd);
+      upstream.removeListener("error", onError);
+    };
+    cleanupFirstEventListeners = cleanup;
+    upstream.once("data", onData);
+    upstream.once("end", onEnd);
+    upstream.once("error", onError);
+  });
+
+  const firstEvent = await Promise.race([
+    firstEventPromise,
+    firstByteTimeoutMs === null
+      ? new Promise(() => {})
+      : sleep(firstByteTimeoutMs).then(() => ({ kind: "timeout" })),
+  ]);
+
+  if (firstEvent.kind === "timeout") {
+    cleanupFirstEventListeners();
+    upstream.destroy(new Error("Upstream first-byte timeout."));
+    return fail(504, "Upstream timeout.");
+  }
+
+  if (firstEvent.kind === "error") {
+    return fail(502, "Upstream fetch failed.", firstEvent.err);
+  }
+
+  if (firstEvent.kind === "end") {
+    return fail(502, "Upstream returned an empty response.");
+  }
+
+  const corsHeaders = buildCorsHeaders(req);
+  res.set({ ...corsHeaders, ...headers });
+  if (bunnyResponse.headers?.["content-length"]) {
+    res.set("Content-Length", bunnyResponse.headers["content-length"]);
+  }
+
+  upstream.on("error", (streamErr) => {
+    if (finished) return;
+    fail(502, "Upstream fetch failed.", streamErr);
+  });
+
+  upstream.on("data", touchIdleTimer);
+  touchIdleTimer();
+
+  upstream.on("end", () => {
+    if (finished) return;
+    finishOnce();
+    logPdfRequest({
+      ...logBase,
+      status: 200,
+      outcome: "success",
+      message: Number.isFinite(ttfbMs) ? `${successMessage} (ttfb ${ttfbMs.toFixed(1)}ms)` : successMessage,
+    });
+  });
+
+  res.write(firstEvent.chunk);
+  upstream.pipe(res);
+  upstream.resume();
 };
 
 const moveToFinal = (file, targetDir) =>
@@ -705,22 +966,16 @@ app.get("/private/:type/:filename", requireAuth, async (req, res) => {
   };
 
   try {
-    const data = await fetchFromBunny(type, "private", req.params.filename);
-    const corsHeaders = buildCorsHeaders(req);
-    Object.entries(corsHeaders).forEach(([key, value]) => res.set(key, value));
-
-    // Determine content type based on extension
+    const bunnyResponse = await fetchStreamFromBunny(type, "private", req.params.filename);
     const ext = path.extname(req.params.filename).toLowerCase();
     const contentType = ext === ".pdf" ? "application/pdf" : "application/octet-stream";
-    res.set("Content-Type", contentType);
-
-    res.send(data);
-
-    logPdfRequest({
-      ...logBase,
-      status: 200,
-      outcome: "success",
-      message: "File delivered from BunnyCDN.",
+    await pipeBunnyStreamToResponse({
+      req,
+      res,
+      bunnyResponse,
+      logBase,
+      headers: { "Content-Type": contentType },
+      successMessage: "File delivered from BunnyCDN.",
     });
   } catch (err) {
     logPdfRequest({
@@ -765,26 +1020,21 @@ app.post("/private/view", requireAuth, async (req, res) => {
   };
 
   try {
-    const data = await fetchFromBunny(parsed.type, "private", parsed.filename);
-    const corsHeaders = buildCorsHeaders(req);
-
-    res.set({
-      ...corsHeaders,
-      "Content-Type": "application/pdf",
-      "Content-Disposition": `inline; filename="${parsed.filename}"`,
-      "Cache-Control": "no-store, no-cache, must-revalidate, private",
-      Pragma: "no-cache",
-      "X-Content-Type-Options": "nosniff",
-      "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
-    });
-
-    res.send(data);
-
-    logPdfRequest({
-      ...logBase,
-      status: 200,
-      outcome: "success",
-      message: "Inline PDF served from BunnyCDN.",
+    const bunnyResponse = await fetchStreamFromBunny(parsed.type, "private", parsed.filename);
+    await pipeBunnyStreamToResponse({
+      req,
+      res,
+      bunnyResponse,
+      logBase,
+      headers: {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": `inline; filename="${parsed.filename}"`,
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        Pragma: "no-cache",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
+      },
+      successMessage: "Inline PDF served from BunnyCDN.",
     });
   } catch (err) {
     logPdfRequest({
