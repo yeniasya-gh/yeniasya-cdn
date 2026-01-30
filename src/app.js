@@ -1547,6 +1547,170 @@ app.post("/payment/session", requireAuth, async (req, res, next) => {
   }
 });
 
+app.post("/payment/query-card", requireAuth, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const pick = (...keys) => {
+      for (const key of keys) {
+        const value = body[key];
+        if (value !== undefined && value !== null && value !== "") {
+          return value;
+        }
+      }
+      return undefined;
+    };
+
+    const merchantUser = PARATIKA_MERCHANTUSER || pick("MERCHANTUSER", "merchantUser");
+    const merchantPassword =
+      PARATIKA_MERCHANTPASSWORD || pick("MERCHANTPASSWORD", "merchantPassword");
+    const merchant = PARATIKA_MERCHANT || pick("MERCHANT", "merchant");
+    const customer = pick("CUSTOMER", "customer");
+
+    const missing = [];
+    if (!PARATIKA_BASE_URL) missing.push("PARATIKA_BASE_URL");
+    if (!merchantUser) missing.push("MERCHANTUSER");
+    if (!merchantPassword) missing.push("MERCHANTPASSWORD");
+    if (!merchant) missing.push("MERCHANT");
+    if (!customer) missing.push("CUSTOMER");
+
+    if (missing.length) {
+      return res.status(400).json({
+        ok: false,
+        error: `Missing required fields: ${missing.join(", ")}`,
+      });
+    }
+
+    const requestPayload = {
+      ACTION: "QUERYCARD",
+      MERCHANTUSER: String(merchantUser),
+      MERCHANTPASSWORD: String(merchantPassword),
+      MERCHANT: String(merchant),
+      CUSTOMER: String(customer),
+    };
+
+    const response = await axios.request({
+      method: "post",
+      maxBodyLength: Infinity,
+      url: PARATIKA_BASE_URL,
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        ...(PARATIKA_COOKIE ? { Cookie: PARATIKA_COOKIE } : {}),
+        Accept: "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        Connection: "keep-alive",
+        "User-Agent": "PostmanRuntime/7.36.0",
+      },
+      data: formEncode(requestPayload),
+      validateStatus: () => true,
+    });
+
+    const status = Number.isInteger(response.status) ? response.status : 502;
+    const contentType = response.headers?.["content-type"];
+
+    if (response.data && typeof response.data === "object") {
+      return res.status(status).json(response.data);
+    }
+
+    if (typeof response.data === "string") {
+      const trimmed = response.data.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          return res.status(status).json(JSON.parse(trimmed));
+        } catch (err) {
+          // Fall through to raw response.
+        }
+      }
+    }
+
+    if (contentType) res.set("Content-Type", contentType);
+    return res.status(status).send(response.data ?? "");
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/payment/delete-card", requireAuth, async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const pick = (...keys) => {
+      for (const key of keys) {
+        const value = body[key];
+        if (value !== undefined && value !== null && value !== "") {
+          return value;
+        }
+      }
+      return undefined;
+    };
+
+    const merchantUser = PARATIKA_MERCHANTUSER || pick("MERCHANTUSER", "merchantUser");
+    const merchantPassword =
+      PARATIKA_MERCHANTPASSWORD || pick("MERCHANTPASSWORD", "merchantPassword");
+    const merchant = PARATIKA_MERCHANT || pick("MERCHANT", "merchant");
+    const cardToken = pick("CARDTOKEN", "cardToken");
+
+    const missing = [];
+    if (!PARATIKA_BASE_URL) missing.push("PARATIKA_BASE_URL");
+    if (!merchantUser) missing.push("MERCHANTUSER");
+    if (!merchantPassword) missing.push("MERCHANTPASSWORD");
+    if (!merchant) missing.push("MERCHANT");
+    if (!cardToken) missing.push("CARDTOKEN");
+
+    if (missing.length) {
+      return res.status(400).json({
+        ok: false,
+        error: `Missing required fields: ${missing.join(", ")}`,
+      });
+    }
+
+    const requestPayload = {
+      ACTION: "EWALLETDELETECARD",
+      MERCHANTUSER: String(merchantUser),
+      MERCHANTPASSWORD: String(merchantPassword),
+      MERCHANT: String(merchant),
+      CARDTOKEN: String(cardToken),
+    };
+
+    const response = await axios.request({
+      method: "post",
+      maxBodyLength: Infinity,
+      url: PARATIKA_BASE_URL,
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        ...(PARATIKA_COOKIE ? { Cookie: PARATIKA_COOKIE } : {}),
+        Accept: "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        Connection: "keep-alive",
+        "User-Agent": "PostmanRuntime/7.36.0",
+      },
+      data: formEncode(requestPayload),
+      validateStatus: () => true,
+    });
+
+    const status = Number.isInteger(response.status) ? response.status : 502;
+    const contentType = response.headers?.["content-type"];
+
+    if (response.data && typeof response.data === "object") {
+      return res.status(status).json(response.data);
+    }
+
+    if (typeof response.data === "string") {
+      const trimmed = response.data.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          return res.status(status).json(JSON.parse(trimmed));
+        } catch (err) {
+          // Fall through to raw response.
+        }
+      }
+    }
+
+    if (contentType) res.set("Content-Type", contentType);
+    return res.status(status).send(response.data ?? "");
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.post("/payment/pay", requireAuth, async (req, res, next) => {
   try {
     const payloadResult = buildPayPayload(req.body || {});
