@@ -871,6 +871,35 @@ app.post("/graphql", requireJwt, async (req, res) => {
   }
 });
 
+app.post("/hasura", requireJwt, async (req, res) => {
+  try {
+    const { query, variables, operationName } = req.body || {};
+    if (!query) {
+      return res.status(400).json({ ok: false, error: "query is required." });
+    }
+
+    const response = await axios.post(
+      HASURA_ENDPOINT,
+      { query, variables, operationName },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "x-hasura-admin-secret": HASURA_ADMIN_SECRET,
+        },
+        validateStatus: () => true,
+      }
+    );
+
+    res.status(response.status);
+    if (response.headers?.["content-type"]) {
+      res.set("Content-Type", response.headers["content-type"]);
+    }
+    return res.send(response.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: "Hasura admin proxy failed." });
+  }
+});
+
 const signViewToken = (payload) => {
   const serialized = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const signature = crypto
