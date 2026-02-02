@@ -71,6 +71,8 @@ const ENABLE_BASE64_VIEWER =
 const MAX_BASE64_VIEW_BYTES = Number(process.env.MAX_BASE64_VIEW_BYTES || "5242880");
 const HASURA_ENDPOINT = process.env.HASURA_ENDPOINT || "";
 const HASURA_ADMIN_SECRET = process.env.HASURA_ADMIN_SECRET || "";
+const HASURA_ALLOW_JWTLESS =
+  (process.env.HASURA_ALLOW_JWTLESS || "").toLowerCase() === "true";
 const JWT_SECRET = process.env.JWT_SECRET || "";
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1d";
 const JWT_ISSUER = process.env.JWT_ISSUER || "yeniasya";
@@ -691,6 +693,38 @@ const requireJwt = (req, res, next) => {
   }
 };
 
+const optionalJwt = (req, res, next) => {
+  if (!HASURA_ALLOW_JWTLESS) {
+    return requireJwt(req, res, next);
+  }
+  const raw = req.get("authorization") || "";
+  const token = raw.toLowerCase().startsWith("bearer ") ? raw.slice(7) : raw;
+  if (!token) {
+    return next();
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET, {
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
+    req.jwt = payload;
+    req.jwtToken = token;
+    return next();
+  } catch (err) {
+    return res.status(401).json({ ok: false, error: "Invalid token." });
+  }
+};
+
+const buildHasuraAuthHeaders = (req) => {
+  if (req?.jwtToken) {
+    return { Authorization: `Bearer ${req.jwtToken}` };
+  }
+  if (HASURA_ALLOW_JWTLESS && HASURA_ADMIN_SECRET) {
+    return { "x-hasura-admin-secret": HASURA_ADMIN_SECRET };
+  }
+  return {};
+};
+
 app.post("/auth/register", async (req, res) => {
   const requestId = crypto.randomUUID();
   const emailForLog = normalizeEmail(req.body?.email);
@@ -842,7 +876,7 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-app.post("/graphql", requireJwt, async (req, res) => {
+app.post("/graphql", optionalJwt, async (req, res) => {
   try {
     const { query, variables, operationName } = req.body || {};
     if (!query) {
@@ -855,7 +889,7 @@ app.post("/graphql", requireJwt, async (req, res) => {
       {
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${req.jwtToken}`,
+          ...buildHasuraAuthHeaders(req),
         },
         validateStatus: () => true,
       }
@@ -871,7 +905,7 @@ app.post("/graphql", requireJwt, async (req, res) => {
   }
 });
 
-app.post("/hasura", requireJwt, async (req, res) => {
+app.post("/hasura", optionalJwt, async (req, res) => {
   try {
     const { query, variables, operationName } = req.body || {};
     if (!query) {
