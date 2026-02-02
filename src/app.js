@@ -693,6 +693,11 @@ const requireJwt = (req, res, next) => {
 };
 
 app.post("/auth/register", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const emailForLog = normalizeEmail(req.body?.email);
+  console.log(
+    `[auth][register][start] id=${requestId} ip=${req.ip} email=${emailForLog}`
+  );
   try {
     const name = String(req.body?.name || "").trim();
     const email = normalizeEmail(req.body?.email);
@@ -700,11 +705,17 @@ app.post("/auth/register", async (req, res) => {
     const password = String(req.body?.password || "");
 
     if (!name || !email || !password) {
+      console.warn(
+        `[auth][register][bad-request] id=${requestId} ip=${req.ip} email=${email}`
+      );
       return res
         .status(400)
         .json({ ok: false, error: "name, email, password are required." });
     }
     if (password.length < 8) {
+      console.warn(
+        `[auth][register][weak-password] id=${requestId} ip=${req.ip} email=${email}`
+      );
       return res.status(400).json({ ok: false, error: "Password is too short." });
     }
 
@@ -719,6 +730,9 @@ app.post("/auth/register", async (req, res) => {
       { email }
     );
     if (existing?.users?.length) {
+      console.warn(
+        `[auth][register][exists] id=${requestId} ip=${req.ip} email=${email}`
+      );
       return res.status(409).json({ ok: false, error: "Email already in use." });
     }
 
@@ -750,17 +764,31 @@ app.post("/auth/register", async (req, res) => {
     }
 
     const { token, expiresAt } = buildJwt(user);
+    console.log(
+      `[auth][register][success] id=${requestId} ip=${req.ip} email=${email} userId=${user.id}`
+    );
     return res.json({ ok: true, user, token, expiresAt });
   } catch (err) {
+    console.error(
+      `[auth][register][error] id=${requestId} ip=${req.ip} email=${emailForLog} msg=${err.message}`
+    );
     return res.status(500).json({ ok: false, error: err.message || "Register failed." });
   }
 });
 
 app.post("/auth/login", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const emailForLog = normalizeEmail(req.body?.email);
+  console.log(
+    `[auth][login][start] id=${requestId} ip=${req.ip} email=${emailForLog}`
+  );
   try {
     const email = normalizeEmail(req.body?.email);
     const password = String(req.body?.password || "");
     if (!email || !password) {
+      console.warn(
+        `[auth][login][bad-request] id=${requestId} ip=${req.ip} email=${email}`
+      );
       return res.status(400).json({ ok: false, error: "email and password are required." });
     }
 
@@ -780,11 +808,17 @@ app.post("/auth/login", async (req, res) => {
     );
     const user = data?.users?.[0];
     if (!user || !user.password) {
+      console.warn(
+        `[auth][login][invalid] id=${requestId} ip=${req.ip} email=${email}`
+      );
       return res.status(401).json({ ok: false, error: "Invalid credentials." });
     }
 
     const ok = hashPassword(password) === user.password;
     if (!ok) {
+      console.warn(
+        `[auth][login][invalid] id=${requestId} ip=${req.ip} email=${email}`
+      );
       return res.status(401).json({ ok: false, error: "Invalid credentials." });
     }
 
@@ -795,8 +829,14 @@ app.post("/auth/login", async (req, res) => {
       phone: user.phone,
     };
     const { token, expiresAt } = buildJwt(safeUser);
+    console.log(
+      `[auth][login][success] id=${requestId} ip=${req.ip} email=${email} userId=${safeUser.id}`
+    );
     return res.json({ ok: true, user: safeUser, token, expiresAt });
   } catch (err) {
+    console.error(
+      `[auth][login][error] id=${requestId} ip=${req.ip} email=${emailForLog} msg=${err.message}`
+    );
     return res.status(500).json({ ok: false, error: err.message || "Login failed." });
   }
 });
