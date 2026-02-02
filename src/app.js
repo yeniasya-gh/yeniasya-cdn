@@ -10,10 +10,11 @@ const https = require("https");
 const { setTimeout: sleep } = require("timers/promises");
 const nodemailer = require("nodemailer");
 const axios = require("axios");
+const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
 
 const PORT = process.env.PORT || 3001;
-// Hardcoded token per request (env not used intentionally).
-const AUTH_TOKEN = "kPPm8b-12kA-9PxQ-YY822L";
+const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
 // Resolve to absolute path so sendFile receives an absolute path.
 const STORAGE_ROOT = path.resolve(
   process.env.STORAGE_ROOT || path.join(__dirname, "..", "storage")
@@ -26,9 +27,9 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
 const ALLOWED_HEADERS =
   process.env.ALLOWED_HEADERS || "content-type, x-api-key, authorization";
 const ALLOWED_METHODS = "GET, POST, OPTIONS";
-const VIEW_TOKEN_SECRET = process.env.VIEW_TOKEN_SECRET || AUTH_TOKEN;
+const VIEW_TOKEN_SECRET = process.env.VIEW_TOKEN_SECRET || "";
 const VIEW_TOKEN_TTL_MIN = Number(process.env.VIEW_TOKEN_TTL_MIN || "5");
-const FRAME_ANCESTORS = (process.env.ALLOWED_FRAME_ANCESTORS || "*")
+const FRAME_ANCESTORS = (process.env.ALLOWED_FRAME_ANCESTORS || "")
   .split(",")
   .map((v) => v.trim())
   .filter(Boolean);
@@ -36,12 +37,12 @@ const FRAME_ANCESTORS_DIRECTIVE =
   FRAME_ANCESTORS.length === 0 ? "'none'" : FRAME_ANCESTORS.join(" ");
 const PUBLIC_ROOT = path.join(__dirname, "..", "public");
 const MAIL_SETTINGS = {
-  host: process.env.MAIL_HOST || "mail.yeniasya.com.tr",
+  host: process.env.MAIL_HOST || "",
   port: Number(process.env.MAIL_PORT || "587"),
-  user: process.env.MAIL_USER || "app@yeniasya.com.tr",
-  pass: process.env.MAIL_PASS || "Asya1970@1",
-  from: process.env.MAIL_FROM || "app@yeniasya.com.tr",
-  token: process.env.MAIL_API_TOKEN || AUTH_TOKEN,
+  user: process.env.MAIL_USER || "",
+  pass: process.env.MAIL_PASS || "",
+  from: process.env.MAIL_FROM || "",
+  token: process.env.MAIL_API_TOKEN || "",
 };
 const PAYMENT_RETURN_REDIRECT_URL = process.env.PAYMENT_RETURN_REDIRECT_URL || "";
 const PARATIKA_BASE_URL =
@@ -66,6 +67,20 @@ const BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS = Number(
 );
 const BUNNY_STREAM_IDLE_TIMEOUT_MS = Number(process.env.BUNNY_STREAM_IDLE_TIMEOUT_MS || "30000");
 const BUNNY_DEBUG = (process.env.BUNNY_DEBUG || "").toLowerCase() === "true";
+const ENABLE_BASE64_VIEWER =
+  (process.env.ENABLE_BASE64_VIEWER || "").toLowerCase() === "true";
+const MAX_BASE64_VIEW_BYTES = Number(process.env.MAX_BASE64_VIEW_BYTES || "5242880");
+const HASURA_ENDPOINT = process.env.HASURA_ENDPOINT || "";
+const HASURA_ADMIN_SECRET = process.env.HASURA_ADMIN_SECRET || "";
+const JWT_SECRET = process.env.JWT_SECRET || "";
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1d";
+const JWT_ISSUER = process.env.JWT_ISSUER || "yeniasya";
+const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "yeniasya-app";
+const JWT_DEFAULT_ROLE = process.env.JWT_DEFAULT_ROLE || "user";
+const JWT_ALLOWED_ROLES = (process.env.JWT_ALLOWED_ROLES || JWT_DEFAULT_ROLE)
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
 
 const bunnyHttp = axios.create({
   baseURL: `https://storage.bunnycdn.com/${BUNNY_SETTINGS.storageZone}`,
@@ -291,6 +306,21 @@ const upload = multer({
   fileFilter,
   limits: { fileSize: 50 * 1024 * 1024 }, // Increased limit for BunnyCDN uploads
 });
+
+const mustHaveEnv = (key, value) => {
+  if (value && String(value).trim()) return;
+  throw new Error(`Missing required env var: ${key}`);
+};
+
+const assertRequiredEnv = () => {
+  mustHaveEnv("AUTH_TOKEN", AUTH_TOKEN);
+  mustHaveEnv("VIEW_TOKEN_SECRET", VIEW_TOKEN_SECRET);
+  mustHaveEnv("HASURA_ENDPOINT", HASURA_ENDPOINT);
+  mustHaveEnv("HASURA_ADMIN_SECRET", HASURA_ADMIN_SECRET);
+  mustHaveEnv("JWT_SECRET", JWT_SECRET);
+};
+
+assertRequiredEnv();
 
 const requireAuth = (req, res, next) => {
   const raw = req.get("x-api-key") || req.get("authorization") || "";
@@ -543,9 +573,7 @@ const mailTransporter = nodemailer.createTransport({
   tls: {
     // Allow self-signed / mismatched certs (needed for current smtp cert).
     rejectUnauthorized:
-      process.env.MAIL_TLS_REJECT_UNAUTHORIZED === "true"
-        ? true
-        : false,
+      process.env.MAIL_TLS_REJECT_UNAUTHORIZED === "false" ? false : true,
     servername: smtpHost,
   },
 });
@@ -585,6 +613,222 @@ const buildCorsHeaders = (req) => {
   };
 };
 
+const hasuraRequest = async (query, variables = {}) => {
+  const response = await axios.post(
+    HASURA_ENDPOINT,
+    { query, variables },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "x-hasura-admin-secret": HASURA_ADMIN_SECRET,
+      },
+      validateStatus: () => true,
+    }
+  );
+
+  if (response.status !== 200) {
+    throw new Error(`Hasura HTTP ${response.status}`);
+  }
+
+  if (response.data?.errors?.length) {
+    const msg = response.data.errors[0]?.message || "Hasura error";
+    throw new Error(msg);
+  }
+
+  return response.data?.data;
+};
+
+const buildJwt = (user) => {
+  const userId = String(user.id);
+  const roles = JWT_ALLOWED_ROLES.includes(JWT_DEFAULT_ROLE)
+    ? JWT_ALLOWED_ROLES
+    : [JWT_DEFAULT_ROLE, ...JWT_ALLOWED_ROLES];
+  const payload = {
+    sub: userId,
+    name: user.name || undefined,
+    email: user.email || undefined,
+    "https://hasura.io/jwt/claims": {
+      "x-hasura-default-role": JWT_DEFAULT_ROLE,
+      "x-hasura-allowed-roles": roles,
+      "x-hasura-user-id": userId,
+    },
+  };
+
+  const token = jwt.sign(payload, JWT_SECRET, {
+    expiresIn: JWT_EXPIRES_IN,
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+    subject: userId,
+  });
+
+  const decoded = jwt.decode(token);
+  const expiresAt =
+    decoded && typeof decoded === "object" && decoded.exp
+      ? new Date(decoded.exp * 1000).toISOString()
+      : null;
+
+  return { token, expiresAt };
+};
+
+const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
+
+const requireJwt = (req, res, next) => {
+  const raw = req.get("authorization") || "";
+  const token = raw.toLowerCase().startsWith("bearer ") ? raw.slice(7) : raw;
+  if (!token) {
+    return res.status(401).json({ ok: false, error: "Missing token." });
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET, {
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
+    req.jwt = payload;
+    req.jwtToken = token;
+    return next();
+  } catch (err) {
+    return res.status(401).json({ ok: false, error: "Invalid token." });
+  }
+};
+
+app.post("/auth/register", async (req, res) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    const email = normalizeEmail(req.body?.email);
+    const phone = req.body?.phone ? String(req.body.phone).trim() : null;
+    const password = String(req.body?.password || "");
+
+    if (!name || !email || !password) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "name, email, password are required." });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ ok: false, error: "Password is too short." });
+    }
+
+    const existing = await hasuraRequest(
+      `
+        query GetUserByEmail($email: String!) {
+          users(where: {email: {_eq: $email}}, limit: 1) {
+            id
+          }
+        }
+      `,
+      { email }
+    );
+    if (existing?.users?.length) {
+      return res.status(409).json({ ok: false, error: "Email already in use." });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const created = await hasuraRequest(
+      `
+        mutation CreateUser($object: users_insert_input!) {
+          insert_users_one(object: $object) {
+            id
+            name
+            email
+            phone
+          }
+        }
+      `,
+      {
+        object: {
+          name,
+          email,
+          phone,
+          password_hash: passwordHash,
+        },
+      }
+    );
+
+    const user = created?.insert_users_one;
+    if (!user) {
+      return res.status(500).json({ ok: false, error: "User creation failed." });
+    }
+
+    const { token, expiresAt } = buildJwt(user);
+    return res.json({ ok: true, user, token, expiresAt });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message || "Register failed." });
+  }
+});
+
+app.post("/auth/login", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const password = String(req.body?.password || "");
+    if (!email || !password) {
+      return res.status(400).json({ ok: false, error: "email and password are required." });
+    }
+
+    const data = await hasuraRequest(
+      `
+        query GetUserByEmail($email: String!) {
+          users(where: {email: {_eq: $email}}, limit: 1) {
+            id
+            name
+            email
+            phone
+            password_hash
+          }
+        }
+      `,
+      { email }
+    );
+    const user = data?.users?.[0];
+    if (!user || !user.password_hash) {
+      return res.status(401).json({ ok: false, error: "Invalid credentials." });
+    }
+
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) {
+      return res.status(401).json({ ok: false, error: "Invalid credentials." });
+    }
+
+    const safeUser = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+    };
+    const { token, expiresAt } = buildJwt(safeUser);
+    return res.json({ ok: true, user: safeUser, token, expiresAt });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message || "Login failed." });
+  }
+});
+
+app.post("/graphql", requireJwt, async (req, res) => {
+  try {
+    const { query, variables, operationName } = req.body || {};
+    if (!query) {
+      return res.status(400).json({ ok: false, error: "query is required." });
+    }
+
+    const response = await axios.post(
+      HASURA_ENDPOINT,
+      { query, variables, operationName },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${req.jwtToken}`,
+        },
+        validateStatus: () => true,
+      }
+    );
+
+    res.status(response.status);
+    if (response.headers?.["content-type"]) {
+      res.set("Content-Type", response.headers["content-type"]);
+    }
+    return res.send(response.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: "Hasura proxy failed." });
+  }
+});
+
 const signViewToken = (payload) => {
   const serialized = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const signature = crypto
@@ -618,6 +862,12 @@ const verifyViewToken = (token) => {
   } catch (err) {
     return { ok: false, error: "Token parse failed." };
   }
+};
+
+const sanitizeFilename = (value) => {
+  const raw = String(value || "").replace(/[\r\n]/g, "");
+  const cleaned = raw.replace(/["\\]/g, "");
+  return cleaned || "file.pdf";
 };
 
 const serveFile = (filePath, res, extraHeaders = {}, logContext = null) => {
@@ -876,7 +1126,7 @@ const moveToFinal = (file, targetDir) =>
     });
   });
 
-app.post("/upload/public", upload.single("file"), async (req, res, next) => {
+app.post("/upload/public", requireAuth, upload.single("file"), async (req, res, next) => {
   try {
     const type = resolveType(req, PUBLIC_TYPES);
     if (!type) {
@@ -903,7 +1153,7 @@ app.post("/upload/public", upload.single("file"), async (req, res, next) => {
   }
 });
 
-app.post("/upload/private", upload.single("file"), async (req, res, next) => {
+app.post("/upload/private", requireAuth, upload.single("file"), async (req, res, next) => {
   try {
     const type = resolveType(req, PRIVATE_TYPES);
     if (!type) {
@@ -1028,7 +1278,7 @@ app.post("/private/view", requireAuth, async (req, res) => {
       logBase,
       headers: {
         "Content-Type": "application/pdf",
-        "Content-Disposition": `inline; filename="${parsed.filename}"`,
+        "Content-Disposition": `inline; filename="${sanitizeFilename(parsed.filename)}"`,
         "Cache-Control": "no-store, no-cache, must-revalidate, private",
         Pragma: "no-cache",
         "X-Content-Type-Options": "nosniff",
@@ -1050,6 +1300,9 @@ app.post("/private/view", requireAuth, async (req, res) => {
 });
 
 app.get("/private/view-file", requireAuth, async (req, res) => {
+  if (!ENABLE_BASE64_VIEWER) {
+    return res.status(404).json({ ok: false, error: "Not found." });
+  }
   const rawPath = req.query?.path || req.query?.pdf || req.query?.file;
   const parsed = parsePrivatePath(rawPath);
   if (!parsed) {
@@ -1080,6 +1333,17 @@ app.get("/private/view-file", requireAuth, async (req, res) => {
 
   try {
     const buffer = await fetchFromBunny(parsed.type, "private", parsed.filename);
+    if (buffer.length > MAX_BASE64_VIEW_BYTES) {
+      logPdfRequest({
+        ...logBase,
+        status: 413,
+        outcome: "error",
+        message: "File too large for base64 viewer.",
+      });
+      return res
+        .status(413)
+        .json({ ok: false, error: "File too large for base64 viewer." });
+    }
     const corsHeaders = buildCorsHeaders(req);
     const base64 = buffer.toString("base64");
     const dataUrl = `data:application/pdf;base64,${base64}`;
@@ -1401,7 +1665,7 @@ app.get("/private/view-secure", async (req, res) => {
     res.set({
       ...corsHeaders,
       "Content-Type": "application/pdf",
-      "Content-Disposition": `inline; filename=\"${parsed.filename}\"`,
+      "Content-Disposition": `inline; filename="${sanitizeFilename(parsed.filename)}"`,
       "Cache-Control": "no-store, no-cache, must-revalidate, private",
       Pragma: "no-cache",
       "X-Content-Type-Options": "nosniff",
@@ -1750,7 +2014,14 @@ app.post("/payment/pay/redirect", requireAuth, async (req, res, next) => {
 
 app.all("/payment/return", (req, res) => {
   const payload = { ...req.query, ...req.body };
-  console.log("Payment return payload:", payload);
+  const safeLog = {
+    responseCode: payload.responseCode ?? payload.responsecode,
+    responseMsg: payload.responseMsg ?? payload.responsemsg,
+    merchantPaymentId: payload.merchantPaymentId || payload.merchantpaymentid || null,
+    pgOrderId: payload.pgOrderId || payload.pgorderid || null,
+    errorCode: payload.errorCode || payload.errorcode || null,
+  };
+  console.log("Payment return:", safeLog);
   const decodeValue = (value) => {
     if (value === undefined || value === null) return null;
     const raw = String(value);
@@ -1799,16 +2070,36 @@ app.all("/payment/return", (req, res) => {
 
 app.post("/payment/test-session", requireAuth, async (req, res, next) => {
   try {
+    if (process.env.NODE_ENV !== "development") {
+      return res.status(404).json({ ok: false, error: "Not found." });
+    }
+
+    const testConfig = {
+      merchant: process.env.TEST_MERCHANT || "",
+      merchantUser: process.env.TEST_MERCHANTUSER || "",
+      merchantPassword: process.env.TEST_MERCHANTPASSWORD || "",
+      returnUrl: process.env.TEST_RETURNURL || "",
+    };
+    const missing = Object.entries(testConfig)
+      .filter(([, value]) => !value)
+      .map(([key]) => key);
+    if (missing.length) {
+      return res.status(400).json({
+        ok: false,
+        error: `Missing required test env vars: ${missing.join(", ")}`,
+      });
+    }
+
     const requestPayload = {
-      MERCHANT: "10001831",
-      MERCHANTUSER: "yasinaydin@yeniasya.com.tr",
-      MERCHANTPASSWORD: "YENIasya111..",
+      MERCHANT: testConfig.merchant,
+      MERCHANTUSER: testConfig.merchantUser,
+      MERCHANTPASSWORD: testConfig.merchantPassword,
       SESSIONTYPE: "PAYMENTSESSION",
       ACTION: "SESSIONTOKEN",
       AMOUNT: "1049.93",
       CURRENCY: "TRY",
-      MERCHANTPAYMENTID: "PaymentId-1232132132131",
-      RETURNURL: "http://localhost:3000/payment/return",
+      MERCHANTPAYMENTID: `PaymentId-${Date.now()}`,
+      RETURNURL: testConfig.returnUrl,
       CUSTOMER: "Customer-21321312",
       CUSTOMERNAME: "Test User",
       CUSTOMEREMAIL: "test.user@example.com",
