@@ -11,7 +11,6 @@ const { setTimeout: sleep } = require("timers/promises");
 const nodemailer = require("nodemailer");
 const axios = require("axios");
 const jwt = require("jsonwebtoken");
-const bcrypt = require("bcryptjs");
 
 const PORT = process.env.PORT || 3001;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
@@ -671,6 +670,8 @@ const buildJwt = (user) => {
 };
 
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
+const hashPassword = (value) =>
+  crypto.createHash("sha256").update(String(value || "")).digest("hex");
 
 const requireJwt = (req, res, next) => {
   const raw = req.get("authorization") || "";
@@ -721,7 +722,7 @@ app.post("/auth/register", async (req, res) => {
       return res.status(409).json({ ok: false, error: "Email already in use." });
     }
 
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordHash = hashPassword(password);
     const created = await hasuraRequest(
       `
         mutation CreateUser($object: users_insert_input!) {
@@ -738,7 +739,7 @@ app.post("/auth/register", async (req, res) => {
           name,
           email,
           phone,
-          password_hash: passwordHash,
+          password: passwordHash,
         },
       }
     );
@@ -771,18 +772,18 @@ app.post("/auth/login", async (req, res) => {
             name
             email
             phone
-            password_hash
+            password
           }
         }
       `,
       { email }
     );
     const user = data?.users?.[0];
-    if (!user || !user.password_hash) {
+    if (!user || !user.password) {
       return res.status(401).json({ ok: false, error: "Invalid credentials." });
     }
 
-    const ok = await bcrypt.compare(password, user.password_hash);
+    const ok = hashPassword(password) === user.password;
     if (!ok) {
       return res.status(401).json({ ok: false, error: "Invalid credentials." });
     }
