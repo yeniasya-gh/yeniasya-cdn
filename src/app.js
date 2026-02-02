@@ -1168,7 +1168,7 @@ const moveToFinal = (file, targetDir) =>
     });
   });
 
-app.post("/upload/public", requireAuth, upload.single("file"), async (req, res, next) => {
+app.post("/upload/public", requireJwt, upload.single("file"), async (req, res, next) => {
   try {
     const type = resolveType(req, PUBLIC_TYPES);
     if (!type) {
@@ -1195,7 +1195,7 @@ app.post("/upload/public", requireAuth, upload.single("file"), async (req, res, 
   }
 });
 
-app.post("/upload/private", requireAuth, upload.single("file"), async (req, res, next) => {
+app.post("/upload/private", requireJwt, upload.single("file"), async (req, res, next) => {
   try {
     const type = resolveType(req, PRIVATE_TYPES);
     if (!type) {
