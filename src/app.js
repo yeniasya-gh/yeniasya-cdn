@@ -657,7 +657,6 @@ const buildJwt = (user) => {
     expiresIn: JWT_EXPIRES_IN,
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
-    subject: userId,
   });
 
   const decoded = jwt.decode(token);
