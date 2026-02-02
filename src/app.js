@@ -1282,7 +1282,7 @@ app.get("/private/:type/:filename", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/private/view", requireAuth, async (req, res) => {
+app.post("/private/view", requireJwt, async (req, res) => {
   const rawPath = req.body?.path || req.body?.pdf || req.body?.file;
   const parsed = parsePrivatePath(rawPath);
   if (!parsed) {
@@ -1442,7 +1442,7 @@ app.get("/private/view-file", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/private/view-token", requireAuth, (req, res) => {
+app.post("/private/view-token", requireJwt, (req, res) => {
   const rawPath = req.body?.path || req.body?.pdf || req.body?.file;
   const parsed = parsePrivatePath(rawPath);
   if (!parsed) {
@@ -1471,7 +1471,7 @@ app.post("/private/view-token", requireAuth, (req, res) => {
   });
 });
 
-app.get("/private/view-secure", async (req, res) => {
+app.get("/private/view-secure", requireJwt, async (req, res) => {
   const token = req.query?.token;
   const validation = verifyViewToken(token);
   if (!validation.ok) {
