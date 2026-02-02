@@ -799,6 +799,7 @@ app.post("/auth/login", async (req, res) => {
             name
             email
             phone
+            role_id
             password
           }
         }
@@ -826,6 +827,7 @@ app.post("/auth/login", async (req, res) => {
       name: user.name,
       email: user.email,
       phone: user.phone,
+      role_id: user.role_id,
     };
     const { token, expiresAt } = buildJwt(safeUser);
     console.log(
