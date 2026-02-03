@@ -82,6 +82,9 @@ const JWT_ALLOWED_ROLES = (process.env.JWT_ALLOWED_ROLES || JWT_DEFAULT_ROLE)
   .split(",")
   .map((v) => v.trim())
   .filter(Boolean);
+const GUEST_AUTH_USERNAME = process.env.GUEST_AUTH_USERNAME || "yeniasyaguest";
+const GUEST_AUTH_PASSWORD =
+  process.env.GUEST_AUTH_PASSWORD || "yeniasya.guest.pass.2026";
 
 const bunnyHttp = axios.create({
   baseURL: `https://storage.bunnycdn.com/${BUNNY_SETTINGS.storageZone}`,
@@ -874,6 +877,32 @@ app.post("/auth/login", async (req, res) => {
     );
     return res.status(500).json({ ok: false, error: err.message || "Login failed." });
   }
+});
+
+app.post("/auth/guest-token", (req, res) => {
+  const username = String(req.body?.username || "").trim();
+  const password = String(req.body?.password || "");
+  if (!username || !password) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "username and password are required." });
+  }
+  if (username !== GUEST_AUTH_USERNAME || password !== GUEST_AUTH_PASSWORD) {
+    return res.status(401).json({ ok: false, error: "Invalid credentials." });
+  }
+
+  const guestUser = {
+    id: "guest",
+    name: "Guest",
+    email: null,
+  };
+  const { token, expiresAt } = buildJwt(guestUser);
+  return res.json({
+    ok: true,
+    user: { id: guestUser.id, name: guestUser.name },
+    token,
+    expiresAt,
+  });
 });
 
 app.post("/graphql", optionalJwt, async (req, res) => {
