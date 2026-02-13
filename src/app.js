@@ -1145,7 +1145,11 @@ const setUserPayUniqe = async (userId, payUniqe) => {
   }
 };
 
-const resolveRevenueCatUser = async ({ userId, appUserId }) => {
+const resolveRevenueCatUser = async ({
+  userId,
+  appUserId,
+  allowPayUniqeRelink = false,
+}) => {
   const normalizedUserId = toPositiveIntOrNull(userId);
   const normalizedAppUserId = normalizeRevenueCatAppUserId(appUserId);
 
@@ -1154,9 +1158,13 @@ const resolveRevenueCatUser = async ({ userId, appUserId }) => {
   if (normalizedUserId) {
     userById = await findUserById(normalizedUserId);
   }
-  // Prefer userId (from JWT/body). payUniqe lookup is only needed when userId is absent.
-  if (normalizedAppUserId && !userById) {
-    userByPayUniqe = await findUserByPayUniqe(normalizedAppUserId);
+  if (normalizedAppUserId) {
+    if (userById) {
+      // Ownership check: appUserId must not already belong to a different user.
+      userByPayUniqe = await findUserByPayUniqe(normalizedAppUserId);
+    } else {
+      userByPayUniqe = await findUserByPayUniqe(normalizedAppUserId);
+    }
   }
 
   if (userById && userByPayUniqe && Number(userById.id) !== Number(userByPayUniqe.id)) {
@@ -1174,13 +1182,15 @@ const resolveRevenueCatUser = async ({ userId, appUserId }) => {
 
   const currentPayUniqe = normalizeRevenueCatAppUserId(user.payUniqe);
   if (normalizedAppUserId && currentPayUniqe && normalizedAppUserId !== currentPayUniqe) {
-    const err = new Error("appUserId does not match user's payUniqe.");
-    err.statusCode = 409;
-    throw err;
+    if (!allowPayUniqeRelink) {
+      const err = new Error("appUserId does not match user's payUniqe.");
+      err.statusCode = 409;
+      throw err;
+    }
   }
 
   const resolvedAppUserId = normalizedAppUserId || currentPayUniqe || String(user.id);
-  if (!currentPayUniqe) {
+  if (!currentPayUniqe || currentPayUniqe !== resolvedAppUserId) {
     try {
       const updated = await setUserPayUniqe(user.id, resolvedAppUserId);
       if (updated?.payUniqe) {
@@ -1456,6 +1466,7 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
     const resolved = await resolveRevenueCatUser({
       userId: resolvedUserIdInput,
       appUserId,
+      allowPayUniqeRelink: req.revenueCatAuthMode === "jwt",
     });
 
     if (req.revenueCatAuthMode === "jwt" && jwtUserId && resolved.userId !== jwtUserId) {
@@ -1533,6 +1544,7 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
       resolved = await resolveRevenueCatUser({
         userId: resolvedUserIdInput,
         appUserId,
+        allowPayUniqeRelink: req.revenueCatAuthMode === "jwt",
       });
     }
 
