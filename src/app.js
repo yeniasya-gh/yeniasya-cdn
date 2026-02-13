@@ -85,6 +85,15 @@ const JWT_ALLOWED_ROLES = (process.env.JWT_ALLOWED_ROLES || JWT_DEFAULT_ROLE)
 const GUEST_AUTH_USERNAME = process.env.GUEST_AUTH_USERNAME || "yeniasyaguest";
 const GUEST_AUTH_PASSWORD =
   process.env.GUEST_AUTH_PASSWORD || "yeniasya.guest.pass.2026";
+const REVENUECAT_ENTITLEMENT_ACCESS = {
+  "yeniasya pro": { itemType: "newspaper_subscription", itemId: null },
+};
+const REVENUECAT_API_BASE_URL = (
+  process.env.REVENUECAT_API_BASE_URL || "https://api.revenuecat.com/v1"
+).replace(/\/+$/, "");
+const REVENUECAT_SECRET_API_KEY =
+  process.env.REVENUECAT_SECRET_API_KEY || process.env.REVENUECAT_REST_API_KEY || "";
+const REVENUECAT_HTTP_TIMEOUT_MS = Number(process.env.REVENUECAT_HTTP_TIMEOUT_MS || "10000");
 
 const bunnyHttp = axios.create({
   baseURL: `https://storage.bunnycdn.com/${BUNNY_SETTINGS.storageZone}`,
@@ -602,6 +611,10 @@ app.use((req, res, next) => {
 
 app.use(express.static(PUBLIC_ROOT));
 
+app.get("/privacy", (req, res) => {
+  return res.sendFile(path.join(PUBLIC_ROOT, "privacy.html"));
+});
+
 const buildCorsHeaders = (req) => {
   const requestOrigin = req.get("origin");
   const originAllowed =
@@ -676,6 +689,43 @@ const buildJwt = (user) => {
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
 const hashPassword = (value) =>
   crypto.createHash("sha256").update(String(value || "")).digest("hex");
+const normalizeRevenueCatAppUserId = (value) => {
+  if (value === undefined || value === null) return null;
+  const normalized = String(value).trim();
+  return normalized || null;
+};
+const toPositiveIntOrNull = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+};
+const toIsoTimestampOrNull = (value) => {
+  const normalized = normalizeRevenueCatAppUserId(value);
+  if (!normalized) return null;
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString();
+};
+const toBool = (value) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value === 1;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    return normalized === "true" || normalized === "1" || normalized === "yes";
+  }
+  return false;
+};
+const verifyJwtToken = (token) =>
+  jwt.verify(token, JWT_SECRET, {
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+  });
+const extractJwtUserId = (payload) => {
+  const claims = payload?.["https://hasura.io/jwt/claims"] || {};
+  const rawId = claims["x-hasura-user-id"] ?? payload?.sub;
+  return toPositiveIntOrNull(rawId);
+};
 
 const requireJwt = (req, res, next) => {
   const raw = req.get("authorization") || "";
@@ -684,10 +734,7 @@ const requireJwt = (req, res, next) => {
     return res.status(401).json({ ok: false, error: "Missing token." });
   }
   try {
-    const payload = jwt.verify(token, JWT_SECRET, {
-      issuer: JWT_ISSUER,
-      audience: JWT_AUDIENCE,
-    });
+    const payload = verifyJwtToken(token);
     req.jwt = payload;
     req.jwtToken = token;
     return next();
@@ -706,16 +753,44 @@ const optionalJwt = (req, res, next) => {
     return next();
   }
   try {
-    const payload = jwt.verify(token, JWT_SECRET, {
-      issuer: JWT_ISSUER,
-      audience: JWT_AUDIENCE,
-    });
+    const payload = verifyJwtToken(token);
     req.jwt = payload;
     req.jwtToken = token;
     return next();
   } catch (err) {
     return res.status(401).json({ ok: false, error: "Invalid token." });
   }
+};
+
+const requireRevenueCatAuth = (req, res, next) => {
+  const authHeader = req.get("authorization") || "";
+  const bearerToken = authHeader.toLowerCase().startsWith("bearer ")
+    ? authHeader.slice(7).trim()
+    : "";
+
+  if (bearerToken) {
+    try {
+      const payload = verifyJwtToken(bearerToken);
+      req.jwt = payload;
+      req.jwtToken = bearerToken;
+      req.revenueCatAuthMode = "jwt";
+      return next();
+    } catch (err) {
+      // fall back to service token validation
+    }
+  }
+
+  const serviceRaw = req.get("x-api-key") || authHeader || "";
+  const serviceToken = serviceRaw.toLowerCase().startsWith("bearer ")
+    ? serviceRaw.slice(7).trim()
+    : serviceRaw.trim();
+
+  if (serviceToken && serviceToken === AUTH_TOKEN) {
+    req.revenueCatAuthMode = "service";
+    return next();
+  }
+
+  return res.status(401).json({ ok: false, error: "Unauthorized." });
 };
 
 const buildHasuraAuthHeaders = (req) => {
@@ -773,6 +848,7 @@ app.post("/auth/register", async (req, res) => {
     }
 
     const passwordHash = hashPassword(password);
+    const payUniqe = crypto.randomUUID();
     const created = await hasuraRequest(
       `
         mutation CreateUser($object: users_insert_input!) {
@@ -781,6 +857,8 @@ app.post("/auth/register", async (req, res) => {
             name
             email
             phone
+            payUniqe
+            role_id
           }
         }
       `,
@@ -790,6 +868,7 @@ app.post("/auth/register", async (req, res) => {
           email,
           phone,
           password: passwordHash,
+          payUniqe,
         },
       }
     );
@@ -836,6 +915,7 @@ app.post("/auth/login", async (req, res) => {
             name
             email
             phone
+            payUniqe
             role_id
             password
           }
@@ -864,6 +944,7 @@ app.post("/auth/login", async (req, res) => {
       name: user.name,
       email: user.email,
       phone: user.phone,
+      payUniqe: user.payUniqe,
       role_id: user.role_id,
     };
     const { token, expiresAt } = buildJwt(safeUser);
@@ -960,6 +1041,505 @@ app.post("/hasura", optionalJwt, async (req, res) => {
     return res.send(response.data);
   } catch (err) {
     return res.status(500).json({ ok: false, error: "Hasura admin proxy failed." });
+  }
+});
+
+const findUserById = async (userId) => {
+  const data = await hasuraRequest(
+    `
+      query GetUserById($id: bigint!) {
+        users_by_pk(id: $id) {
+          id
+          name
+          email
+          phone
+          role_id
+          payUniqe
+        }
+      }
+    `,
+    { id: userId }
+  );
+  return data?.users_by_pk || null;
+};
+
+const findUserByPayUniqe = async (payUniqe) => {
+  const data = await hasuraRequest(
+    `
+      query GetUserByPayUniqe($payUniqe: String!) {
+        users(where: {payUniqe: {_eq: $payUniqe}}, limit: 2) {
+          id
+          name
+          email
+          phone
+          role_id
+          payUniqe
+        }
+      }
+    `,
+    { payUniqe }
+  );
+  const users = data?.users || [];
+  if (users.length > 1) {
+    const err = new Error("payUniqe is not unique in users table.");
+    err.statusCode = 409;
+    throw err;
+  }
+  return users[0] || null;
+};
+
+const setUserPayUniqe = async (userId, payUniqe) => {
+  const data = await hasuraRequest(
+    `
+      mutation UpdateUserPayUniqe($id: bigint!, $payUniqe: String!) {
+        update_users_by_pk(pk_columns: {id: $id}, _set: {payUniqe: $payUniqe}) {
+          id
+          payUniqe
+        }
+      }
+    `,
+    { id: userId, payUniqe }
+  );
+  return data?.update_users_by_pk || null;
+};
+
+const resolveRevenueCatUser = async ({ userId, appUserId }) => {
+  const normalizedUserId = toPositiveIntOrNull(userId);
+  const normalizedAppUserId = normalizeRevenueCatAppUserId(appUserId);
+
+  let userById = null;
+  let userByPayUniqe = null;
+  if (normalizedUserId) {
+    userById = await findUserById(normalizedUserId);
+  }
+  if (normalizedAppUserId) {
+    userByPayUniqe = await findUserByPayUniqe(normalizedAppUserId);
+  }
+
+  if (userById && userByPayUniqe && Number(userById.id) !== Number(userByPayUniqe.id)) {
+    const err = new Error("userId and appUserId belong to different users.");
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const user = userById || userByPayUniqe;
+  if (!user) {
+    const err = new Error("User not found for provided userId/appUserId.");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const currentPayUniqe = normalizeRevenueCatAppUserId(user.payUniqe);
+  if (normalizedAppUserId && currentPayUniqe && normalizedAppUserId !== currentPayUniqe) {
+    const err = new Error("appUserId does not match user's payUniqe.");
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const resolvedAppUserId = normalizedAppUserId || currentPayUniqe || String(user.id);
+  if (!currentPayUniqe) {
+    const updated = await setUserPayUniqe(user.id, resolvedAppUserId);
+    if (!updated?.payUniqe) {
+      throw new Error("Failed to persist payUniqe.");
+    }
+    user.payUniqe = updated.payUniqe;
+  }
+
+  return {
+    userId: Number(user.id),
+    appUserId: resolvedAppUserId,
+    user,
+  };
+};
+
+const getEntitlementFromSubscriber = (subscriberEntitlements, entitlementId) => {
+  const targetKey = String(entitlementId || "").trim().toLowerCase();
+  if (!targetKey || !subscriberEntitlements || typeof subscriberEntitlements !== "object") {
+    return null;
+  }
+
+  const direct = subscriberEntitlements[entitlementId];
+  if (direct) return direct;
+
+  for (const [key, value] of Object.entries(subscriberEntitlements)) {
+    if (String(key).trim().toLowerCase() === targetKey) {
+      return value;
+    }
+  }
+
+  return null;
+};
+
+const fetchRevenueCatEntitlementState = async ({ appUserId, entitlementId }) => {
+  if (!appUserId) {
+    return {
+      checked: false,
+      source: "payload",
+      reason: "missing_app_user_id",
+    };
+  }
+  if (!REVENUECAT_SECRET_API_KEY) {
+    return {
+      checked: false,
+      source: "payload",
+      reason: "missing_revenuecat_secret_key",
+    };
+  }
+
+  const url = `${REVENUECAT_API_BASE_URL}/subscribers/${encodeURIComponent(appUserId)}`;
+  const response = await axios.get(url, {
+    headers: {
+      Authorization: `Bearer ${REVENUECAT_SECRET_API_KEY}`,
+    },
+    timeout: REVENUECAT_HTTP_TIMEOUT_MS,
+    validateStatus: () => true,
+  });
+
+  if (response.status === 404) {
+    return {
+      checked: true,
+      source: "revenuecat",
+      reason: "subscriber_not_found",
+      isActive: false,
+      expirationDate: null,
+    };
+  }
+
+  if (response.status < 200 || response.status >= 300) {
+    const err = new Error(`RevenueCat subscriber lookup failed (${response.status}).`);
+    err.statusCode = 502;
+    throw err;
+  }
+
+  const subscriberEntitlements = response.data?.subscriber?.entitlements || {};
+  const entitlement = getEntitlementFromSubscriber(subscriberEntitlements, entitlementId);
+
+  if (!entitlement) {
+    return {
+      checked: true,
+      source: "revenuecat",
+      reason: "entitlement_not_found",
+      isActive: false,
+      expirationDate: null,
+    };
+  }
+
+  const expiresRaw = entitlement.expires_date ?? entitlement.expiresDate ?? null;
+  const expirationDate = toIsoTimestampOrNull(expiresRaw);
+  const hasExplicitExpiry = expiresRaw !== null && expiresRaw !== undefined && expiresRaw !== "";
+
+  let isActive = true;
+  if (hasExplicitExpiry && expirationDate) {
+    isActive = new Date(expirationDate).getTime() > Date.now();
+  } else if (hasExplicitExpiry && !expirationDate) {
+    isActive = false;
+  }
+
+  return {
+    checked: true,
+    source: "revenuecat",
+    reason: isActive ? "active" : "expired",
+    isActive,
+    expirationDate,
+  };
+};
+
+const syncRevenueCatAccessByEntitlement = async ({
+  userId,
+  entitlementId,
+  isActive,
+  expirationDate,
+}) => {
+  const entitlementKey = String(entitlementId || "").trim().toLowerCase();
+  const mapping = REVENUECAT_ENTITLEMENT_ACCESS[entitlementKey];
+  if (!mapping) {
+    return {
+      mapped: false,
+      reason: "unsupported_entitlement",
+      entitlementId,
+    };
+  }
+
+  const expiresAt = toIsoTimestampOrNull(expirationDate);
+  const nowIso = new Date().toISOString();
+
+  if (!isActive) {
+    const data = await hasuraRequest(
+      `
+        mutation DeactivateRevenueCatAccess(
+          $user_id: bigint!
+          $item_type: access_item_type!
+          $ended_at: timestamptz!
+        ) {
+          update_user_content_access(
+            where: {
+              user_id: {_eq: $user_id}
+              item_type: {_eq: $item_type}
+              item_id: {_is_null: true}
+              is_active: {_eq: true}
+            }
+            _set: {is_active: false, expires_at: $ended_at}
+          ) {
+            affected_rows
+          }
+        }
+      `,
+      {
+        user_id: userId,
+        item_type: mapping.itemType,
+        ended_at: nowIso,
+      }
+    );
+
+    return {
+      mapped: true,
+      action: "deactivated",
+      affectedRows: data?.update_user_content_access?.affected_rows ?? 0,
+      itemType: mapping.itemType,
+    };
+  }
+
+  const activeData = await hasuraRequest(
+    `
+      query GetActiveRevenueCatAccess($user_id: bigint!, $item_type: access_item_type!) {
+        user_content_access(
+          where: {
+            user_id: {_eq: $user_id}
+            item_type: {_eq: $item_type}
+            item_id: {_is_null: true}
+            is_active: {_eq: true}
+          }
+          order_by: {started_at: desc}
+          limit: 1
+        ) {
+          id
+        }
+      }
+    `,
+    {
+      user_id: userId,
+      item_type: mapping.itemType,
+    }
+  );
+
+  const activeRow = activeData?.user_content_access?.[0] || null;
+  if (activeRow?.id) {
+    await hasuraRequest(
+      `
+        mutation RefreshRevenueCatAccess($id: bigint!, $expires_at: timestamptz) {
+          update_user_content_access_by_pk(
+            pk_columns: {id: $id}
+            _set: {is_active: true, expires_at: $expires_at}
+          ) {
+            id
+          }
+        }
+      `,
+      {
+        id: activeRow.id,
+        expires_at: expiresAt,
+      }
+    );
+
+    return {
+      mapped: true,
+      action: "updated",
+      itemType: mapping.itemType,
+      accessId: activeRow.id,
+      expiresAt,
+    };
+  }
+
+  const inserted = await hasuraRequest(
+    `
+      mutation InsertRevenueCatAccess($object: user_content_access_insert_input!) {
+        insert_user_content_access_one(object: $object) {
+          id
+        }
+      }
+    `,
+    {
+      object: {
+        user_id: userId,
+        item_type: mapping.itemType,
+        item_id: mapping.itemId,
+        is_active: true,
+        started_at: nowIso,
+        expires_at: expiresAt,
+      },
+    }
+  );
+
+  return {
+    mapped: true,
+    action: "inserted",
+    itemType: mapping.itemType,
+    accessId: inserted?.insert_user_content_access_one?.id ?? null,
+    expiresAt,
+  };
+};
+
+app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  try {
+    const body = req.body || {};
+    const entitlementId = normalizeRevenueCatAppUserId(body.entitlementId);
+    const appUserId = normalizeRevenueCatAppUserId(body.appUserId);
+    const bodyUserId = toPositiveIntOrNull(body.userId);
+    const jwtUserId = extractJwtUserId(req.jwt);
+    const resolvedUserIdInput = bodyUserId || jwtUserId;
+
+    if (!entitlementId) {
+      return res.status(400).json({ ok: false, error: "entitlementId is required." });
+    }
+    if (!resolvedUserIdInput && !appUserId) {
+      return res.status(400).json({ ok: false, error: "userId or appUserId is required." });
+    }
+    if (
+      req.revenueCatAuthMode === "jwt" &&
+      bodyUserId &&
+      jwtUserId &&
+      bodyUserId !== jwtUserId
+    ) {
+      return res.status(403).json({ ok: false, error: "Token userId mismatch." });
+    }
+
+    const resolved = await resolveRevenueCatUser({
+      userId: resolvedUserIdInput,
+      appUserId,
+    });
+
+    if (req.revenueCatAuthMode === "jwt" && jwtUserId && resolved.userId !== jwtUserId) {
+      return res.status(403).json({ ok: false, error: "User mismatch." });
+    }
+
+    const verification = await fetchRevenueCatEntitlementState({
+      appUserId: resolved.appUserId,
+      entitlementId,
+    });
+    if (!verification.checked && body.isActive === undefined) {
+      return res.status(400).json({
+        ok: false,
+        error: "isActive is required when RevenueCat verification is unavailable.",
+      });
+    }
+
+    const isActive = verification.checked ? verification.isActive : toBool(body.isActive);
+    const effectiveExpirationDate = verification.checked
+      ? verification.expirationDate
+      : body.expirationDate;
+    const accessSync = await syncRevenueCatAccessByEntitlement({
+      userId: resolved.userId,
+      entitlementId,
+      isActive,
+      expirationDate: effectiveExpirationDate,
+    });
+
+    console.log(
+      `[revenuecat][sync] id=${requestId} source=${verification.source} userId=${resolved.userId} appUserId=${resolved.appUserId} entitlement=${entitlementId} active=${isActive} action=${accessSync.action || "skipped"}`
+    );
+
+    return res.json({
+      ok: true,
+      requestId,
+      userId: resolved.userId,
+      appUserId: resolved.appUserId,
+      entitlementId,
+      isActive,
+      expirationDate: effectiveExpirationDate || null,
+      verification,
+      accessSync,
+    });
+  } catch (err) {
+    const status = Number.isInteger(err.statusCode) ? err.statusCode : 500;
+    console.error(`[revenuecat][sync][error] id=${requestId} msg=${err.message}`);
+    return res.status(status).json({ ok: false, error: err.message || "Sync failed." });
+  }
+});
+
+app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  try {
+    const body = req.body || {};
+    const source = normalizeRevenueCatAppUserId(body.source) || "unknown";
+    const result = normalizeRevenueCatAppUserId(body.result) || "unknown";
+    const success = toBool(body.success);
+    const entitlementId = normalizeRevenueCatAppUserId(body.entitlementId);
+    const appUserId = normalizeRevenueCatAppUserId(body.appUserId);
+    const bodyUserId = toPositiveIntOrNull(body.userId);
+    const jwtUserId = extractJwtUserId(req.jwt);
+    const resolvedUserIdInput = bodyUserId || jwtUserId;
+
+    if (
+      req.revenueCatAuthMode === "jwt" &&
+      bodyUserId &&
+      jwtUserId &&
+      bodyUserId !== jwtUserId
+    ) {
+      return res.status(403).json({ ok: false, error: "Token userId mismatch." });
+    }
+
+    let resolved = null;
+    if (resolvedUserIdInput || appUserId) {
+      resolved = await resolveRevenueCatUser({
+        userId: resolvedUserIdInput,
+        appUserId,
+      });
+    }
+
+    if (req.revenueCatAuthMode === "jwt" && jwtUserId && resolved && resolved.userId !== jwtUserId) {
+      return res.status(403).json({ ok: false, error: "User mismatch." });
+    }
+
+    let verification = null;
+    let accessSync = null;
+    if (resolved && entitlementId) {
+      verification = await fetchRevenueCatEntitlementState({
+        appUserId: resolved.appUserId,
+        entitlementId,
+      });
+
+      const canSyncFromPayload = body.isActive !== undefined;
+      if (verification.checked || canSyncFromPayload) {
+        const isActive = verification.checked ? verification.isActive : toBool(body.isActive);
+        const effectiveExpirationDate = verification.checked
+          ? verification.expirationDate
+          : body.expirationDate;
+        accessSync = await syncRevenueCatAccessByEntitlement({
+          userId: resolved.userId,
+          entitlementId,
+          isActive,
+          expirationDate: effectiveExpirationDate,
+        });
+      } else {
+        accessSync = {
+          mapped: false,
+          reason: "missing_is_active_and_no_verification",
+          entitlementId,
+        };
+      }
+    }
+
+    console.log(
+      `[revenuecat][event] id=${requestId} source=${source} result=${result} success=${success} userId=${resolved?.userId ?? "-"} appUserId=${resolved?.appUserId ?? appUserId ?? "-"} entitlement=${entitlementId || "-"} action=${accessSync?.action || "none"}`
+    );
+
+    return res.json({
+      ok: true,
+      requestId,
+      source,
+      result,
+      success,
+      userId: resolved?.userId ?? null,
+      appUserId: resolved?.appUserId ?? appUserId ?? null,
+      entitlementId: entitlementId || null,
+      verification,
+      accessSync,
+    });
+  } catch (err) {
+    const status = Number.isInteger(err.statusCode) ? err.statusCode : 500;
+    console.error(`[revenuecat][event][error] id=${requestId} msg=${err.message}`);
+    return res.status(status).json({ ok: false, error: err.message || "Event failed." });
   }
 });
 
