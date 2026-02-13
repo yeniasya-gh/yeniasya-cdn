@@ -94,6 +94,27 @@ const REVENUECAT_API_BASE_URL = (
 const REVENUECAT_SECRET_API_KEY =
   process.env.REVENUECAT_SECRET_API_KEY || process.env.REVENUECAT_REST_API_KEY || "";
 const REVENUECAT_HTTP_TIMEOUT_MS = Number(process.env.REVENUECAT_HTTP_TIMEOUT_MS || "10000");
+const REVENUECAT_WEBHOOK_AUTH_TOKEN = (
+  process.env.REVENUECAT_WEBHOOK_AUTH_TOKEN ||
+  AUTH_TOKEN ||
+  ""
+).trim();
+const REVENUECAT_DEFAULT_ENTITLEMENT_ID =
+  process.env.REVENUECAT_DEFAULT_ENTITLEMENT_ID || "Yeniasya Pro";
+const REVENUECAT_ACTIVE_EVENT_TYPES = new Set([
+  "INITIAL_PURCHASE",
+  "RENEWAL",
+  "NON_RENEWING_PURCHASE",
+  "PRODUCT_CHANGE",
+  "SUBSCRIPTION_EXTENDED",
+  "TEMPORARY_ENTITLEMENT_GRANT",
+  "UNCANCELLATION",
+]);
+const REVENUECAT_INACTIVE_EVENT_TYPES = new Set([
+  "EXPIRATION",
+  "REFUND",
+  "SUBSCRIPTION_PAUSED",
+]);
 
 const bunnyHttp = axios.create({
   baseURL: `https://storage.bunnycdn.com/${BUNNY_SETTINGS.storageZone}`,
@@ -716,6 +737,34 @@ const toBool = (value) => {
   }
   return false;
 };
+const toNullableBool = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return null;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes"].includes(normalized)) return true;
+    if (["false", "0", "no"].includes(normalized)) return false;
+  }
+  return null;
+};
+const toIsoFromMillisOrNull = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  const date = new Date(parsed);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString();
+};
+const boolForLog = (value) => {
+  if (value === true) return "true";
+  if (value === false) return "false";
+  return "-";
+};
 const verifyJwtToken = (token) =>
   jwt.verify(token, JWT_SECRET, {
     issuer: JWT_ISSUER,
@@ -803,6 +852,30 @@ const requireRevenueCatAuth = (req, res, next) => {
   }
 
   return res.status(401).json({ ok: false, error: "Unauthorized." });
+};
+
+const requireRevenueCatWebhookAuth = (req, res, next) => {
+  if (!REVENUECAT_WEBHOOK_AUTH_TOKEN) {
+    return res.status(503).json({
+      ok: false,
+      error: "RevenueCat webhook auth token is not configured.",
+    });
+  }
+
+  const authHeader = req.get("authorization") || "";
+  const bearerToken = authHeader.toLowerCase().startsWith("bearer ")
+    ? authHeader.slice(7).trim()
+    : "";
+  const headerToken =
+    (req.get("x-revenuecat-webhook-token") || req.get("x-api-key") || "").trim();
+  const token = bearerToken || headerToken;
+
+  if (!token || token !== REVENUECAT_WEBHOOK_AUTH_TOKEN) {
+    return res.status(401).json({ ok: false, error: "Unauthorized webhook request." });
+  }
+
+  req.revenueCatAuthMode = "webhook";
+  return next();
 };
 
 const buildHasuraAuthHeaders = (req) => {
@@ -1438,12 +1511,125 @@ const syncRevenueCatAccessByEntitlement = async ({
   };
 };
 
+let revenueCatAuditLogEnabled = true;
+const writeRevenueCatAuditLog = async (entry) => {
+  if (!revenueCatAuditLogEnabled) return;
+  const object = Object.fromEntries(
+    Object.entries(entry || {}).filter(([, value]) => value !== undefined)
+  );
+  try {
+    await hasuraRequest(
+      `
+        mutation InsertRevenueCatSyncLog($object: revenuecat_sync_logs_insert_input!) {
+          insert_revenuecat_sync_logs_one(object: $object) {
+            id
+          }
+        }
+      `,
+      { object }
+    );
+  } catch (err) {
+    const message = String(err?.message || "");
+    if (
+      message.includes("insert_revenuecat_sync_logs_one") ||
+      message.includes("revenuecat_sync_logs")
+    ) {
+      revenueCatAuditLogEnabled = false;
+    }
+    console.warn(
+      `[revenuecat][audit-warning] requestId=${entry?.request_id || "-"} msg=${message}`
+    );
+  }
+};
+
+const buildRevenueCatIdentityContext = ({
+  expectedAppUserId,
+  payloadIdentityMatched,
+  resolvedAppUserId,
+}) => {
+  const normalizedExpected = normalizeRevenueCatAppUserId(expectedAppUserId);
+  const normalizedResolved = normalizeRevenueCatAppUserId(resolvedAppUserId);
+  const payloadMatched = toNullableBool(payloadIdentityMatched);
+  const serverMatched =
+    normalizedExpected && normalizedResolved
+      ? normalizedExpected === normalizedResolved
+      : null;
+  const effectiveMatched =
+    serverMatched === null
+      ? payloadMatched === null
+        ? true
+        : payloadMatched
+      : serverMatched;
+
+  return {
+    expectedAppUserId: normalizedExpected,
+    payloadIdentityMatched: payloadMatched,
+    serverIdentityMatched: serverMatched,
+    identityMatched: effectiveMatched,
+  };
+};
+
+const inferRevenueCatWebhookIsActive = (eventType, expirationDate) => {
+  const normalizedType = String(eventType || "")
+    .trim()
+    .toUpperCase();
+  if (REVENUECAT_ACTIVE_EVENT_TYPES.has(normalizedType)) return true;
+  if (REVENUECAT_INACTIVE_EVENT_TYPES.has(normalizedType)) return false;
+  if (expirationDate) {
+    return new Date(expirationDate).getTime() > Date.now();
+  }
+  return null;
+};
+
+const normalizeRevenueCatWebhookEvent = (body) => {
+  const root = body && typeof body === "object" ? body : {};
+  const event = root.event && typeof root.event === "object" ? root.event : root;
+  const eventType =
+    normalizeRevenueCatAppUserId(event.type || event.event_type || root.type) || "unknown";
+  const appUserId = normalizeRevenueCatAppUserId(
+    event.app_user_id ||
+      event.appUserId ||
+      event.original_app_user_id ||
+      event.originalAppUserId
+  );
+  const entitlementId =
+    normalizeRevenueCatAppUserId(
+      event.entitlement_id ||
+        event.entitlementId ||
+        (Array.isArray(event.entitlement_ids) ? event.entitlement_ids[0] : null)
+    ) || normalizeRevenueCatAppUserId(REVENUECAT_DEFAULT_ENTITLEMENT_ID);
+  const expirationDate =
+    toIsoFromMillisOrNull(event.expiration_at_ms || event.expires_date_ms) ||
+    toIsoTimestampOrNull(
+      event.expiration_at || event.expires_date || event.expiration_date || null
+    );
+  const inferredIsActive = inferRevenueCatWebhookIsActive(eventType, expirationDate);
+
+  return {
+    event,
+    eventId: normalizeRevenueCatAppUserId(event.id || event.event_id || root.id),
+    eventType,
+    appUserId,
+    entitlementId,
+    expirationDate,
+    inferredIsActive,
+  };
+};
+
 app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res) => {
   const requestId = crypto.randomUUID();
+  const baseAudit = {
+    request_id: requestId,
+    endpoint: "/revenuecat/subscription/sync",
+    auth_mode: req.revenueCatAuthMode || "unknown",
+  };
+
   try {
     const body = req.body || {};
     const entitlementId = normalizeRevenueCatAppUserId(body.entitlementId);
     const appUserId = normalizeRevenueCatAppUserId(body.appUserId);
+    const expectedAppUserId = normalizeRevenueCatAppUserId(body.expectedAppUserId);
+    const payloadIdentityMatched = toNullableBool(body.identityMatched);
     const bodyUserId = toPositiveIntOrNull(body.userId);
     const jwtUserId = extractJwtUserId(req.jwt);
     const resolvedUserIdInput = bodyUserId || jwtUserId;
@@ -1473,6 +1659,17 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       return res.status(403).json({ ok: false, error: "User mismatch." });
     }
 
+    const identity = buildRevenueCatIdentityContext({
+      expectedAppUserId,
+      payloadIdentityMatched,
+      resolvedAppUserId: resolved.appUserId,
+    });
+    if (identity.serverIdentityMatched === false) {
+      console.warn(
+        `[revenuecat][identity-mismatch] id=${requestId} endpoint=sync userId=${resolved.userId} expected=${identity.expectedAppUserId} resolved=${resolved.appUserId}`
+      );
+    }
+
     const verification = await fetchRevenueCatEntitlementState({
       appUserId: resolved.appUserId,
       entitlementId,
@@ -1495,8 +1692,27 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       expirationDate: effectiveExpirationDate,
     });
 
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      source: verification.source,
+      user_id: resolved.userId,
+      app_user_id: resolved.appUserId,
+      expected_app_user_id: identity.expectedAppUserId,
+      identity_payload_matched: identity.payloadIdentityMatched,
+      identity_server_matched: identity.serverIdentityMatched,
+      identity_effective_matched: identity.identityMatched,
+      entitlement_id: entitlementId,
+      is_active: isActive,
+      expiration_date: toIsoTimestampOrNull(effectiveExpirationDate),
+      verification_source: verification.source,
+      verification_reason: verification.reason || null,
+      access_action: accessSync.action || accessSync.reason || "skipped",
+      success: true,
+      payload: body,
+    });
+
     console.log(
-      `[revenuecat][sync] id=${requestId} source=${verification.source} userId=${resolved.userId} appUserId=${resolved.appUserId} entitlement=${entitlementId} active=${isActive} action=${accessSync.action || "skipped"}`
+      `[revenuecat][sync] id=${requestId} source=${verification.source} userId=${resolved.userId} appUserId=${resolved.appUserId} expected=${identity.expectedAppUserId || "-"} payloadMatched=${boolForLog(identity.payloadIdentityMatched)} serverMatched=${boolForLog(identity.serverIdentityMatched)} entitlement=${entitlementId} active=${isActive} action=${accessSync.action || "skipped"}`
     );
 
     return res.json({
@@ -1504,6 +1720,10 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       requestId,
       userId: resolved.userId,
       appUserId: resolved.appUserId,
+      expectedAppUserId: identity.expectedAppUserId,
+      identityMatched: identity.identityMatched,
+      identityServerMatched: identity.serverIdentityMatched,
+      identityPayloadMatched: identity.payloadIdentityMatched,
       entitlementId,
       isActive,
       expirationDate: effectiveExpirationDate || null,
@@ -1512,6 +1732,12 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
     });
   } catch (err) {
     const status = Number.isInteger(err.statusCode) ? err.statusCode : 500;
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      success: false,
+      error: err.message || "Sync failed.",
+      payload: req.body || {},
+    });
     console.error(`[revenuecat][sync][error] id=${requestId} msg=${err.message}`);
     return res.status(status).json({ ok: false, error: err.message || "Sync failed." });
   }
@@ -1519,6 +1745,12 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
 
 app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, res) => {
   const requestId = crypto.randomUUID();
+  const baseAudit = {
+    request_id: requestId,
+    endpoint: "/revenuecat/subscription/event",
+    auth_mode: req.revenueCatAuthMode || "unknown",
+  };
+
   try {
     const body = req.body || {};
     const source = normalizeRevenueCatAppUserId(body.source) || "unknown";
@@ -1526,6 +1758,8 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
     const success = toBool(body.success);
     const entitlementId = normalizeRevenueCatAppUserId(body.entitlementId);
     const appUserId = normalizeRevenueCatAppUserId(body.appUserId);
+    const expectedAppUserId = normalizeRevenueCatAppUserId(body.expectedAppUserId);
+    const payloadIdentityMatched = toNullableBool(body.identityMatched);
     const bodyUserId = toPositiveIntOrNull(body.userId);
     const jwtUserId = extractJwtUserId(req.jwt);
     const resolvedUserIdInput = bodyUserId || jwtUserId;
@@ -1552,8 +1786,21 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
       return res.status(403).json({ ok: false, error: "User mismatch." });
     }
 
+    const identity = buildRevenueCatIdentityContext({
+      expectedAppUserId,
+      payloadIdentityMatched,
+      resolvedAppUserId: resolved?.appUserId || appUserId,
+    });
+    if (identity.serverIdentityMatched === false && resolved) {
+      console.warn(
+        `[revenuecat][identity-mismatch] id=${requestId} endpoint=event userId=${resolved.userId} expected=${identity.expectedAppUserId} resolved=${resolved.appUserId}`
+      );
+    }
+
     let verification = null;
     let accessSync = null;
+    let syncedIsActive = null;
+    let syncedExpirationDate = null;
     if (resolved && entitlementId) {
       verification = await fetchRevenueCatEntitlementState({
         appUserId: resolved.appUserId,
@@ -1562,15 +1809,13 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
 
       const canSyncFromPayload = body.isActive !== undefined;
       if (verification.checked || canSyncFromPayload) {
-        const isActive = verification.checked ? verification.isActive : toBool(body.isActive);
-        const effectiveExpirationDate = verification.checked
-          ? verification.expirationDate
-          : body.expirationDate;
+        syncedIsActive = verification.checked ? verification.isActive : toBool(body.isActive);
+        syncedExpirationDate = verification.checked ? verification.expirationDate : body.expirationDate;
         accessSync = await syncRevenueCatAccessByEntitlement({
           userId: resolved.userId,
           entitlementId,
-          isActive,
-          expirationDate: effectiveExpirationDate,
+          isActive: syncedIsActive,
+          expirationDate: syncedExpirationDate,
         });
       } else {
         accessSync = {
@@ -1581,8 +1826,29 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
       }
     }
 
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      source,
+      event_type: result,
+      result,
+      success,
+      user_id: resolved?.userId ?? null,
+      app_user_id: resolved?.appUserId ?? appUserId ?? null,
+      expected_app_user_id: identity.expectedAppUserId,
+      identity_payload_matched: identity.payloadIdentityMatched,
+      identity_server_matched: identity.serverIdentityMatched,
+      identity_effective_matched: identity.identityMatched,
+      entitlement_id: entitlementId || null,
+      is_active: syncedIsActive,
+      expiration_date: toIsoTimestampOrNull(syncedExpirationDate),
+      verification_source: verification?.source || null,
+      verification_reason: verification?.reason || null,
+      access_action: accessSync?.action || accessSync?.reason || "none",
+      payload: body,
+    });
+
     console.log(
-      `[revenuecat][event] id=${requestId} source=${source} result=${result} success=${success} userId=${resolved?.userId ?? "-"} appUserId=${resolved?.appUserId ?? appUserId ?? "-"} entitlement=${entitlementId || "-"} action=${accessSync?.action || "none"}`
+      `[revenuecat][event] id=${requestId} source=${source} result=${result} success=${success} userId=${resolved?.userId ?? "-"} appUserId=${resolved?.appUserId ?? appUserId ?? "-"} expected=${identity.expectedAppUserId || "-"} payloadMatched=${boolForLog(identity.payloadIdentityMatched)} serverMatched=${boolForLog(identity.serverIdentityMatched)} entitlement=${entitlementId || "-"} action=${accessSync?.action || "none"}`
     );
 
     return res.json({
@@ -1593,14 +1859,117 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
       success,
       userId: resolved?.userId ?? null,
       appUserId: resolved?.appUserId ?? appUserId ?? null,
+      expectedAppUserId: identity.expectedAppUserId,
+      identityMatched: identity.identityMatched,
+      identityServerMatched: identity.serverIdentityMatched,
+      identityPayloadMatched: identity.payloadIdentityMatched,
       entitlementId: entitlementId || null,
       verification,
       accessSync,
     });
   } catch (err) {
     const status = Number.isInteger(err.statusCode) ? err.statusCode : 500;
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      success: false,
+      error: err.message || "Event failed.",
+      payload: req.body || {},
+    });
     console.error(`[revenuecat][event][error] id=${requestId} msg=${err.message}`);
     return res.status(status).json({ ok: false, error: err.message || "Event failed." });
+  }
+});
+
+app.post("/revenuecat/webhook", requireRevenueCatWebhookAuth, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const baseAudit = {
+    request_id: requestId,
+    endpoint: "/revenuecat/webhook",
+    auth_mode: req.revenueCatAuthMode || "webhook",
+  };
+
+  try {
+    const payload = req.body || {};
+    const normalized = normalizeRevenueCatWebhookEvent(payload);
+    if (!normalized.appUserId) {
+      return res.status(400).json({ ok: false, error: "Webhook app_user_id is required." });
+    }
+    if (!normalized.entitlementId) {
+      return res.status(400).json({ ok: false, error: "Webhook entitlement id is required." });
+    }
+
+    const resolved = await resolveRevenueCatUser({
+      appUserId: normalized.appUserId,
+      allowPayUniqeRelink: false,
+    });
+
+    const verification = await fetchRevenueCatEntitlementState({
+      appUserId: resolved.appUserId,
+      entitlementId: normalized.entitlementId,
+    });
+
+    if (!verification.checked && normalized.inferredIsActive === null) {
+      return res.status(400).json({
+        ok: false,
+        error: "Unable to infer entitlement state from webhook payload.",
+      });
+    }
+
+    const isActive = verification.checked ? verification.isActive : normalized.inferredIsActive;
+    const effectiveExpirationDate = verification.checked
+      ? verification.expirationDate
+      : normalized.expirationDate;
+    const accessSync = await syncRevenueCatAccessByEntitlement({
+      userId: resolved.userId,
+      entitlementId: normalized.entitlementId,
+      isActive,
+      expirationDate: effectiveExpirationDate,
+    });
+
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      source: "webhook",
+      event_type: normalized.eventType,
+      user_id: resolved.userId,
+      app_user_id: resolved.appUserId,
+      entitlement_id: normalized.entitlementId,
+      is_active: isActive,
+      expiration_date: toIsoTimestampOrNull(effectiveExpirationDate),
+      verification_source: verification.source,
+      verification_reason: verification.reason || null,
+      access_action: accessSync.action || accessSync.reason || "none",
+      success: true,
+      payload,
+    });
+
+    console.log(
+      `[revenuecat][webhook] id=${requestId} eventId=${normalized.eventId || "-"} type=${normalized.eventType} userId=${resolved.userId} appUserId=${resolved.appUserId} entitlement=${normalized.entitlementId} active=${isActive} action=${accessSync.action || "none"}`
+    );
+
+    return res.json({
+      ok: true,
+      requestId,
+      eventId: normalized.eventId || null,
+      eventType: normalized.eventType,
+      userId: resolved.userId,
+      appUserId: resolved.appUserId,
+      entitlementId: normalized.entitlementId,
+      isActive,
+      expirationDate: effectiveExpirationDate || null,
+      verification,
+      accessSync,
+    });
+  } catch (err) {
+    const status = Number.isInteger(err.statusCode) ? err.statusCode : 500;
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      source: "webhook",
+      success: false,
+      error: err.message || "Webhook failed.",
+      payload: req.body || {},
+    });
+    console.error(`[revenuecat][webhook][error] id=${requestId} msg=${err.message}`);
+    return res.status(status).json({ ok: false, error: err.message || "Webhook failed." });
   }
 });
 
