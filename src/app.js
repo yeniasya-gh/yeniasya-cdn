@@ -1394,6 +1394,13 @@ const syncRevenueCatAccessByEntitlement = async ({
 
   const expiresAt = toIsoTimestampOrNull(expirationDate);
   const nowIso = new Date().toISOString();
+  const isDuplicateActiveAccessError = (err) => {
+    const message = String(err?.message || "").toLowerCase();
+    return (
+      (message.includes("duplicate key") || message.includes("uniqueness violation")) &&
+      message.includes("user_content_access_active_newspaper_subscription_uq")
+    );
+  };
 
   if (!isActive) {
     const data = await hasuraRequest(
@@ -1431,84 +1438,131 @@ const syncRevenueCatAccessByEntitlement = async ({
     };
   }
 
-  const activeData = await hasuraRequest(
+  const refreshActiveData = await hasuraRequest(
     `
-      query GetActiveRevenueCatAccess($user_id: Int!, $item_type: access_item_type!) {
-        user_content_access(
+      mutation RefreshRevenueCatAccessByFilter(
+        $user_id: Int!
+        $item_type: access_item_type!
+        $expires_at: timestamptz
+      ) {
+        update_user_content_access(
           where: {
             user_id: {_eq: $user_id}
             item_type: {_eq: $item_type}
             item_id: {_is_null: true}
             is_active: {_eq: true}
           }
-          order_by: {started_at: desc}
-          limit: 1
+          _set: {is_active: true, expires_at: $expires_at}
         ) {
-          id
+          affected_rows
+          returning {
+            id
+          }
         }
       }
     `,
     {
       user_id: userId,
       item_type: mapping.itemType,
+      expires_at: expiresAt,
     }
   );
 
-  const activeRow = activeData?.user_content_access?.[0] || null;
-  if (activeRow?.id) {
-    await hasuraRequest(
+  const refreshedRows =
+    refreshActiveData?.update_user_content_access?.affected_rows ?? 0;
+  const refreshedAccessId =
+    refreshActiveData?.update_user_content_access?.returning?.[0]?.id ?? null;
+
+  if (refreshedRows > 0) {
+    return {
+      mapped: true,
+      action: "updated",
+      itemType: mapping.itemType,
+      accessId: refreshedAccessId,
+      expiresAt,
+    };
+  }
+
+  try {
+    const inserted = await hasuraRequest(
       `
-        mutation RefreshRevenueCatAccess($id: Int!, $expires_at: timestamptz) {
-          update_user_content_access_by_pk(
-            pk_columns: {id: $id}
-            _set: {is_active: true, expires_at: $expires_at}
-          ) {
+        mutation InsertRevenueCatAccess($object: user_content_access_insert_input!) {
+          insert_user_content_access_one(object: $object) {
             id
           }
         }
       `,
       {
-        id: activeRow.id,
-        expires_at: expiresAt,
-      }
+        object: {
+          user_id: userId,
+          item_type: mapping.itemType,
+          item_id: mapping.itemId,
+          is_active: true,
+          started_at: nowIso,
+          expires_at: expiresAt,
+        },
+      },
     );
 
     return {
       mapped: true,
-      action: "updated",
+      action: "inserted",
       itemType: mapping.itemType,
-      accessId: activeRow.id,
+      accessId: inserted?.insert_user_content_access_one?.id ?? null,
       expiresAt,
     };
-  }
+  } catch (err) {
+    if (!isDuplicateActiveAccessError(err)) {
+      throw err;
+    }
 
-  const inserted = await hasuraRequest(
-    `
-      mutation InsertRevenueCatAccess($object: user_content_access_insert_input!) {
-        insert_user_content_access_one(object: $object) {
-          id
+    const recovered = await hasuraRequest(
+      `
+        mutation RecoverRevenueCatAccessAfterConflict(
+          $user_id: Int!
+          $item_type: access_item_type!
+          $expires_at: timestamptz
+        ) {
+          update_user_content_access(
+            where: {
+              user_id: {_eq: $user_id}
+              item_type: {_eq: $item_type}
+              item_id: {_is_null: true}
+              is_active: {_eq: true}
+            }
+            _set: {is_active: true, expires_at: $expires_at}
+          ) {
+            affected_rows
+            returning {
+              id
+            }
+          }
         }
-      }
-    `,
-    {
-      object: {
+      `,
+      {
         user_id: userId,
         item_type: mapping.itemType,
-        item_id: mapping.itemId,
-        is_active: true,
-        started_at: nowIso,
         expires_at: expiresAt,
-      },
-    }
-  );
+      }
+    );
 
-  return {
-    mapped: true,
-    action: "inserted",
-    itemType: mapping.itemType,
-    accessId: inserted?.insert_user_content_access_one?.id ?? null,
-    expiresAt,
-  };
+    const recoveredRows =
+      recovered?.update_user_content_access?.affected_rows ?? 0;
+    const recoveredAccessId =
+      recovered?.update_user_content_access?.returning?.[0]?.id ?? null;
+
+    if (recoveredRows > 0) {
+      return {
+        mapped: true,
+        action: "updated_after_conflict",
+        itemType: mapping.itemType,
+        accessId: recoveredAccessId,
+        expiresAt,
+      };
+    }
+
+    throw err;
+  }
 };
 
 let revenueCatAuditLogEnabled = true;
@@ -1632,7 +1686,13 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
     const payloadIdentityMatched = toNullableBool(body.identityMatched);
     const bodyUserId = toPositiveIntOrNull(body.userId);
     const jwtUserId = extractJwtUserId(req.jwt);
-    const resolvedUserIdInput = bodyUserId || jwtUserId;
+    const hasJwtBodyMismatch =
+      req.revenueCatAuthMode === "jwt" &&
+      bodyUserId &&
+      jwtUserId &&
+      bodyUserId !== jwtUserId;
+    const resolvedUserIdInput =
+      req.revenueCatAuthMode === "jwt" && jwtUserId ? jwtUserId : bodyUserId || jwtUserId;
 
     if (!entitlementId) {
       return res.status(400).json({ ok: false, error: "entitlementId is required." });
@@ -1640,13 +1700,10 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
     if (!resolvedUserIdInput && !appUserId) {
       return res.status(400).json({ ok: false, error: "userId or appUserId is required." });
     }
-    if (
-      req.revenueCatAuthMode === "jwt" &&
-      bodyUserId &&
-      jwtUserId &&
-      bodyUserId !== jwtUserId
-    ) {
-      return res.status(403).json({ ok: false, error: "Token userId mismatch." });
+    if (hasJwtBodyMismatch) {
+      console.warn(
+        `[revenuecat][sync][jwt-mismatch] id=${requestId} bodyUserId=${bodyUserId} jwtUserId=${jwtUserId} mode=jwt_using_token_user_id`
+      );
     }
 
     const resolved = await resolveRevenueCatUser({
@@ -1762,15 +1819,18 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
     const payloadIdentityMatched = toNullableBool(body.identityMatched);
     const bodyUserId = toPositiveIntOrNull(body.userId);
     const jwtUserId = extractJwtUserId(req.jwt);
-    const resolvedUserIdInput = bodyUserId || jwtUserId;
-
-    if (
+    const hasJwtBodyMismatch =
       req.revenueCatAuthMode === "jwt" &&
       bodyUserId &&
       jwtUserId &&
-      bodyUserId !== jwtUserId
-    ) {
-      return res.status(403).json({ ok: false, error: "Token userId mismatch." });
+      bodyUserId !== jwtUserId;
+    const resolvedUserIdInput =
+      req.revenueCatAuthMode === "jwt" && jwtUserId ? jwtUserId : bodyUserId || jwtUserId;
+
+    if (hasJwtBodyMismatch) {
+      console.warn(
+        `[revenuecat][event][jwt-mismatch] id=${requestId} bodyUserId=${bodyUserId} jwtUserId=${jwtUserId} mode=jwt_using_token_user_id`
+      );
     }
 
     let resolved = null;
