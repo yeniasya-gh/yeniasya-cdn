@@ -1326,7 +1326,7 @@ const syncRevenueCatAccessByEntitlement = async ({
     const data = await hasuraRequest(
       `
         mutation DeactivateRevenueCatAccess(
-          $user_id: bigint!
+          $user_id: Int!
           $item_type: access_item_type!
           $ended_at: timestamptz!
         ) {
@@ -1360,7 +1360,7 @@ const syncRevenueCatAccessByEntitlement = async ({
 
   const activeData = await hasuraRequest(
     `
-      query GetActiveRevenueCatAccess($user_id: bigint!, $item_type: access_item_type!) {
+      query GetActiveRevenueCatAccess($user_id: Int!, $item_type: access_item_type!) {
         user_content_access(
           where: {
             user_id: {_eq: $user_id}
