@@ -1385,7 +1385,7 @@ const syncRevenueCatAccessByEntitlement = async ({
   if (activeRow?.id) {
     await hasuraRequest(
       `
-        mutation RefreshRevenueCatAccess($id: bigint!, $expires_at: timestamptz) {
+        mutation RefreshRevenueCatAccess($id: Int!, $expires_at: timestamptz) {
           update_user_content_access_by_pk(
             pk_columns: {id: $id}
             _set: {is_active: true, expires_at: $expires_at}
