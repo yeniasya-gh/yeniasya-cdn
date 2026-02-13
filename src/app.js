@@ -726,6 +726,18 @@ const extractJwtUserId = (payload) => {
   const rawId = claims["x-hasura-user-id"] ?? payload?.sub;
   return toPositiveIntOrNull(rawId);
 };
+const isHasuraVariableTypeMismatch = (err, variableName, expectedType) => {
+  const message = String(err?.message || "").toLowerCase();
+  const variableKey = String(variableName || "").toLowerCase();
+  const expectedKey = String(expectedType || "").toLowerCase();
+  if (!message || !variableKey || !expectedKey) return false;
+  return (
+    message.includes(`variable '${variableKey}'`) &&
+    message.includes("is declared as") &&
+    message.includes("used where") &&
+    message.includes(`'${expectedKey}'`)
+  );
+};
 
 const requireJwt = (req, res, next) => {
   const raw = req.get("authorization") || "";
@@ -1064,43 +1076,73 @@ const findUserById = async (userId) => {
 };
 
 const findUserByPayUniqe = async (payUniqe) => {
-  const data = await hasuraRequest(
-    `
-      query GetUserByPayUniqe($payUniqe: String!) {
-        users(where: {payUniqe: {_eq: $payUniqe}}, limit: 2) {
-          id
-          name
-          email
-          phone
-          role_id
-          payUniqe
+  const runLookup = async (value, gqlType) => {
+    const data = await hasuraRequest(
+      `
+        query GetUserByPayUniqe($payUniqe: ${gqlType}) {
+          users(where: {payUniqe: {_eq: $payUniqe}}, limit: 2) {
+            id
+            name
+            email
+            phone
+            role_id
+            payUniqe
+          }
         }
-      }
-    `,
-    { payUniqe }
-  );
-  const users = data?.users || [];
-  if (users.length > 1) {
-    const err = new Error("payUniqe is not unique in users table.");
-    err.statusCode = 409;
-    throw err;
+      `,
+      { payUniqe: value }
+    );
+    const users = data?.users || [];
+    if (users.length > 1) {
+      const err = new Error("payUniqe is not unique in users table.");
+      err.statusCode = 409;
+      throw err;
+    }
+    return users[0] || null;
+  };
+
+  try {
+    return await runLookup(payUniqe, "String!");
+  } catch (err) {
+    if (!isHasuraVariableTypeMismatch(err, "payUniqe", "bigint")) {
+      throw err;
+    }
+    const asBigint = toPositiveIntOrNull(payUniqe);
+    if (!asBigint) return null;
+    return runLookup(asBigint, "bigint!");
   }
-  return users[0] || null;
 };
 
 const setUserPayUniqe = async (userId, payUniqe) => {
-  const data = await hasuraRequest(
-    `
-      mutation UpdateUserPayUniqe($id: bigint!, $payUniqe: String!) {
-        update_users_by_pk(pk_columns: {id: $id}, _set: {payUniqe: $payUniqe}) {
-          id
-          payUniqe
+  const runUpdate = async (value, gqlType) => {
+    const data = await hasuraRequest(
+      `
+        mutation UpdateUserPayUniqe($id: bigint!, $payUniqe: ${gqlType}) {
+          update_users_by_pk(pk_columns: {id: $id}, _set: {payUniqe: $payUniqe}) {
+            id
+            payUniqe
+          }
         }
-      }
-    `,
-    { id: userId, payUniqe }
-  );
-  return data?.update_users_by_pk || null;
+      `,
+      { id: userId, payUniqe: value }
+    );
+    return data?.update_users_by_pk || null;
+  };
+
+  try {
+    return await runUpdate(payUniqe, "String!");
+  } catch (err) {
+    if (!isHasuraVariableTypeMismatch(err, "payUniqe", "bigint")) {
+      throw err;
+    }
+    const asBigint = toPositiveIntOrNull(payUniqe);
+    if (!asBigint) {
+      const mismatchErr = new Error("payUniqe must be numeric for current schema.");
+      mismatchErr.statusCode = 400;
+      throw mismatchErr;
+    }
+    return runUpdate(asBigint, "bigint!");
+  }
 };
 
 const resolveRevenueCatUser = async ({ userId, appUserId }) => {
@@ -1112,7 +1154,8 @@ const resolveRevenueCatUser = async ({ userId, appUserId }) => {
   if (normalizedUserId) {
     userById = await findUserById(normalizedUserId);
   }
-  if (normalizedAppUserId) {
+  // Prefer userId (from JWT/body). payUniqe lookup is only needed when userId is absent.
+  if (normalizedAppUserId && !userById) {
     userByPayUniqe = await findUserByPayUniqe(normalizedAppUserId);
   }
 
@@ -1138,11 +1181,17 @@ const resolveRevenueCatUser = async ({ userId, appUserId }) => {
 
   const resolvedAppUserId = normalizedAppUserId || currentPayUniqe || String(user.id);
   if (!currentPayUniqe) {
-    const updated = await setUserPayUniqe(user.id, resolvedAppUserId);
-    if (!updated?.payUniqe) {
-      throw new Error("Failed to persist payUniqe.");
+    try {
+      const updated = await setUserPayUniqe(user.id, resolvedAppUserId);
+      if (updated?.payUniqe) {
+        user.payUniqe = updated.payUniqe;
+      }
+    } catch (err) {
+      // Do not fail entitlement sync if identity persistence is incompatible with schema.
+      console.warn(
+        `[revenuecat][link-warning] userId=${user.id} appUserId=${resolvedAppUserId} msg=${err.message}`
+      );
     }
-    user.payUniqe = updated.payUniqe;
   }
 
   return {

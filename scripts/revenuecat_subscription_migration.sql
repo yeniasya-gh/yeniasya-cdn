@@ -1,13 +1,30 @@
 BEGIN;
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
 ALTER TABLE public.users
   ADD COLUMN IF NOT EXISTS "payUniqe" text;
 
-UPDATE public.users
-SET "payUniqe" = gen_random_uuid()::text
-WHERE "payUniqe" IS NULL OR btrim("payUniqe") = '';
+DO $$
+DECLARE
+  payuniqe_udt text;
+BEGIN
+  SELECT c.udt_name
+  INTO payuniqe_udt
+  FROM information_schema.columns c
+  WHERE c.table_schema = 'public'
+    AND c.table_name = 'users'
+    AND c.column_name = 'payUniqe'
+  LIMIT 1;
+
+  IF payuniqe_udt IS NOT NULL AND payuniqe_udt <> 'text' THEN
+    EXECUTE 'ALTER TABLE public.users ALTER COLUMN "payUniqe" TYPE text USING "payUniqe"::text';
+  END IF;
+END $$;
+
+UPDATE public.users u
+SET "payUniqe" = md5(
+  random()::text || clock_timestamp()::text || txid_current()::text || u.id::text
+)
+WHERE u."payUniqe" IS NULL OR btrim(u."payUniqe") = '';
 
 WITH duplicated AS (
   SELECT
@@ -17,18 +34,24 @@ WITH duplicated AS (
   WHERE "payUniqe" IS NOT NULL AND btrim("payUniqe") <> ''
 )
 UPDATE public.users u
-SET "payUniqe" = gen_random_uuid()::text
+SET "payUniqe" = md5(
+  random()::text || clock_timestamp()::text || txid_current()::text || u.id::text
+)
 FROM duplicated d
 WHERE u.id = d.id AND d.rn > 1;
 
 ALTER TABLE public.users
-  ALTER COLUMN "payUniqe" SET DEFAULT gen_random_uuid()::text;
+  ALTER COLUMN "payUniqe" SET DEFAULT md5(
+    random()::text || clock_timestamp()::text || txid_current()::text
+  );
 
 ALTER TABLE public.users
   ALTER COLUMN "payUniqe" SET NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS users_payuniqe_unique_idx
   ON public.users ("payUniqe");
+
+COMMIT;
 
 DO $$
 BEGIN
@@ -65,5 +88,3 @@ CREATE UNIQUE INDEX IF NOT EXISTS user_content_access_active_newspaper_subscript
 
 CREATE INDEX IF NOT EXISTS user_content_access_user_item_type_idx
   ON public.user_content_access (user_id, item_type);
-
-COMMIT;
