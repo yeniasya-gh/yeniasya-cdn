@@ -6,6 +6,7 @@ ALTER TABLE public.users
 DO $$
 DECLARE
   payuniqe_udt text;
+  rec record;
 BEGIN
   SELECT c.udt_name
   INTO payuniqe_udt
@@ -16,6 +17,20 @@ BEGIN
   LIMIT 1;
 
   IF payuniqe_udt IS NOT NULL AND payuniqe_udt <> 'text' THEN
+    FOR rec IN
+      SELECT pc.conname
+      FROM pg_constraint pc
+      WHERE pc.conrelid = 'public.users'::regclass
+        AND pc.contype = 'c'
+        AND pg_get_constraintdef(pc.oid) ILIKE '%payUniqe%'
+    LOOP
+      EXECUTE format(
+        'ALTER TABLE public.users DROP CONSTRAINT IF EXISTS %I',
+        rec.conname
+      );
+    END LOOP;
+
+    EXECUTE 'ALTER TABLE public.users ALTER COLUMN "payUniqe" DROP DEFAULT';
     EXECUTE 'ALTER TABLE public.users ALTER COLUMN "payUniqe" TYPE text USING "payUniqe"::text';
   END IF;
 END $$;
@@ -55,7 +70,7 @@ COMMIT;
 
 DO $$
 BEGIN
-  ALTER TYPE public.access_item_type ADD VALUE IF NOT EXISTS 'newspaper_subscription';
+  ALTER TYPE public.access_item_type ADD VALUE 'newspaper_subscription';
 EXCEPTION
   WHEN duplicate_object THEN NULL;
 END $$;
