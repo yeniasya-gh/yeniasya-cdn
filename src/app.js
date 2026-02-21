@@ -11,6 +11,9 @@ const { setTimeout: sleep } = require("timers/promises");
 const nodemailer = require("nodemailer");
 const axios = require("axios");
 const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 
 const PORT = process.env.PORT || 3001;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
@@ -26,6 +29,33 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
 const ALLOWED_HEADERS =
   process.env.ALLOWED_HEADERS || "content-type, x-api-key, authorization";
 const ALLOWED_METHODS = "GET, POST, OPTIONS";
+const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || "2mb";
+const TRUST_PROXY = process.env.TRUST_PROXY || "loopback";
+const RATE_LIMIT_WINDOW_MS_RAW = Number(process.env.RATE_LIMIT_WINDOW_MS || "900000");
+const RATE_LIMIT_WINDOW_MS =
+  Number.isFinite(RATE_LIMIT_WINDOW_MS_RAW) && RATE_LIMIT_WINDOW_MS_RAW > 0
+    ? RATE_LIMIT_WINDOW_MS_RAW
+    : 900000;
+const RATE_LIMIT_MAX_RAW = Number(process.env.RATE_LIMIT_MAX || "1200");
+const RATE_LIMIT_MAX =
+  Number.isFinite(RATE_LIMIT_MAX_RAW) && RATE_LIMIT_MAX_RAW > 0
+    ? RATE_LIMIT_MAX_RAW
+    : 1200;
+const AUTH_RATE_LIMIT_MAX_RAW = Number(process.env.AUTH_RATE_LIMIT_MAX || "20");
+const AUTH_RATE_LIMIT_MAX =
+  Number.isFinite(AUTH_RATE_LIMIT_MAX_RAW) && AUTH_RATE_LIMIT_MAX_RAW > 0
+    ? AUTH_RATE_LIMIT_MAX_RAW
+    : 20;
+const UPLOAD_RATE_LIMIT_MAX_RAW = Number(process.env.UPLOAD_RATE_LIMIT_MAX || "60");
+const UPLOAD_RATE_LIMIT_MAX =
+  Number.isFinite(UPLOAD_RATE_LIMIT_MAX_RAW) && UPLOAD_RATE_LIMIT_MAX_RAW > 0
+    ? UPLOAD_RATE_LIMIT_MAX_RAW
+    : 60;
+const BCRYPT_COST_RAW = Number(process.env.BCRYPT_COST || "12");
+const BCRYPT_COST =
+  Number.isInteger(BCRYPT_COST_RAW) && BCRYPT_COST_RAW >= 10 && BCRYPT_COST_RAW <= 14
+    ? BCRYPT_COST_RAW
+    : 12;
 const VIEW_TOKEN_SECRET = process.env.VIEW_TOKEN_SECRET || "";
 const VIEW_TOKEN_TTL_MIN = Number(process.env.VIEW_TOKEN_TTL_MIN || "5");
 const FRAME_ANCESTORS = (process.env.ALLOWED_FRAME_ANCESTORS || "")
@@ -82,9 +112,8 @@ const JWT_ALLOWED_ROLES = (process.env.JWT_ALLOWED_ROLES || JWT_DEFAULT_ROLE)
   .split(",")
   .map((v) => v.trim())
   .filter(Boolean);
-const GUEST_AUTH_USERNAME = process.env.GUEST_AUTH_USERNAME || "yeniasyaguest";
-const GUEST_AUTH_PASSWORD =
-  process.env.GUEST_AUTH_PASSWORD || "yeniasya.guest.pass.2026";
+const GUEST_AUTH_USERNAME = process.env.GUEST_AUTH_USERNAME || "";
+const GUEST_AUTH_PASSWORD = process.env.GUEST_AUTH_PASSWORD || "";
 const REVENUECAT_ENTITLEMENT_ACCESS = {
   "yeniasya pro": { itemType: "newspaper_subscription", itemId: null },
 };
@@ -212,10 +241,25 @@ const parsePrivatePath = (input) => {
   // Basic validation
   if (!type || !filename) return null;
 
-  // Optional: check if type is allowed
-  // if (!PRIVATE_TYPES.includes(type)) return null;
+  if (!PRIVATE_TYPES.includes(type)) return null;
 
   return { type, filename };
+};
+
+const sanitizeUrlForLog = (urlLike) => {
+  const raw = String(urlLike || "");
+  if (!raw) return raw;
+  try {
+    const parsed = new URL(raw, "http://localhost");
+    ["token", "password", "authorization", "x-api-key", "x-mail-token"].forEach((key) => {
+      if (parsed.searchParams.has(key)) {
+        parsed.searchParams.set(key, "[redacted]");
+      }
+    });
+    return `${parsed.pathname}${parsed.search}`;
+  } catch (err) {
+    return raw;
+  }
 };
 
 const logPdfRequest = ({
@@ -238,7 +282,7 @@ const logPdfRequest = ({
     route,
     action,
     method: req?.method,
-    path: req?.originalUrl || req?.url,
+    path: sanitizeUrlForLog(req?.originalUrl || req?.url),
     status,
     type,
     filename,
@@ -282,6 +326,56 @@ const paths = {
 };
 
 const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", TRUST_PROXY);
+
+const safeTokenCompare = (provided, expected) => {
+  const expectedValue = String(expected || "");
+  const providedValue = String(provided || "");
+  if (!expectedValue || providedValue.length !== expectedValue.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(
+    Buffer.from(providedValue, "utf8"),
+    Buffer.from(expectedValue, "utf8")
+  );
+};
+
+const buildRateLimiter = ({ windowMs, max, message, skip }) =>
+  rateLimit({
+    windowMs,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { ok: false, error: message },
+    skip,
+  });
+
+const globalRateLimiter = buildRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMIT_MAX,
+  message: "Too many requests.",
+  skip: (req) => req.path === "/health",
+});
+const authRateLimiter = buildRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: AUTH_RATE_LIMIT_MAX,
+  message: "Too many authentication attempts.",
+});
+const uploadRateLimiter = buildRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: UPLOAD_RATE_LIMIT_MAX,
+  message: "Too many upload attempts.",
+});
+
+app.use(globalRateLimiter);
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: false,
+  })
+);
 
 // Basic request/response logger to surface hung/slow requests.
 app.use((req, res, next) => {
@@ -289,7 +383,7 @@ app.use((req, res, next) => {
   res.on("finish", () => {
     const durationMs = Number(process.hrtime.bigint() - start) / 1_000_000;
     console.log(
-      `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${durationMs.toFixed(
+      `[${new Date().toISOString()}] ${req.method} ${sanitizeUrlForLog(req.originalUrl)} -> ${res.statusCode} (${durationMs.toFixed(
         1
       )}ms)`
     );
@@ -318,22 +412,32 @@ const prewarmBunnyConnection = () => {
 prewarmBunnyConnection();
 
 const fileFilter = (req, file, cb) => {
-  const ok =
-    file.mimetype === "application/pdf" ||
-    file.mimetype === "image/jpeg" ||
-    file.mimetype === "image/png" ||
-    file.mimetype === "image/webp";
+  const allowedByMime = {
+    "application/pdf": [".pdf"],
+    "image/jpeg": [".jpg", ".jpeg"],
+    "image/png": [".png"],
+    "image/webp": [".webp"],
+  };
+  const ext = path.extname(file.originalname || "").toLowerCase();
+  const allowedExts = allowedByMime[file.mimetype] || null;
+  const ok = Array.isArray(allowedExts) && allowedExts.includes(ext);
 
   if (!ok) {
     return cb(
-      new Error("Only pdf, jpg, png, or webp files are allowed for uploads.")
+      new Error("Only pdf, jpg/jpeg, png, or webp files are allowed for uploads.")
     );
   }
 
   cb(null, true);
 };
 
-const storage = multer.memoryStorage();
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, TMP_DIR),
+  filename: (req, file, cb) => {
+    const extension = path.extname(file.originalname || "").toLowerCase();
+    cb(null, `${Date.now()}-${crypto.randomUUID()}${extension}`);
+  },
+});
 
 const upload = multer({
   storage,
@@ -362,7 +466,7 @@ const requireAuth = (req, res, next) => {
     ? raw.slice(7)
     : raw;
 
-  if (!token || token !== AUTH_TOKEN) {
+  if (!token || !safeTokenCompare(token, AUTH_TOKEN)) {
     if ((req.path || "").startsWith("/private")) {
       logPdfRequest({
         req,
@@ -385,7 +489,7 @@ const requireMailAuth = (req, res, next) => {
   const token = raw.toLowerCase().startsWith("bearer ")
     ? raw.slice(7)
     : raw;
-  if (!token || token !== MAIL_SETTINGS.token) {
+  if (!MAIL_SETTINGS.token || !token || !safeTokenCompare(token, MAIL_SETTINGS.token)) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
   next();
@@ -612,8 +716,8 @@ const mailTransporter = nodemailer.createTransport({
   },
 });
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+app.use(express.json({ limit: REQUEST_BODY_LIMIT }));
+app.use(express.urlencoded({ extended: false, limit: REQUEST_BODY_LIMIT }));
 
 app.use((req, res, next) => {
   const requestOrigin = req.get("origin");
@@ -622,10 +726,15 @@ app.use((req, res, next) => {
     (requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin));
 
   if (originAllowed) {
+    res.vary("Origin");
     res.set("Access-Control-Allow-Origin", requestOrigin || "*");
   }
   res.set("Access-Control-Allow-Methods", ALLOWED_METHODS);
   res.set("Access-Control-Allow-Headers", ALLOWED_HEADERS);
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
 
   next();
 });
@@ -707,9 +816,29 @@ const buildJwt = (user) => {
   return { token, expiresAt };
 };
 
+const BCRYPT_HASH_REGEX = /^\$2[abxy]\$\d{2}\$/;
+const SHA256_HEX_REGEX = /^[a-f0-9]{64}$/i;
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
-const hashPassword = (value) =>
+const hashLegacyPassword = (value) =>
   crypto.createHash("sha256").update(String(value || "")).digest("hex");
+const hashPassword = (value) => bcrypt.hash(String(value || ""), BCRYPT_COST);
+const verifyPasswordHash = async (plainTextPassword, persistedHash) => {
+  const hash = String(persistedHash || "");
+  if (!hash) return { ok: false, needsUpgrade: false };
+
+  if (BCRYPT_HASH_REGEX.test(hash)) {
+    const ok = await bcrypt.compare(String(plainTextPassword || ""), hash);
+    return { ok, needsUpgrade: false };
+  }
+
+  if (!SHA256_HEX_REGEX.test(hash)) {
+    return { ok: false, needsUpgrade: false };
+  }
+
+  const legacy = hashLegacyPassword(plainTextPassword);
+  const ok = safeTokenCompare(legacy.toLowerCase(), hash.toLowerCase());
+  return { ok, needsUpgrade: ok };
+};
 const normalizeRevenueCatAppUserId = (value) => {
   if (value === undefined || value === null) return null;
   const normalized = String(value).trim();
@@ -823,6 +952,35 @@ const optionalJwt = (req, res, next) => {
   }
 };
 
+const requireJwtOrServiceAuth = (req, res, next) => {
+  const authHeader = req.get("authorization") || "";
+  const bearerToken = authHeader.toLowerCase().startsWith("bearer ")
+    ? authHeader.slice(7).trim()
+    : "";
+  if (bearerToken) {
+    try {
+      const payload = verifyJwtToken(bearerToken);
+      req.jwt = payload;
+      req.jwtToken = bearerToken;
+      req.hasuraAuthMode = "jwt";
+      return next();
+    } catch (err) {
+      // Fall back to service token mode.
+    }
+  }
+
+  const serviceRaw = req.get("x-api-key") || authHeader || "";
+  const serviceToken = serviceRaw.toLowerCase().startsWith("bearer ")
+    ? serviceRaw.slice(7).trim()
+    : serviceRaw.trim();
+  if (serviceToken && safeTokenCompare(serviceToken, AUTH_TOKEN)) {
+    req.hasuraAuthMode = "service";
+    return next();
+  }
+
+  return res.status(401).json({ ok: false, error: "Unauthorized." });
+};
+
 const requireRevenueCatAuth = (req, res, next) => {
   const authHeader = req.get("authorization") || "";
   const bearerToken = authHeader.toLowerCase().startsWith("bearer ")
@@ -846,7 +1004,7 @@ const requireRevenueCatAuth = (req, res, next) => {
     ? serviceRaw.slice(7).trim()
     : serviceRaw.trim();
 
-  if (serviceToken && serviceToken === AUTH_TOKEN) {
+  if (serviceToken && safeTokenCompare(serviceToken, AUTH_TOKEN)) {
     req.revenueCatAuthMode = "service";
     return next();
   }
@@ -870,7 +1028,7 @@ const requireRevenueCatWebhookAuth = (req, res, next) => {
     (req.get("x-revenuecat-webhook-token") || req.get("x-api-key") || "").trim();
   const token = bearerToken || headerToken;
 
-  if (!token || token !== REVENUECAT_WEBHOOK_AUTH_TOKEN) {
+  if (!token || !safeTokenCompare(token, REVENUECAT_WEBHOOK_AUTH_TOKEN)) {
     return res.status(401).json({ ok: false, error: "Unauthorized webhook request." });
   }
 
@@ -882,11 +1040,27 @@ const buildHasuraAuthHeaders = (req) => {
   if (req?.jwtToken) {
     return { Authorization: `Bearer ${req.jwtToken}` };
   }
-  if (HASURA_ALLOW_JWTLESS && HASURA_ADMIN_SECRET) {
-    return { "x-hasura-admin-secret": HASURA_ADMIN_SECRET };
-  }
   return {};
 };
+
+const setUserPasswordHash = async (userId, passwordHash) => {
+  await hasuraRequest(
+    `
+      mutation UpdateUserPassword($id: bigint!, $password: String!) {
+        update_users_by_pk(pk_columns: {id: $id}, _set: {password: $password}) {
+          id
+        }
+      }
+    `,
+    { id: userId, password: passwordHash }
+  );
+};
+
+app.use(
+  ["/auth/register", "/auth/login", "/auth/guest-token"],
+  authRateLimiter
+);
+app.use(["/upload/public", "/upload/private"], uploadRateLimiter);
 
 app.post("/auth/register", async (req, res) => {
   const requestId = crypto.randomUUID();
@@ -932,7 +1106,7 @@ app.post("/auth/register", async (req, res) => {
       return res.status(409).json({ ok: false, error: "Email already in use." });
     }
 
-    const passwordHash = hashPassword(password);
+    const passwordHash = await hashPassword(password);
     const payUniqe = crypto.randomUUID();
     const created = await hasuraRequest(
       `
@@ -1016,12 +1190,25 @@ app.post("/auth/login", async (req, res) => {
       return res.status(401).json({ ok: false, error: "Invalid credentials." });
     }
 
-    const ok = hashPassword(password) === user.password;
-    if (!ok) {
+    const passwordCheck = await verifyPasswordHash(password, user.password);
+    if (!passwordCheck.ok) {
       console.warn(
         `[auth][login][invalid] id=${requestId} ip=${req.ip} email=${email}`
       );
       return res.status(401).json({ ok: false, error: "Invalid credentials." });
+    }
+
+    if (passwordCheck.needsUpgrade) {
+      try {
+        await setUserPasswordHash(user.id, await hashPassword(password));
+        console.log(
+          `[auth][login][password-upgrade] id=${requestId} ip=${req.ip} email=${email} userId=${user.id}`
+        );
+      } catch (upgradeErr) {
+        console.warn(
+          `[auth][login][password-upgrade-failed] id=${requestId} ip=${req.ip} email=${email} userId=${user.id} msg=${upgradeErr.message}`
+        );
+      }
     }
 
     const safeUser = {
@@ -1048,12 +1235,21 @@ app.post("/auth/login", async (req, res) => {
 app.post("/auth/guest-token", (req, res) => {
   const username = String(req.body?.username || "").trim();
   const password = String(req.body?.password || "");
+  if (!GUEST_AUTH_USERNAME || !GUEST_AUTH_PASSWORD) {
+    return res.status(503).json({
+      ok: false,
+      error: "Guest auth credentials are not configured.",
+    });
+  }
   if (!username || !password) {
     return res
       .status(400)
       .json({ ok: false, error: "username and password are required." });
   }
-  if (username !== GUEST_AUTH_USERNAME || password !== GUEST_AUTH_PASSWORD) {
+  if (
+    !safeTokenCompare(username, GUEST_AUTH_USERNAME) ||
+    !safeTokenCompare(password, GUEST_AUTH_PASSWORD)
+  ) {
     return res.status(401).json({ ok: false, error: "Invalid credentials." });
   }
 
@@ -1100,7 +1296,7 @@ app.post("/graphql", optionalJwt, async (req, res) => {
   }
 });
 
-app.post("/hasura", optionalJwt, async (req, res) => {
+app.post("/hasura", requireJwtOrServiceAuth, async (req, res) => {
   try {
     const { query, variables, operationName } = req.body || {};
     if (!query) {
@@ -1113,7 +1309,9 @@ app.post("/hasura", optionalJwt, async (req, res) => {
       {
         headers: {
           "Content-Type": "application/json",
-          "x-hasura-admin-secret": HASURA_ADMIN_SECRET,
+          ...(req.hasuraAuthMode === "service"
+            ? { "x-hasura-admin-secret": HASURA_ADMIN_SECRET }
+            : buildHasuraAuthHeaders(req)),
         },
         validateStatus: () => true,
       }
@@ -1125,7 +1323,7 @@ app.post("/hasura", optionalJwt, async (req, res) => {
     }
     return res.send(response.data);
   } catch (err) {
-    return res.status(500).json({ ok: false, error: "Hasura admin proxy failed." });
+    return res.status(500).json({ ok: false, error: "Hasura proxy failed." });
   }
 });
 
@@ -2051,7 +2249,7 @@ const verifyViewToken = (token) => {
     .createHmac("sha256", VIEW_TOKEN_SECRET)
     .update(payloadB64)
     .digest("base64url");
-  if (signature !== expectedSig) {
+  if (!safeTokenCompare(signature, expectedSig)) {
     return { ok: false, error: "Signature mismatch." };
   }
   try {
@@ -2110,14 +2308,14 @@ const generateUniqueFilename = (originalName) => {
   return `${stamp}-${unique}-${base}${ext}`;
 };
 
-const uploadToBunny = async (fileBuffer, type, scope, filename) => {
+const uploadToBunny = async (filePath, type, scope, filename) => {
   const url = `/${type}/${scope}/${filename}`;
   try {
     const response = await bunnyRequest(
       {
         method: "PUT",
         url,
-        data: fileBuffer,
+        data: fs.createReadStream(filePath),
         headers: {
           "Content-Type": "application/octet-stream",
         },
@@ -2135,6 +2333,17 @@ const uploadToBunny = async (fileBuffer, type, scope, filename) => {
       `[BunnyCDN Request Details] URL: ${bunnyHttp.defaults.baseURL}${url}, Zone: ${BUNNY_SETTINGS.storageZone}`
     );
     throw new Error(`BunnyCDN upload failed (${statusCode}): ${JSON.stringify(errorMsg)}`);
+  }
+};
+
+const cleanupTempUpload = async (filePath) => {
+  if (!filePath) return;
+  try {
+    await fs.promises.unlink(filePath);
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      console.warn(`[upload][cleanup-warning] path=${filePath} msg=${err?.message}`);
+    }
   }
 };
 
@@ -2331,6 +2540,7 @@ const moveToFinal = (file, targetDir) =>
   });
 
 app.post("/upload/public", requireJwt, upload.single("file"), async (req, res, next) => {
+  const tempFilePath = req.file?.path;
   try {
     const type = resolveType(req, PUBLIC_TYPES);
     if (!type) {
@@ -2343,7 +2553,7 @@ app.post("/upload/public", requireJwt, upload.single("file"), async (req, res, n
     }
 
     const filename = generateUniqueFilename(req.file.originalname);
-    await uploadToBunny(req.file.buffer, type, "public", filename);
+    await uploadToBunny(req.file.path, type, "public", filename);
 
     return res.json({
       ok: true,
@@ -2354,10 +2564,13 @@ app.post("/upload/public", requireJwt, upload.single("file"), async (req, res, n
     });
   } catch (err) {
     next(err);
+  } finally {
+    await cleanupTempUpload(tempFilePath);
   }
 });
 
 app.post("/upload/private", requireJwt, upload.single("file"), async (req, res, next) => {
+  const tempFilePath = req.file?.path;
   try {
     const type = resolveType(req, PRIVATE_TYPES);
     if (!type) {
@@ -2370,7 +2583,7 @@ app.post("/upload/private", requireJwt, upload.single("file"), async (req, res, 
     }
 
     const filename = generateUniqueFilename(req.file.originalname);
-    await uploadToBunny(req.file.buffer, type, "private", filename);
+    await uploadToBunny(req.file.path, type, "private", filename);
 
     return res.json({
       ok: true,
@@ -2381,6 +2594,8 @@ app.post("/upload/private", requireJwt, upload.single("file"), async (req, res, 
     });
   } catch (err) {
     next(err);
+  } finally {
+    await cleanupTempUpload(tempFilePath);
   }
 });
 
@@ -2895,7 +3110,7 @@ app.get("/private/view-secure", requireJwt, async (req, res) => {
   }
 });
 
-app.post("/payment/session", requireAuth, async (req, res, next) => {
+app.post("/payment/session", requireJwt, async (req, res, next) => {
   try {
     const body = req.body || {};
     const pick = (...keys) => {
@@ -3015,7 +3230,7 @@ app.post("/payment/session", requireAuth, async (req, res, next) => {
   }
 });
 
-app.post("/payment/query-card", requireAuth, async (req, res, next) => {
+app.post("/payment/query-card", requireJwt, async (req, res, next) => {
   try {
     const body = req.body || {};
     const pick = (...keys) => {
@@ -3097,7 +3312,7 @@ app.post("/payment/query-card", requireAuth, async (req, res, next) => {
   }
 });
 
-app.post("/payment/delete-card", requireAuth, async (req, res, next) => {
+app.post("/payment/delete-card", requireJwt, async (req, res, next) => {
   try {
     const body = req.body || {};
     const pick = (...keys) => {
@@ -3179,7 +3394,7 @@ app.post("/payment/delete-card", requireAuth, async (req, res, next) => {
   }
 });
 
-app.post("/payment/pay", requireAuth, async (req, res, next) => {
+app.post("/payment/pay", requireJwt, async (req, res, next) => {
   try {
     const payloadResult = buildPayPayload(req.body || {});
     if (!payloadResult.ok) {
@@ -3199,7 +3414,7 @@ app.post("/payment/pay", requireAuth, async (req, res, next) => {
   }
 });
 
-app.post("/payment/pay/redirect", requireAuth, async (req, res, next) => {
+app.post("/payment/pay/redirect", requireJwt, async (req, res, next) => {
   try {
     const payloadResult = buildPayPayload(req.body || {});
     if (!payloadResult.ok) {
@@ -3272,7 +3487,7 @@ app.all("/payment/return", (req, res) => {
   return res.redirect(redirectTarget);
 });
 
-app.post("/payment/test-session", requireAuth, async (req, res, next) => {
+app.post("/payment/test-session", requireJwt, async (req, res, next) => {
   try {
     if (process.env.NODE_ENV !== "development") {
       return res.status(404).json({ ok: false, error: "Not found." });
@@ -3412,8 +3627,9 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, message: "alive" });
 });
 
-app.use((err, req, res, next) => {
+app.use(async (err, req, res, next) => {
   // Multer and manual errors land here
+  await cleanupTempUpload(req?.file?.path);
   console.error(err);
   res.status(400).json({ ok: false, error: err.message || "Upload failed." });
 });
