@@ -1037,10 +1037,13 @@ const requireRevenueCatWebhookAuth = (req, res, next) => {
 };
 
 const buildHasuraAuthHeaders = (req) => {
+  const headers = {
+    "x-hasura-admin-secret": HASURA_ADMIN_SECRET,
+  };
   if (req?.jwtToken) {
-    return { Authorization: `Bearer ${req.jwtToken}` };
+    headers.Authorization = `Bearer ${req.jwtToken}`;
   }
-  return {};
+  return headers;
 };
 
 const setUserPasswordHash = async (userId, passwordHash) => {
@@ -1309,9 +1312,7 @@ app.post("/hasura", requireJwtOrServiceAuth, async (req, res) => {
       {
         headers: {
           "Content-Type": "application/json",
-          ...(req.hasuraAuthMode === "service"
-            ? { "x-hasura-admin-secret": HASURA_ADMIN_SECRET }
-            : buildHasuraAuthHeaders(req)),
+          ...buildHasuraAuthHeaders(req),
         },
         validateStatus: () => true,
       }
