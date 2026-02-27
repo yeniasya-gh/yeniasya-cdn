@@ -130,6 +130,8 @@ const REVENUECAT_WEBHOOK_AUTH_TOKEN = (
 ).trim();
 const REVENUECAT_DEFAULT_ENTITLEMENT_ID =
   process.env.REVENUECAT_DEFAULT_ENTITLEMENT_ID || "Yeniasya Pro";
+const REVENUECAT_WEB_CHECKOUT_PLATFORM =
+  process.env.REVENUECAT_WEB_CHECKOUT_PLATFORM || "paratika";
 const REVENUECAT_ACTIVE_EVENT_TYPES = new Set([
   "INITIAL_PURCHASE",
   "RENEWAL",
@@ -1575,6 +1577,248 @@ const fetchRevenueCatEntitlementState = async ({ appUserId, entitlementId }) => 
   };
 };
 
+const ensureRevenueCatSubscriber = async ({
+  appUserId,
+  platform = REVENUECAT_WEB_CHECKOUT_PLATFORM,
+}) => {
+  const normalizedAppUserId = normalizeRevenueCatAppUserId(appUserId);
+  if (!normalizedAppUserId) {
+    const err = new Error("appUserId is required.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!REVENUECAT_SECRET_API_KEY) {
+    const err = new Error("RevenueCat secret key is not configured.");
+    err.statusCode = 503;
+    throw err;
+  }
+
+  const response = await axios.get(
+    `${REVENUECAT_API_BASE_URL}/subscribers/${encodeURIComponent(normalizedAppUserId)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${REVENUECAT_SECRET_API_KEY}`,
+        ...(platform ? { "X-Platform": String(platform).trim() } : {}),
+      },
+      timeout: REVENUECAT_HTTP_TIMEOUT_MS,
+      validateStatus: () => true,
+    }
+  );
+
+  if (response.status === 404) return false;
+  if (response.status < 200 || response.status >= 300) {
+    const err = new Error(
+      `RevenueCat subscriber ensure failed (${response.status}).`
+    );
+    err.statusCode = 502;
+    throw err;
+  }
+
+  return true;
+};
+
+const resolveRevenueCatGrantDuration = ({
+  expirationDate,
+  lifetime = false,
+}) => {
+  if (lifetime) {
+    return { duration: "lifetime", expiresAt: null };
+  }
+
+  const expiresAt = toIsoTimestampOrNull(expirationDate);
+  if (!expiresAt) {
+    const err = new Error(
+      "expirationDate is required when lifetime is not requested."
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const diffMs = new Date(expiresAt).getTime() - Date.now();
+  if (!Number.isFinite(diffMs) || diffMs <= 0) {
+    const err = new Error("expirationDate must be a future timestamp.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const durationSeconds = Math.max(60, Math.ceil(diffMs / 1000));
+  return { duration: `${durationSeconds}s`, expiresAt };
+};
+
+const grantRevenueCatPromotionalEntitlement = async ({
+  appUserId,
+  entitlementId,
+  expirationDate,
+  lifetime = false,
+  platform = REVENUECAT_WEB_CHECKOUT_PLATFORM,
+}) => {
+  const normalizedAppUserId = normalizeRevenueCatAppUserId(appUserId);
+  const normalizedEntitlementId = normalizeRevenueCatAppUserId(entitlementId);
+  if (!normalizedAppUserId) {
+    const err = new Error("appUserId is required.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!normalizedEntitlementId) {
+    const err = new Error("entitlementId is required.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!REVENUECAT_SECRET_API_KEY) {
+    const err = new Error("RevenueCat secret key is not configured.");
+    err.statusCode = 503;
+    throw err;
+  }
+
+  const grantWindow = resolveRevenueCatGrantDuration({
+    expirationDate,
+    lifetime,
+  });
+  const url = `${REVENUECAT_API_BASE_URL}/subscribers/${encodeURIComponent(
+    normalizedAppUserId
+  )}/entitlements/${encodeURIComponent(normalizedEntitlementId)}/promotional`;
+
+  let attemptedEnsure = false;
+  for (;;) {
+    const response = await axios.post(
+      url,
+      { duration: grantWindow.duration },
+      {
+        headers: {
+          Authorization: `Bearer ${REVENUECAT_SECRET_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: REVENUECAT_HTTP_TIMEOUT_MS,
+        validateStatus: () => true,
+      }
+    );
+
+    if (response.status >= 200 && response.status < 300) {
+      return {
+        granted: true,
+        duration: grantWindow.duration,
+        expirationDate: grantWindow.expiresAt,
+      };
+    }
+
+    if (response.status === 404 && !attemptedEnsure) {
+      attemptedEnsure = true;
+      await ensureRevenueCatSubscriber({
+        appUserId: normalizedAppUserId,
+        platform,
+      });
+      continue;
+    }
+
+    const err = new Error(
+      `RevenueCat promotional grant failed (${response.status}).`
+    );
+    err.statusCode = 502;
+    throw err;
+  }
+};
+
+const revokeRevenueCatPromotionalEntitlement = async ({
+  appUserId,
+  entitlementId,
+}) => {
+  const normalizedAppUserId = normalizeRevenueCatAppUserId(appUserId);
+  const normalizedEntitlementId = normalizeRevenueCatAppUserId(entitlementId);
+  if (!normalizedAppUserId) {
+    const err = new Error("appUserId is required.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!normalizedEntitlementId) {
+    const err = new Error("entitlementId is required.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!REVENUECAT_SECRET_API_KEY) {
+    const err = new Error("RevenueCat secret key is not configured.");
+    err.statusCode = 503;
+    throw err;
+  }
+
+  const url = `${REVENUECAT_API_BASE_URL}/subscribers/${encodeURIComponent(
+    normalizedAppUserId
+  )}/entitlements/${encodeURIComponent(
+    normalizedEntitlementId
+  )}/revoke_promotionals`;
+
+  const response = await axios.post(
+    url,
+    {},
+    {
+      headers: {
+        Authorization: `Bearer ${REVENUECAT_SECRET_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      timeout: REVENUECAT_HTTP_TIMEOUT_MS,
+      validateStatus: () => true,
+    }
+  );
+
+  if (response.status >= 200 && response.status < 300) {
+    return { revoked: true };
+  }
+  if (response.status === 404) {
+    return { revoked: false, reason: "subscriber_not_found" };
+  }
+
+  const err = new Error(
+    `RevenueCat promotional revoke failed (${response.status}).`
+  );
+  err.statusCode = 502;
+  throw err;
+};
+
+const resolveEntitlementStateWithFallback = async ({
+  appUserId,
+  entitlementId,
+  fallbackIsActive,
+  fallbackExpirationDate,
+  allowFallbackOverride = false,
+}) => {
+  const verification = await fetchRevenueCatEntitlementState({
+    appUserId,
+    entitlementId,
+  });
+  const fallbackProvided = fallbackIsActive !== undefined && fallbackIsActive !== null;
+  const fallbackActive = toBool(fallbackIsActive);
+  const fallbackExpiry = toIsoTimestampOrNull(fallbackExpirationDate);
+
+  if (
+    verification.checked &&
+    !(
+      fallbackProvided &&
+      (allowFallbackOverride || verification.reason === "subscriber_not_found")
+    )
+  ) {
+    return {
+      verification,
+      isActive: verification.isActive,
+      expirationDate: verification.expirationDate,
+      usedFallback: false,
+    };
+  }
+
+  if (!fallbackProvided) {
+    const err = new Error(
+      "RevenueCat verification unavailable and no fallback entitlement state was provided."
+    );
+    err.statusCode = 503;
+    throw err;
+  }
+
+  return {
+    verification,
+    isActive: fallbackActive,
+    expirationDate: fallbackExpiry,
+    usedFallback: true,
+  };
+};
+
 const syncRevenueCatAccessByEntitlement = async ({
   userId,
   entitlementId,
@@ -2136,6 +2380,426 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
     });
     console.error(`[revenuecat][event][error] id=${requestId} msg=${err.message}`);
     return res.status(status).json({ ok: false, error: err.message || "Event failed." });
+  }
+});
+
+app.post("/revenuecat/subscription/refresh", requireRevenueCatAuth, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const baseAudit = {
+    request_id: requestId,
+    endpoint: "/revenuecat/subscription/refresh",
+    auth_mode: req.revenueCatAuthMode || "unknown",
+  };
+
+  try {
+    const body = req.body || {};
+    const source = normalizeRevenueCatAppUserId(body.source) || "manual_refresh";
+    const entitlementId =
+      normalizeRevenueCatAppUserId(body.entitlementId) ||
+      normalizeRevenueCatAppUserId(REVENUECAT_DEFAULT_ENTITLEMENT_ID);
+    const appUserId = normalizeRevenueCatAppUserId(body.appUserId);
+    const expectedAppUserId = normalizeRevenueCatAppUserId(body.expectedAppUserId);
+    const payloadIdentityMatched = toNullableBool(body.identityMatched);
+    const bodyUserId = toPositiveIntOrNull(body.userId);
+    const jwtUserId = extractJwtUserId(req.jwt);
+    const hasJwtBodyMismatch =
+      req.revenueCatAuthMode === "jwt" &&
+      bodyUserId &&
+      jwtUserId &&
+      bodyUserId !== jwtUserId;
+    const resolvedUserIdInput =
+      req.revenueCatAuthMode === "jwt" && jwtUserId ? jwtUserId : bodyUserId || jwtUserId;
+
+    if (!entitlementId) {
+      return res.status(400).json({ ok: false, error: "entitlementId is required." });
+    }
+    if (!resolvedUserIdInput && !appUserId) {
+      return res.status(400).json({ ok: false, error: "userId or appUserId is required." });
+    }
+    if (hasJwtBodyMismatch) {
+      console.warn(
+        `[revenuecat][refresh][jwt-mismatch] id=${requestId} bodyUserId=${bodyUserId} jwtUserId=${jwtUserId} mode=jwt_using_token_user_id`
+      );
+    }
+
+    const resolved = await resolveRevenueCatUser({
+      userId: resolvedUserIdInput,
+      appUserId,
+      allowPayUniqeRelink: req.revenueCatAuthMode === "jwt",
+    });
+
+    if (req.revenueCatAuthMode === "jwt" && jwtUserId && resolved.userId !== jwtUserId) {
+      return res.status(403).json({ ok: false, error: "User mismatch." });
+    }
+
+    const identity = buildRevenueCatIdentityContext({
+      expectedAppUserId,
+      payloadIdentityMatched,
+      resolvedAppUserId: resolved.appUserId,
+    });
+    if (identity.serverIdentityMatched === false) {
+      console.warn(
+        `[revenuecat][identity-mismatch] id=${requestId} endpoint=refresh userId=${resolved.userId} expected=${identity.expectedAppUserId} resolved=${resolved.appUserId}`
+      );
+    }
+
+    const state = await resolveEntitlementStateWithFallback({
+      appUserId: resolved.appUserId,
+      entitlementId,
+      fallbackIsActive: body.isActive,
+      fallbackExpirationDate: body.expirationDate,
+      allowFallbackOverride: false,
+    });
+    const accessSync = await syncRevenueCatAccessByEntitlement({
+      userId: resolved.userId,
+      entitlementId,
+      isActive: state.isActive,
+      expirationDate: state.expirationDate,
+    });
+
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      source,
+      user_id: resolved.userId,
+      app_user_id: resolved.appUserId,
+      expected_app_user_id: identity.expectedAppUserId,
+      identity_payload_matched: identity.payloadIdentityMatched,
+      identity_server_matched: identity.serverIdentityMatched,
+      identity_effective_matched: identity.identityMatched,
+      entitlement_id: entitlementId,
+      is_active: state.isActive,
+      expiration_date: toIsoTimestampOrNull(state.expirationDate),
+      verification_source: state.verification.source || null,
+      verification_reason: state.verification.reason || null,
+      access_action: accessSync.action || accessSync.reason || "none",
+      success: true,
+      payload: body,
+    });
+
+    console.log(
+      `[revenuecat][refresh] id=${requestId} source=${source} userId=${resolved.userId} appUserId=${resolved.appUserId} expected=${identity.expectedAppUserId || "-"} payloadMatched=${boolForLog(identity.payloadIdentityMatched)} serverMatched=${boolForLog(identity.serverIdentityMatched)} entitlement=${entitlementId} active=${state.isActive} action=${accessSync.action || "none"}`
+    );
+
+    return res.json({
+      ok: true,
+      requestId,
+      source,
+      userId: resolved.userId,
+      appUserId: resolved.appUserId,
+      expectedAppUserId: identity.expectedAppUserId,
+      identityMatched: identity.identityMatched,
+      identityServerMatched: identity.serverIdentityMatched,
+      identityPayloadMatched: identity.payloadIdentityMatched,
+      entitlementId,
+      isActive: state.isActive,
+      expirationDate: state.expirationDate || null,
+      verification: state.verification,
+      accessSync,
+      usedFallback: state.usedFallback,
+    });
+  } catch (err) {
+    const status = Number.isInteger(err.statusCode) ? err.statusCode : 500;
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      source: normalizeRevenueCatAppUserId(req.body?.source) || "manual_refresh",
+      success: false,
+      error: err.message || "Refresh failed.",
+      payload: req.body || {},
+    });
+    console.error(`[revenuecat][refresh][error] id=${requestId} msg=${err.message}`);
+    return res.status(status).json({ ok: false, error: err.message || "Refresh failed." });
+  }
+});
+
+app.post("/revenuecat/subscription/grant", requireRevenueCatAuth, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const baseAudit = {
+    request_id: requestId,
+    endpoint: "/revenuecat/subscription/grant",
+    auth_mode: req.revenueCatAuthMode || "unknown",
+  };
+
+  try {
+    const body = req.body || {};
+    const source = normalizeRevenueCatAppUserId(body.source) || "web_checkout";
+    const entitlementId =
+      normalizeRevenueCatAppUserId(body.entitlementId) ||
+      normalizeRevenueCatAppUserId(REVENUECAT_DEFAULT_ENTITLEMENT_ID);
+    const appUserId = normalizeRevenueCatAppUserId(body.appUserId);
+    const expectedAppUserId = normalizeRevenueCatAppUserId(body.expectedAppUserId);
+    const payloadIdentityMatched = toNullableBool(body.identityMatched);
+    const bodyUserId = toPositiveIntOrNull(body.userId);
+    const jwtUserId = extractJwtUserId(req.jwt);
+    const hasJwtBodyMismatch =
+      req.revenueCatAuthMode === "jwt" &&
+      bodyUserId &&
+      jwtUserId &&
+      bodyUserId !== jwtUserId;
+    const resolvedUserIdInput =
+      req.revenueCatAuthMode === "jwt" && jwtUserId ? jwtUserId : bodyUserId || jwtUserId;
+    const durationMonths = toPositiveIntOrNull(
+      body.durationMonths || body.periodMonths || body.period_months
+    );
+    const explicitExpirationDate = toIsoTimestampOrNull(body.expirationDate);
+    const lifetime = toBool(body.lifetime) || toBool(body.isLifetime);
+    let targetExpirationDate = explicitExpirationDate;
+
+    if (!targetExpirationDate && durationMonths) {
+      const expiration = new Date();
+      expiration.setMonth(expiration.getMonth() + durationMonths);
+      targetExpirationDate = expiration.toISOString();
+    }
+
+    if (!entitlementId) {
+      return res.status(400).json({ ok: false, error: "entitlementId is required." });
+    }
+    if (!resolvedUserIdInput && !appUserId) {
+      return res.status(400).json({ ok: false, error: "userId or appUserId is required." });
+    }
+    if (!lifetime && !targetExpirationDate) {
+      return res.status(400).json({
+        ok: false,
+        error: "expirationDate, durationMonths or lifetime must be provided.",
+      });
+    }
+    if (hasJwtBodyMismatch) {
+      console.warn(
+        `[revenuecat][grant][jwt-mismatch] id=${requestId} bodyUserId=${bodyUserId} jwtUserId=${jwtUserId} mode=jwt_using_token_user_id`
+      );
+    }
+
+    const resolved = await resolveRevenueCatUser({
+      userId: resolvedUserIdInput,
+      appUserId,
+      allowPayUniqeRelink: req.revenueCatAuthMode === "jwt",
+    });
+
+    if (req.revenueCatAuthMode === "jwt" && jwtUserId && resolved.userId !== jwtUserId) {
+      return res.status(403).json({ ok: false, error: "User mismatch." });
+    }
+
+    const identity = buildRevenueCatIdentityContext({
+      expectedAppUserId,
+      payloadIdentityMatched,
+      resolvedAppUserId: resolved.appUserId,
+    });
+    if (identity.serverIdentityMatched === false) {
+      console.warn(
+        `[revenuecat][identity-mismatch] id=${requestId} endpoint=grant userId=${resolved.userId} expected=${identity.expectedAppUserId} resolved=${resolved.appUserId}`
+      );
+    }
+
+    const grant = await grantRevenueCatPromotionalEntitlement({
+      appUserId: resolved.appUserId,
+      entitlementId,
+      expirationDate: targetExpirationDate,
+      lifetime,
+      platform: normalizeRevenueCatAppUserId(body.platform) || REVENUECAT_WEB_CHECKOUT_PLATFORM,
+    });
+    const state = await resolveEntitlementStateWithFallback({
+      appUserId: resolved.appUserId,
+      entitlementId,
+      fallbackIsActive: true,
+      fallbackExpirationDate: grant.expirationDate ?? targetExpirationDate,
+      allowFallbackOverride: true,
+    });
+    const accessSync = await syncRevenueCatAccessByEntitlement({
+      userId: resolved.userId,
+      entitlementId,
+      isActive: state.isActive,
+      expirationDate: state.expirationDate,
+    });
+
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      source,
+      event_type: "grant",
+      user_id: resolved.userId,
+      app_user_id: resolved.appUserId,
+      expected_app_user_id: identity.expectedAppUserId,
+      identity_payload_matched: identity.payloadIdentityMatched,
+      identity_server_matched: identity.serverIdentityMatched,
+      identity_effective_matched: identity.identityMatched,
+      entitlement_id: entitlementId,
+      is_active: state.isActive,
+      expiration_date: toIsoTimestampOrNull(state.expirationDate),
+      verification_source: state.verification.source || null,
+      verification_reason: state.verification.reason || null,
+      access_action: accessSync.action || accessSync.reason || "none",
+      success: true,
+      payload: body,
+    });
+
+    console.log(
+      `[revenuecat][grant] id=${requestId} source=${source} userId=${resolved.userId} appUserId=${resolved.appUserId} expected=${identity.expectedAppUserId || "-"} payloadMatched=${boolForLog(identity.payloadIdentityMatched)} serverMatched=${boolForLog(identity.serverIdentityMatched)} entitlement=${entitlementId} active=${state.isActive} action=${accessSync.action || "none"}`
+    );
+
+    return res.json({
+      ok: true,
+      requestId,
+      source,
+      userId: resolved.userId,
+      appUserId: resolved.appUserId,
+      expectedAppUserId: identity.expectedAppUserId,
+      identityMatched: identity.identityMatched,
+      identityServerMatched: identity.serverIdentityMatched,
+      identityPayloadMatched: identity.payloadIdentityMatched,
+      entitlementId,
+      isActive: state.isActive,
+      expirationDate: state.expirationDate || null,
+      verification: state.verification,
+      accessSync,
+      usedFallback: state.usedFallback,
+      grant,
+    });
+  } catch (err) {
+    const status = Number.isInteger(err.statusCode) ? err.statusCode : 500;
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      source: normalizeRevenueCatAppUserId(req.body?.source) || "web_checkout",
+      event_type: "grant",
+      success: false,
+      error: err.message || "Grant failed.",
+      payload: req.body || {},
+    });
+    console.error(`[revenuecat][grant][error] id=${requestId} msg=${err.message}`);
+    return res.status(status).json({ ok: false, error: err.message || "Grant failed." });
+  }
+});
+
+app.post("/revenuecat/subscription/revoke", requireRevenueCatAuth, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const baseAudit = {
+    request_id: requestId,
+    endpoint: "/revenuecat/subscription/revoke",
+    auth_mode: req.revenueCatAuthMode || "unknown",
+  };
+
+  try {
+    const body = req.body || {};
+    const source = normalizeRevenueCatAppUserId(body.source) || "manual_revoke";
+    const entitlementId =
+      normalizeRevenueCatAppUserId(body.entitlementId) ||
+      normalizeRevenueCatAppUserId(REVENUECAT_DEFAULT_ENTITLEMENT_ID);
+    const appUserId = normalizeRevenueCatAppUserId(body.appUserId);
+    const expectedAppUserId = normalizeRevenueCatAppUserId(body.expectedAppUserId);
+    const payloadIdentityMatched = toNullableBool(body.identityMatched);
+    const bodyUserId = toPositiveIntOrNull(body.userId);
+    const jwtUserId = extractJwtUserId(req.jwt);
+    const hasJwtBodyMismatch =
+      req.revenueCatAuthMode === "jwt" &&
+      bodyUserId &&
+      jwtUserId &&
+      bodyUserId !== jwtUserId;
+    const resolvedUserIdInput =
+      req.revenueCatAuthMode === "jwt" && jwtUserId ? jwtUserId : bodyUserId || jwtUserId;
+
+    if (!entitlementId) {
+      return res.status(400).json({ ok: false, error: "entitlementId is required." });
+    }
+    if (!resolvedUserIdInput && !appUserId) {
+      return res.status(400).json({ ok: false, error: "userId or appUserId is required." });
+    }
+    if (hasJwtBodyMismatch) {
+      console.warn(
+        `[revenuecat][revoke][jwt-mismatch] id=${requestId} bodyUserId=${bodyUserId} jwtUserId=${jwtUserId} mode=jwt_using_token_user_id`
+      );
+    }
+
+    const resolved = await resolveRevenueCatUser({
+      userId: resolvedUserIdInput,
+      appUserId,
+      allowPayUniqeRelink: req.revenueCatAuthMode === "jwt",
+    });
+
+    if (req.revenueCatAuthMode === "jwt" && jwtUserId && resolved.userId !== jwtUserId) {
+      return res.status(403).json({ ok: false, error: "User mismatch." });
+    }
+
+    const identity = buildRevenueCatIdentityContext({
+      expectedAppUserId,
+      payloadIdentityMatched,
+      resolvedAppUserId: resolved.appUserId,
+    });
+    if (identity.serverIdentityMatched === false) {
+      console.warn(
+        `[revenuecat][identity-mismatch] id=${requestId} endpoint=revoke userId=${resolved.userId} expected=${identity.expectedAppUserId} resolved=${resolved.appUserId}`
+      );
+    }
+
+    const revoke = await revokeRevenueCatPromotionalEntitlement({
+      appUserId: resolved.appUserId,
+      entitlementId,
+    });
+    const fallbackExpirationDate = new Date().toISOString();
+    const state = await resolveEntitlementStateWithFallback({
+      appUserId: resolved.appUserId,
+      entitlementId,
+      fallbackIsActive: false,
+      fallbackExpirationDate,
+      allowFallbackOverride: true,
+    });
+    const accessSync = await syncRevenueCatAccessByEntitlement({
+      userId: resolved.userId,
+      entitlementId,
+      isActive: state.isActive,
+      expirationDate: state.expirationDate,
+    });
+
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      source,
+      event_type: "revoke",
+      user_id: resolved.userId,
+      app_user_id: resolved.appUserId,
+      expected_app_user_id: identity.expectedAppUserId,
+      identity_payload_matched: identity.payloadIdentityMatched,
+      identity_server_matched: identity.serverIdentityMatched,
+      identity_effective_matched: identity.identityMatched,
+      entitlement_id: entitlementId,
+      is_active: state.isActive,
+      expiration_date: toIsoTimestampOrNull(state.expirationDate),
+      verification_source: state.verification.source || null,
+      verification_reason: state.verification.reason || null,
+      access_action: accessSync.action || accessSync.reason || "none",
+      success: true,
+      payload: body,
+    });
+
+    console.log(
+      `[revenuecat][revoke] id=${requestId} source=${source} userId=${resolved.userId} appUserId=${resolved.appUserId} expected=${identity.expectedAppUserId || "-"} payloadMatched=${boolForLog(identity.payloadIdentityMatched)} serverMatched=${boolForLog(identity.serverIdentityMatched)} entitlement=${entitlementId} active=${state.isActive} action=${accessSync.action || "none"}`
+    );
+
+    return res.json({
+      ok: true,
+      requestId,
+      source,
+      userId: resolved.userId,
+      appUserId: resolved.appUserId,
+      expectedAppUserId: identity.expectedAppUserId,
+      identityMatched: identity.identityMatched,
+      identityServerMatched: identity.serverIdentityMatched,
+      identityPayloadMatched: identity.payloadIdentityMatched,
+      entitlementId,
+      isActive: state.isActive,
+      expirationDate: state.expirationDate || null,
+      verification: state.verification,
+      accessSync,
+      usedFallback: state.usedFallback,
+      revoke,
+    });
+  } catch (err) {
+    const status = Number.isInteger(err.statusCode) ? err.statusCode : 500;
+    await writeRevenueCatAuditLog({
+      ...baseAudit,
+      source: normalizeRevenueCatAppUserId(req.body?.source) || "manual_revoke",
+      event_type: "revoke",
+      success: false,
+      error: err.message || "Revoke failed.",
+      payload: req.body || {},
+    });
+    console.error(`[revenuecat][revoke][error] id=${requestId} msg=${err.message}`);
+    return res.status(status).json({ ok: false, error: err.message || "Revoke failed." });
   }
 });
 
