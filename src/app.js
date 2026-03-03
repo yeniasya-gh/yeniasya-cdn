@@ -1284,6 +1284,63 @@ const buildWelcomeMailHtml = (name) => {
   `;
 };
 
+const formatCurrencyTry = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return "0.00";
+  return parsed.toFixed(2);
+};
+
+const buildOrderSummaryMailHtml = ({ name, orderId, total, rowsHtml }) => {
+  const safeName = escapeHtml(name || "Değerli Okur");
+  const safeOrderId = escapeHtml(orderId || "-");
+  const safeRows = rowsHtml || "";
+  const safeTotal = formatCurrencyTry(total);
+  return `
+    <div style="font-family:Arial,sans-serif;background:#fafafa;padding:16px;">
+      <div style="max-width:640px;margin:0 auto;background:#fff;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,0.05);padding:20px;">
+        <div style="text-align:center;margin-bottom:16px;">
+          <h1 style="color:#d32f2f;margin:0;">Yeni Asya Dijital</h1>
+        </div>
+        <h2>Teşekkürler ${safeName},</h2>
+        <p>Siparişiniz alındı. Detaylar aşağıda:</p>
+        <p><strong>Sipariş No:</strong> ${safeOrderId}</p>
+        <table width="100%" cellpadding="8" cellspacing="0" style="border-collapse:collapse;">
+          <thead>
+            <tr style="background:#f5f5f5;">
+              <th align="left">Ürün</th>
+              <th align="center">Adet</th>
+              <th align="right">Tutar</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${safeRows}
+          </tbody>
+        </table>
+        <p style="text-align:right;font-weight:bold;margin-top:12px;">Toplam: ₺${safeTotal}</p>
+        <p>İyi okumalar dileriz.</p>
+        <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+        <p style="font-size:12px;color:#777;text-align:center;">Bu e-posta otomatik gönderilmiştir.</p>
+      </div>
+    </div>
+  `;
+};
+
+const getUserMailProfile = async (userId) => {
+  const data = await hasuraRequest(
+    `
+      query GetUserMailProfile($id: bigint!) {
+        users_by_pk(id: $id) {
+          id
+          name
+          email
+        }
+      }
+    `,
+    { id: userId }
+  );
+  return data?.users_by_pk || null;
+};
+
 const getUserWelcomeMailState = async (userId) => {
   const data = await hasuraRequest(
     `
@@ -1484,7 +1541,7 @@ const setUserPasswordHash = async (userId, passwordHash) => {
 };
 
 app.use(
-  ["/auth/register", "/auth/login", "/auth/guest-token"],
+  ["/auth/register", "/auth/login", "/auth/social-login", "/auth/guest-token"],
   authRateLimiter
 );
 app.use(["/upload/public", "/upload/private"], uploadRateLimiter);
@@ -1656,6 +1713,69 @@ app.post("/auth/login", async (req, res) => {
       `[auth][login][error] id=${requestId} ip=${req.ip} email=${emailForLog} msg=${err.message}`
     );
     return res.status(500).json({ ok: false, error: err.message || "Login failed." });
+  }
+});
+
+app.post("/auth/social-login", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const emailForLog = normalizeEmail(req.body?.email);
+  const provider = String(req.body?.provider || "").trim().toLowerCase();
+  console.log(
+    `[auth][social-login][start] id=${requestId} ip=${req.ip} provider=${provider || "-"} email=${emailForLog}`
+  );
+
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const allowedProviders = new Set(["google", "apple"]);
+    if (!email || !provider || !allowedProviders.has(provider)) {
+      return res.status(400).json({
+        ok: false,
+        error: "email and provider (google|apple) are required.",
+      });
+    }
+
+    const data = await hasuraRequest(
+      `
+        query GetUserByEmailForSocial($email: String!) {
+          users(where: {email: {_eq: $email}}, limit: 1) {
+            id
+            name
+            email
+            phone
+            payUniqe
+            role_id
+          }
+        }
+      `,
+      { email }
+    );
+    const user = data?.users?.[0];
+    if (!user) {
+      console.log(
+        `[auth][social-login][not-found] id=${requestId} provider=${provider} email=${email}`
+      );
+      return res.status(404).json({ ok: false, error: "USER_NOT_FOUND" });
+    }
+
+    const safeUser = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      payUniqe: user.payUniqe,
+      role_id: user.role_id,
+    };
+
+    const { token, expiresAt } = buildJwt(safeUser);
+    console.log(
+      `[auth][social-login][success] id=${requestId} provider=${provider} email=${email} userId=${safeUser.id}`
+    );
+    return res.json({ ok: true, user: safeUser, token, expiresAt });
+  } catch (err) {
+    console.error(
+      `[auth][social-login][error] id=${requestId} provider=${provider || "-"} email=${emailForLog} msg=${err.message}`
+    );
+    return res.status(500).json({ ok: false, error: err.message || "Social login failed." });
   }
 });
 
@@ -4835,6 +4955,85 @@ app.post("/admin/notifications/send", requireJwtOrServiceAuth, async (req, res) 
     return res.status(statusCode).json({
       ok: false,
       error: err?.message || "Notification send failed.",
+      requestId,
+    });
+  }
+});
+
+app.post("/mail/order-summary", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: "Invalid user token." });
+  }
+
+  try {
+    const orderId = String(req.body?.orderId || "").trim();
+    const totalRaw = Number(req.body?.total);
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+    if (!orderId) {
+      return res.status(400).json({ ok: false, error: "orderId is required." });
+    }
+    if (!Number.isFinite(totalRaw) || totalRaw < 0) {
+      return res.status(400).json({ ok: false, error: "total must be a valid number." });
+    }
+    if (!items.length) {
+      return res.status(400).json({ ok: false, error: "items are required." });
+    }
+
+    const user = await getUserMailProfile(userId);
+    if (!user) {
+      return res.status(404).json({ ok: false, error: "User not found." });
+    }
+
+    const email = normalizeEmail(user.email);
+    if (!email) {
+      return res.status(400).json({ ok: false, error: "User email is missing." });
+    }
+    const name = String(user.name || "").trim() || email.split("@")[0];
+
+    const rowsHtml = items
+      .slice(0, 200)
+      .map((item) => {
+        const title = escapeHtml(item?.title || "-");
+        const qty = Math.max(1, toPositiveIntOrNull(item?.quantity) || 1);
+        const price = formatCurrencyTry(item?.line_total);
+        return `<tr><td>${title}</td><td align='center'>${qty}</td><td align='right'>₺${price}</td></tr>`;
+      })
+      .join("");
+
+    const html = buildOrderSummaryMailHtml({
+      name,
+      orderId,
+      total: totalRaw,
+      rowsHtml,
+    });
+    const text = `Merhaba ${name}, sipariş #${orderId} alındı. Toplam: ₺${formatCurrencyTry(totalRaw)}.`;
+
+    const info = await mailTransporter.sendMail({
+      from: MAIL_SETTINGS.from,
+      to: email,
+      subject: `Sipariş #${orderId} alındı`,
+      text,
+      html,
+    });
+
+    return res.json({
+      ok: true,
+      sent: true,
+      messageId: info.messageId,
+      accepted: info.accepted,
+      rejected: info.rejected,
+      requestId,
+    });
+  } catch (err) {
+    console.error(
+      `[mail][order-summary][error] id=${requestId} userId=${userId} msg=${err?.message || err}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Order summary mail send failed.",
       requestId,
     });
   }

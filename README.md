@@ -57,6 +57,10 @@ npm run dev
 - `POST /auth/login`
   - JSON body: `{ "email": "...", "password": "..." }`
   - Yanıt: `{ ok, user, token, expiresAt }`
+- `POST /auth/social-login`
+  - JSON body: `{ "email": "...", "provider": "google|apple", "name": "...", "phone": "..." }`
+  - Kullanıcı varsa JWT döner, yoksa `404 USER_NOT_FOUND`.
+  - Yanıt: `{ ok, user, token, expiresAt }`
 - `POST /graphql`
   - Hasura proxy (JWT zorunlu).
   - Header: `Authorization: Bearer <JWT>`
@@ -96,6 +100,10 @@ npm run dev
   - Auth: `Authorization: Bearer <JWT>`
   - Hoş geldin mailini yalnızca bir kez gönderir (kontrol alanı: `users.welcome_mail_sent_at`).
   - Not: Önce `scripts/welcome_mail_sent_at_migration.sql` çalıştırılmalıdır.
+- `POST /mail/order-summary`
+  - Auth: `Authorization: Bearer <JWT>`
+  - Kullanıcının kendi hesabına sipariş özet maili gönderir.
+  - JSON body: `{ "orderId": "...", "total": 123.45, "items": [{ "title": "...", "quantity": 1, "line_total": 123.45 }] }`
 - `GET /health` durumu kontrol eder.
 
 ## Kurallar
