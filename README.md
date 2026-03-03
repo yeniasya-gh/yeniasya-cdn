@@ -14,6 +14,10 @@ cp .env.example .env
 # MAIL_USER=...
 # MAIL_PASS=...
 # MAIL_FROM="Yeni Asya Dijital <noreply@yeniasya.com.tr>"
+# TLS sertifika CN/SAN host ile SMTP host farklıysa:
+# MAIL_TLS_SERVERNAME=srvpanel.com
+# MAIL_TLS_REJECT_UNAUTHORIZED=true
+# (acil geçici bypass için false yapılabilir, önerilmez)
 # MAIL_API_TOKEN=...
 # Origin yetkisi için ALLOWED_ORIGINS'i kendi domainlerinle doldur (virgülle ayır)
 # Base64 viewer kapalıdır (istersen ENABLE_BASE64_VIEWER=true)

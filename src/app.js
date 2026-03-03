@@ -73,6 +73,11 @@ const MAIL_SETTINGS = {
   from: process.env.MAIL_FROM || "",
   token: process.env.MAIL_API_TOKEN || "",
 };
+const MAIL_TLS_SERVERNAME = (process.env.MAIL_TLS_SERVERNAME || "")
+  .trim()
+  .replace(/\.$/, "");
+const MAIL_TLS_REJECT_UNAUTHORIZED =
+  process.env.MAIL_TLS_REJECT_UNAUTHORIZED === "false" ? false : true;
 const FIREBASE_SERVICE_ACCOUNT_JSON =
   process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
 const FIREBASE_SERVICE_ACCOUNT_JSON_PATH =
@@ -713,6 +718,7 @@ const postLocalJson = (pathName, payload, headers = {}) =>
   });
 
 const smtpHost = (MAIL_SETTINGS.host || "").trim().replace(/\.$/, "");
+const smtpTlsServername = (MAIL_TLS_SERVERNAME || smtpHost || "").trim().replace(/\.$/, "");
 const mailTransporter = nodemailer.createTransport({
   host: smtpHost,
   port: MAIL_SETTINGS.port,
@@ -722,10 +728,9 @@ const mailTransporter = nodemailer.createTransport({
     pass: MAIL_SETTINGS.pass,
   },
   tls: {
-    // Allow self-signed / mismatched certs (needed for current smtp cert).
-    rejectUnauthorized:
-      process.env.MAIL_TLS_REJECT_UNAUTHORIZED === "false" ? false : true,
-    servername: smtpHost,
+    // Keep TLS verification on by default. Override servername when SMTP host and cert CN/SAN differ.
+    rejectUnauthorized: MAIL_TLS_REJECT_UNAUTHORIZED,
+    ...(smtpTlsServername ? { servername: smtpTlsServername } : {}),
   },
 });
 
