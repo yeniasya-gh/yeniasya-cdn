@@ -27,7 +27,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
   .map((v) => v.trim())
   .filter(Boolean);
 const ALLOWED_HEADERS =
-  process.env.ALLOWED_HEADERS || "content-type, x-api-key, authorization";
+  process.env.ALLOWED_HEADERS || "content-type, x-api-key, authorization, x-mail-token";
 const ALLOWED_METHODS = "GET, POST, OPTIONS";
 const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || "2mb";
 const TRUST_PROXY = process.env.TRUST_PROXY || "loopback";
@@ -73,6 +73,17 @@ const MAIL_SETTINGS = {
   from: process.env.MAIL_FROM || "",
   token: process.env.MAIL_API_TOKEN || "",
 };
+const FIREBASE_SERVICE_ACCOUNT_JSON =
+  process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
+const FIREBASE_SERVICE_ACCOUNT_JSON_PATH =
+  process.env.FIREBASE_SERVICE_ACCOUNT_JSON_PATH || "";
+const FIREBASE_PROJECT_ID = (process.env.FIREBASE_PROJECT_ID || "").trim();
+const FCM_HTTP_TIMEOUT_MS = Number(process.env.FCM_HTTP_TIMEOUT_MS || "15000");
+const ADMIN_ROLE_IDS_RAW = (process.env.ADMIN_ROLE_IDS || "2")
+  .split(",")
+  .map((v) => Number.parseInt(v.trim(), 10))
+  .filter((v) => Number.isInteger(v) && v > 0);
+const ADMIN_ROLE_IDS = ADMIN_ROLE_IDS_RAW.length ? ADMIN_ROLE_IDS_RAW : [2];
 const PAYMENT_RETURN_REDIRECT_URL = process.env.PAYMENT_RETURN_REDIRECT_URL || "";
 const PARATIKA_BASE_URL =
   process.env.PARATIKA_BASE_URL || "https://vpos.paratika.com.tr/paratika/api/v2";
@@ -919,6 +930,417 @@ const isHasuraVariableTypeMismatch = (err, variableName, expectedType) => {
   );
 };
 
+const FCM_OAUTH_AUDIENCE = "https://oauth2.googleapis.com/token";
+const FCM_OAUTH_SCOPE = "https://www.googleapis.com/auth/firebase.messaging";
+const FCM_INVALID_TOKEN_CODES = new Set(["UNREGISTERED", "INVALID_ARGUMENT"]);
+
+let firebaseServiceAccountCache = null;
+let firebaseAccessTokenCache = {
+  token: "",
+  expiresAtMs: 0,
+};
+
+const encodeBase64Url = (value) =>
+  Buffer.from(value)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+
+const safeJsonParse = (value) => {
+  try {
+    return JSON.parse(value);
+  } catch (err) {
+    return null;
+  }
+};
+
+const readFirebaseServiceAccount = () => {
+  if (firebaseServiceAccountCache) return firebaseServiceAccountCache;
+
+  let serviceAccount = null;
+  if (FIREBASE_SERVICE_ACCOUNT_JSON.trim()) {
+    serviceAccount = safeJsonParse(FIREBASE_SERVICE_ACCOUNT_JSON.trim());
+  } else if (FIREBASE_SERVICE_ACCOUNT_JSON_PATH.trim()) {
+    const absPath = path.resolve(FIREBASE_SERVICE_ACCOUNT_JSON_PATH.trim());
+    const raw = fs.readFileSync(absPath, "utf8");
+    serviceAccount = safeJsonParse(raw);
+  }
+
+  if (!serviceAccount || typeof serviceAccount !== "object") {
+    const err = new Error("Firebase service account JSON is not configured.");
+    err.statusCode = 503;
+    throw err;
+  }
+
+  const clientEmail = String(serviceAccount.client_email || "").trim();
+  const privateKey = String(serviceAccount.private_key || "").trim();
+  const projectId = String(serviceAccount.project_id || "").trim();
+  if (!clientEmail || !privateKey || !projectId) {
+    const err = new Error(
+      "Firebase service account must include client_email, private_key and project_id."
+    );
+    err.statusCode = 503;
+    throw err;
+  }
+
+  firebaseServiceAccountCache = serviceAccount;
+  return firebaseServiceAccountCache;
+};
+
+const resolveFirebaseProjectId = () => {
+  if (FIREBASE_PROJECT_ID) return FIREBASE_PROJECT_ID;
+  const serviceAccount = readFirebaseServiceAccount();
+  const projectId = String(serviceAccount.project_id || "").trim();
+  if (!projectId) {
+    const err = new Error("Firebase project id is missing.");
+    err.statusCode = 503;
+    throw err;
+  }
+  return projectId;
+};
+
+const buildGoogleServiceAccountJwt = (serviceAccount) => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: serviceAccount.client_email,
+    scope: FCM_OAUTH_SCOPE,
+    aud: FCM_OAUTH_AUDIENCE,
+    iat: nowSec,
+    exp: nowSec + 3600,
+  };
+
+  const unsigned = `${encodeBase64Url(JSON.stringify(header))}.${encodeBase64Url(
+    JSON.stringify(payload)
+  )}`;
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(unsigned);
+  signer.end();
+  const signature = signer
+    .sign(serviceAccount.private_key, "base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+  return `${unsigned}.${signature}`;
+};
+
+const getFirebaseAccessToken = async () => {
+  const nowMs = Date.now();
+  if (
+    firebaseAccessTokenCache.token &&
+    firebaseAccessTokenCache.expiresAtMs - 60_000 > nowMs
+  ) {
+    return firebaseAccessTokenCache.token;
+  }
+
+  const serviceAccount = readFirebaseServiceAccount();
+  const assertion = buildGoogleServiceAccountJwt(serviceAccount);
+  const payload = formEncode({
+    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    assertion,
+  });
+
+  const response = await axios.post(FCM_OAUTH_AUDIENCE, payload, {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: FCM_HTTP_TIMEOUT_MS,
+    validateStatus: () => true,
+  });
+
+  if (response.status < 200 || response.status >= 300) {
+    const msg = response?.data?.error_description || response?.data?.error || "OAuth failed";
+    const err = new Error(`Firebase OAuth token request failed: ${msg}`);
+    err.statusCode = 502;
+    throw err;
+  }
+
+  const accessToken = String(response?.data?.access_token || "").trim();
+  const expiresIn = Number(response?.data?.expires_in || 3600);
+  if (!accessToken) {
+    const err = new Error("Firebase OAuth response did not include access_token.");
+    err.statusCode = 502;
+    throw err;
+  }
+
+  firebaseAccessTokenCache = {
+    token: accessToken,
+    expiresAtMs: Date.now() + Math.max(60, expiresIn) * 1000,
+  };
+  return accessToken;
+};
+
+const normalizeFcmDataPayload = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const out = {};
+  for (const [key, raw] of Object.entries(value)) {
+    const normalizedKey = String(key || "").trim();
+    if (!normalizedKey) continue;
+    if (raw === undefined || raw === null) continue;
+    out[normalizedKey] = typeof raw === "string" ? raw : JSON.stringify(raw);
+  }
+  return Object.keys(out).length ? out : undefined;
+};
+
+const maskDeviceToken = (token) => {
+  const value = String(token || "");
+  if (value.length <= 16) return value ? "***" : "";
+  return `${value.slice(0, 8)}...${value.slice(-6)}`;
+};
+
+const extractFcmErrorCode = (errorPayload) => {
+  const direct = String(errorPayload?.error?.status || "").trim();
+  if (direct) return direct;
+  const details = errorPayload?.error?.details;
+  if (!Array.isArray(details)) return "";
+  for (const detail of details) {
+    const code = String(detail?.errorCode || detail?.error_code || "").trim();
+    if (code) return code;
+  }
+  return "";
+};
+
+const sendFirebaseMessageToToken = async ({
+  token,
+  title,
+  body,
+  data,
+  dryRun = false,
+}) => {
+  const accessToken = await getFirebaseAccessToken();
+  const projectId = resolveFirebaseProjectId();
+
+  const payload = {
+    message: {
+      token,
+      notification: { title, body },
+      ...(data ? { data } : {}),
+      android: { priority: "HIGH" },
+      apns: { headers: { "apns-priority": "10" } },
+    },
+    validate_only: !!dryRun,
+  };
+
+  const response = await axios.post(
+    `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(
+      projectId
+    )}/messages:send`,
+    payload,
+    {
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      timeout: FCM_HTTP_TIMEOUT_MS,
+      validateStatus: () => true,
+    }
+  );
+
+  if (response.status >= 200 && response.status < 300) {
+    return {
+      ok: true,
+      messageId: response?.data?.name || null,
+      statusCode: response.status,
+    };
+  }
+
+  const errorCode = extractFcmErrorCode(response?.data);
+  return {
+    ok: false,
+    statusCode: response.status,
+    errorCode,
+    errorMessage:
+      response?.data?.error?.message ||
+      response?.data?.error_description ||
+      "FCM send failed.",
+  };
+};
+
+const fetchUsersWithFirebaseTokens = async ({ userId, userIds } = {}) => {
+  if (userId) {
+    const data = await hasuraRequest(
+      `
+        query GetUserToken($id: bigint!) {
+          users_by_pk(id: $id) {
+            id
+            firebase_token
+          }
+        }
+      `,
+      { id: userId }
+    );
+    const user = data?.users_by_pk;
+    if (!user || !String(user.firebase_token || "").trim()) return [];
+    return [{ id: user.id, firebase_token: String(user.firebase_token).trim() }];
+  }
+
+  if (Array.isArray(userIds) && userIds.length) {
+    const data = await hasuraRequest(
+      `
+        query GetUserTokensByIds($ids: [bigint!]!) {
+          users(
+            where: {
+              id: {_in: $ids}
+              firebase_token: {_is_null: false, _neq: ""}
+            }
+          ) {
+            id
+            firebase_token
+          }
+        }
+      `,
+      { ids: userIds }
+    );
+    return (data?.users || [])
+      .map((u) => ({
+        id: u.id,
+        firebase_token: String(u.firebase_token || "").trim(),
+      }))
+      .filter((u) => !!u.firebase_token);
+  }
+
+  const data = await hasuraRequest(
+    `
+      query GetAllUserTokens {
+        users(
+          where: {firebase_token: {_is_null: false, _neq: ""}}
+          order_by: {firebase_token_updated_at: desc}
+        ) {
+          id
+          firebase_token
+        }
+      }
+    `
+  );
+  return (data?.users || [])
+    .map((u) => ({
+      id: u.id,
+      firebase_token: String(u.firebase_token || "").trim(),
+    }))
+    .filter((u) => !!u.firebase_token);
+};
+
+const persistNotifications = async ({ title, body, userIds }) => {
+  if (!Array.isArray(userIds) || userIds.length === 0) {
+    return 0;
+  }
+  const uniqueIds = [...new Set(userIds.map((id) => toPositiveIntOrNull(id)).filter(Boolean))];
+  if (!uniqueIds.length) return 0;
+  const objects = uniqueIds.map((id) => ({ title, body, user_id: id }));
+  const data = await hasuraRequest(
+    `
+      mutation InsertNotifications($objects: [notifications_insert_input!]!) {
+        insert_notifications(objects: $objects) {
+          affected_rows
+        }
+      }
+    `,
+    { objects }
+  );
+  return Number(data?.insert_notifications?.affected_rows || 0);
+};
+
+const clearUsersFirebaseTokens = async (userIds) => {
+  const uniqueIds = [...new Set((userIds || []).map((id) => toPositiveIntOrNull(id)).filter(Boolean))];
+  if (!uniqueIds.length) return 0;
+  const data = await hasuraRequest(
+    `
+      mutation ClearFirebaseTokens($ids: [bigint!]!) {
+        update_users(
+          where: {id: {_in: $ids}},
+          _set: {firebase_token: null, firebase_token_updated_at: null}
+        ) {
+          affected_rows
+        }
+      }
+    `,
+    { ids: uniqueIds }
+  );
+  return Number(data?.update_users?.affected_rows || 0);
+};
+
+const escapeHtml = (value) =>
+  String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+const buildWelcomeMailHtml = (name) => {
+  const safeName = escapeHtml(name || "Değerli Okur");
+  return `
+    <div style="font-family:Arial,sans-serif;background:#fafafa;padding:16px;">
+      <div style="max-width:640px;margin:0 auto;background:#fff;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,0.05);padding:20px;">
+        <div style="text-align:center;margin-bottom:16px;">
+          <h1 style="color:#d32f2f;margin:0;">Yeni Asya Dijital</h1>
+        </div>
+        <h2>Merhaba ${safeName},</h2>
+        <p>Aramıza katıldığınız için teşekkürler. Yeni Asya uygulamasında dijital içeriklerinize hemen ulaşabilirsiniz.</p>
+        <p>Keyifli okumalar!</p>
+        <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+        <p style="font-size:12px;color:#777;text-align:center;">Bu e-posta otomatik gönderilmiştir.</p>
+      </div>
+    </div>
+  `;
+};
+
+const getUserWelcomeMailState = async (userId) => {
+  const data = await hasuraRequest(
+    `
+      query GetUserWelcomeMailState($id: bigint!) {
+        users_by_pk(id: $id) {
+          id
+          name
+          email
+          welcome_mail_sent_at
+        }
+      }
+    `,
+    { id: userId }
+  );
+  return data?.users_by_pk || null;
+};
+
+const claimWelcomeMailSend = async (userId, claimedAt) => {
+  const data = await hasuraRequest(
+    `
+      mutation ClaimWelcomeMailSend($id: bigint!, $claimedAt: timestamptz!) {
+        update_users(
+          where: {id: {_eq: $id}, welcome_mail_sent_at: {_is_null: true}},
+          _set: {welcome_mail_sent_at: $claimedAt}
+        ) {
+          affected_rows
+          returning {
+            id
+            name
+            email
+            welcome_mail_sent_at
+          }
+        }
+      }
+    `,
+    { id: userId, claimedAt }
+  );
+  return data?.update_users || { affected_rows: 0, returning: [] };
+};
+
+const rollbackWelcomeMailClaim = async (userId, claimedAt) => {
+  const data = await hasuraRequest(
+    `
+      mutation RollbackWelcomeMailSend($id: bigint!, $claimedAt: timestamptz!) {
+        update_users(
+          where: {id: {_eq: $id}, welcome_mail_sent_at: {_eq: $claimedAt}},
+          _set: {welcome_mail_sent_at: null}
+        ) {
+          affected_rows
+        }
+      }
+    `,
+    { id: userId, claimedAt }
+  );
+  return Number(data?.update_users?.affected_rows || 0);
+};
+
 const requireJwt = (req, res, next) => {
   const raw = req.get("authorization") || "";
   const token = raw.toLowerCase().startsWith("bearer ") ? raw.slice(7) : raw;
@@ -1347,6 +1769,36 @@ const findUserById = async (userId) => {
     { id: userId }
   );
   return data?.users_by_pk || null;
+};
+
+const ensureNotificationAdminActor = async (req) => {
+  if (req?.hasuraAuthMode === "service") {
+    return { mode: "service", actor: null };
+  }
+
+  const jwtPayload = req?.jwt;
+  const jwtUserId = extractJwtUserId(jwtPayload);
+  if (!jwtUserId) {
+    const err = new Error("Missing user id in JWT.");
+    err.statusCode = 401;
+    throw err;
+  }
+
+  const actor = await findUserById(jwtUserId);
+  if (!actor) {
+    const err = new Error("Authenticated user not found.");
+    err.statusCode = 401;
+    throw err;
+  }
+
+  const roleId = toPositiveIntOrNull(actor.role_id);
+  if (!roleId || !ADMIN_ROLE_IDS.includes(roleId)) {
+    const err = new Error("Admin privileges required.");
+    err.statusCode = 403;
+    throw err;
+  }
+
+  return { mode: "jwt", actor };
 };
 
 const findUserByPayUniqe = async (payUniqe) => {
@@ -4247,6 +4699,215 @@ app.post("/payment/test-session", requireJwt, async (req, res, next) => {
     });
   } catch (err) {
     next(err);
+  }
+});
+
+app.post("/admin/notifications/send", requireJwtOrServiceAuth, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  try {
+    await ensureNotificationAdminActor(req);
+
+    const title = String(req.body?.title || "").trim();
+    const body = String(req.body?.body || "").trim();
+    const userId = toPositiveIntOrNull(req.body?.userId);
+    const userIds = Array.isArray(req.body?.userIds)
+      ? req.body.userIds.map((id) => toPositiveIntOrNull(id)).filter(Boolean)
+      : [];
+    const persist = req.body?.persist === undefined ? true : toBool(req.body.persist);
+    const dryRun = toBool(req.body?.dryRun);
+    const data = normalizeFcmDataPayload(req.body?.data);
+
+    if (!title || !body) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "title and body are required." });
+    }
+    if (userId && userIds.length > 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Provide either userId or userIds, not both.",
+      });
+    }
+
+    const targets = await fetchUsersWithFirebaseTokens({
+      userId: userId || null,
+      userIds: userIds.length ? userIds : null,
+    });
+    if (!targets.length) {
+      return res.status(404).json({
+        ok: false,
+        error: "No users with firebase tokens were found for this target.",
+      });
+    }
+
+    const tokenMap = new Map();
+    for (const target of targets) {
+      const token = String(target.firebase_token || "").trim();
+      const uid = toPositiveIntOrNull(target.id);
+      if (!token || !uid) continue;
+      const existing = tokenMap.get(token) || [];
+      existing.push(uid);
+      tokenMap.set(token, existing);
+    }
+
+    if (!tokenMap.size) {
+      return res.status(404).json({
+        ok: false,
+        error: "No valid firebase token entries found.",
+      });
+    }
+
+    let sentCount = 0;
+    let failedCount = 0;
+    const successfulUserIds = new Set();
+    const invalidTokenUserIds = new Set();
+    const failedResults = [];
+
+    for (const [token, linkedUserIds] of tokenMap.entries()) {
+      // eslint-disable-next-line no-await-in-loop
+      const result = await sendFirebaseMessageToToken({
+        token,
+        title,
+        body,
+        data,
+        dryRun,
+      });
+
+      if (result.ok) {
+        sentCount += 1;
+        for (const uid of linkedUserIds) {
+          successfulUserIds.add(uid);
+        }
+        continue;
+      }
+
+      failedCount += 1;
+      if (FCM_INVALID_TOKEN_CODES.has(String(result.errorCode || "").toUpperCase())) {
+        for (const uid of linkedUserIds) {
+          invalidTokenUserIds.add(uid);
+        }
+      }
+
+      failedResults.push({
+        token: maskDeviceToken(token),
+        userIds: linkedUserIds,
+        statusCode: result.statusCode,
+        errorCode: result.errorCode || null,
+        errorMessage: result.errorMessage || "Unknown FCM error.",
+      });
+    }
+
+    let persistedCount = 0;
+    if (persist && !dryRun && successfulUserIds.size) {
+      persistedCount = await persistNotifications({
+        title,
+        body,
+        userIds: [...successfulUserIds],
+      });
+    }
+
+    let clearedTokenCount = 0;
+    if (invalidTokenUserIds.size) {
+      clearedTokenCount = await clearUsersFirebaseTokens([...invalidTokenUserIds]);
+    }
+
+    console.log(
+      `[notifications][send] id=${requestId} targets=${tokenMap.size} sent=${sentCount} failed=${failedCount} persist=${persistedCount} cleared=${clearedTokenCount} dryRun=${dryRun}`
+    );
+
+    return res.json({
+      ok: true,
+      summary: {
+        requestId,
+        targetUsers: targets.length,
+        targetTokens: tokenMap.size,
+        sent: sentCount,
+        failed: failedCount,
+        persisted: persistedCount,
+        clearedInvalidTokens: clearedTokenCount,
+        dryRun,
+      },
+      failed: failedResults.slice(0, 100),
+    });
+  } catch (err) {
+    const statusCode = Number.isInteger(err?.statusCode) ? err.statusCode : 500;
+    console.error(`[notifications][send][error] id=${requestId}:`, err?.message || err);
+    return res.status(statusCode).json({
+      ok: false,
+      error: err?.message || "Notification send failed.",
+      requestId,
+    });
+  }
+});
+
+app.post("/mail/welcome", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: "Invalid user token." });
+  }
+
+  const claimedAt = new Date().toISOString();
+  try {
+    const claim = await claimWelcomeMailSend(userId, claimedAt);
+    if (Number(claim?.affected_rows || 0) === 0) {
+      const userState = await getUserWelcomeMailState(userId);
+      if (!userState) {
+        return res.status(404).json({ ok: false, error: "User not found." });
+      }
+      return res.json({
+        ok: true,
+        skipped: true,
+        reason: "already_sent",
+        welcomeMailSentAt: userState.welcome_mail_sent_at,
+      });
+    }
+
+    const user = claim?.returning?.[0];
+    const email = normalizeEmail(user?.email);
+    if (!email) {
+      await rollbackWelcomeMailClaim(userId, claimedAt);
+      return res.status(400).json({ ok: false, error: "User email is missing." });
+    }
+    const name = String(user?.name || "").trim() || email.split("@")[0];
+
+    const subject = `Yeni Asya’ya hoş geldiniz, ${name}`;
+    const html = buildWelcomeMailHtml(name);
+    const text = `Merhaba ${name}, aramıza katıldığınız için teşekkürler. Keyifli okumalar!`;
+
+    const info = await mailTransporter.sendMail({
+      from: MAIL_SETTINGS.from,
+      to: email,
+      subject,
+      text,
+      html,
+    });
+
+    return res.json({
+      ok: true,
+      sent: true,
+      messageId: info.messageId,
+      accepted: info.accepted,
+      rejected: info.rejected,
+      welcomeMailSentAt: claimedAt,
+      requestId,
+    });
+  } catch (err) {
+    try {
+      await rollbackWelcomeMailClaim(userId, claimedAt);
+    } catch (rollbackErr) {
+      console.error(
+        `[mail][welcome][rollback-failed] id=${requestId} userId=${userId} msg=${rollbackErr?.message || rollbackErr}`
+      );
+    }
+    console.error(
+      `[mail][welcome][error] id=${requestId} userId=${userId} msg=${err?.message || err}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Welcome mail send failed.",
+      requestId,
+    });
   }
 });
 

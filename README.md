@@ -8,6 +8,13 @@ Fotoğraf ve PDF yükleyebileceğiniz, public ve private alanları olan minimal 
 ```bash
 cp .env.example .env
 # AUTH_TOKEN, VIEW_TOKEN_SECRET, HASURA_ENDPOINT, HASURA_ADMIN_SECRET, JWT_SECRET zorunlu
+# Mail (opsiyonel ama /mail/send ve /mail/welcome için gerekli):
+# MAIL_HOST=smtp.example.com
+# MAIL_PORT=587
+# MAIL_USER=...
+# MAIL_PASS=...
+# MAIL_FROM="Yeni Asya Dijital <noreply@yeniasya.com.tr>"
+# MAIL_API_TOKEN=...
 # Origin yetkisi için ALLOWED_ORIGINS'i kendi domainlerinle doldur (virgülle ayır)
 # Base64 viewer kapalıdır (istersen ENABLE_BASE64_VIEWER=true)
 # İsteğe bağlı: MAX_BASE64_VIEW_BYTES=5242880
@@ -17,6 +24,12 @@ cp .env.example .env
 # JWT_AUDIENCE=yeniasya-app
 # JWT_DEFAULT_ROLE=user
 # JWT_ALLOWED_ROLES=user
+# Admin push bildirim servisi (opsiyonel):
+# FIREBASE_SERVICE_ACCOUNT_JSON_PATH=/absolute/path/firebase-service-account.json
+# veya FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
+# FIREBASE_PROJECT_ID=<firebase-project-id>   # JSON içindeki project_id yoksa kullanılır
+# ADMIN_ROLE_IDS=2                             # virgül ile birden fazla rol id verilebilir
+# FCM_HTTP_TIMEOUT_MS=15000
 # Opsiyonel (BunnyCDN isteklerini daha stabil yapmak için):
 # BUNNY_HTTP_TIMEOUT_MS=20000
 # BUNNY_HTTP_RETRIES=1
@@ -68,13 +81,28 @@ npm run dev
 - `GET /private/view-file`
   - Base64 viewer (varsayılan kapalı).  
   - Aktif etmek için `ENABLE_BASE64_VIEWER=true` ve opsiyonel `MAX_BASE64_VIEW_BYTES`.
+- `POST /admin/notifications/send`
+  - Auth: `Authorization: Bearer <JWT>` (admin rol) veya `x-api-key: <AUTH_TOKEN>`.
+  - JSON body:
+    - `title` (zorunlu)
+    - `body` (zorunlu)
+    - `userId` (opsiyonel, tek kullanıcı)
+    - `userIds` (opsiyonel, kullanıcı id listesi)
+    - `data` (opsiyonel, FCM data payload)
+    - `persist` (opsiyonel, default `true`, başarılı gönderimler için `notifications` tablosuna kayıt)
+    - `dryRun` (opsiyonel, default `false`)
+  - Token kaynağı: `users.firebase_token`
+- `POST /mail/welcome`
+  - Auth: `Authorization: Bearer <JWT>`
+  - Hoş geldin mailini yalnızca bir kez gönderir (kontrol alanı: `users.welcome_mail_sent_at`).
+  - Not: Önce `scripts/welcome_mail_sent_at_migration.sql` çalıştırılmalıdır.
 - `GET /health` durumu kontrol eder.
 
 ## Kurallar
 - İzin verilen MIME: `application/pdf`, `image/jpeg`, `image/png`, `image/webp`.
 - 50MB üstü dosyalar reddedilir.
 - Private dosyalar `storage/<type>/private` dizinlerine yazılır.
-- CORS: `.env` içinde `ALLOWED_ORIGINS` (örn. `http://localhost:3000,https://cdn.yeniasyadigital.com`) ve `ALLOWED_HEADERS` (varsayılan `content-type,x-api-key,authorization`).
+- CORS: `.env` içinde `ALLOWED_ORIGINS` (örn. `http://localhost:3000,https://cdn.yeniasyadigital.com`) ve `ALLOWED_HEADERS` (varsayılan `content-type,x-api-key,authorization,x-mail-token`).
 - Frame koruması: `.env` içinde `ALLOWED_FRAME_ANCESTORS` ile whitelist belirleyin.
 - Ödeme test endpoint'i sadece `NODE_ENV=development` iken çalışır ve `TEST_MERCHANT`, `TEST_MERCHANTUSER`, `TEST_MERCHANTPASSWORD`, `TEST_RETURNURL` ister.
 
