@@ -54,6 +54,15 @@ npm start
 npm run dev
 ```
 
+## Manuel E-Gazete Erişim Tablosu
+- Eski sistem aboneleri için manuel erişim tablosu migration dosyası:
+  `scripts/manual_newspaper_users_migration.sql`
+- Uygulama:
+```bash
+psql "$DATABASE_URL" -f scripts/manual_newspaper_users_migration.sql
+```
+- Migration sonrası Hasura'da `manual_newspaper_users` tablosunu track edin.
+
 ## Endpoint'ler
 - `POST /auth/register`
   - JSON body: `{ "name": "...", "email": "...", "password": "...", "phone": "..." }`
