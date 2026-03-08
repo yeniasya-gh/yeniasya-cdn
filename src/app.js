@@ -77,6 +77,14 @@ const PASSWORD_RESET_TOKEN_TTL_MINUTES =
   PASSWORD_RESET_TOKEN_TTL_MINUTES_RAW > 0
     ? PASSWORD_RESET_TOKEN_TTL_MINUTES_RAW
     : 30;
+const LEGACY_NEWSPAPER_TOKEN_SECRET = String(
+  process.env.LEGACY_NEWSPAPER_TOKEN_SECRET || ""
+).trim();
+const LEGACY_NEWSPAPER_BASE_URL = String(
+  process.env.LEGACY_NEWSPAPER_BASE_URL || "https://www.yeniasya.com.tr/e-gazete/content/0"
+)
+  .trim()
+  .replace(/\/+$/, "");
 const UPLOAD_RATE_LIMIT_MAX_RAW = Number(process.env.UPLOAD_RATE_LIMIT_MAX || "60");
 const UPLOAD_RATE_LIMIT_MAX =
   Number.isFinite(UPLOAD_RATE_LIMIT_MAX_RAW) && UPLOAD_RATE_LIMIT_MAX_RAW > 0
@@ -1565,6 +1573,98 @@ const PASSWORD_RESET_GENERIC_RESPONSE = {
     "Bu e-posta adresi kayıtlıysa şifre sıfırlama bağlantısı gönderildi.",
 };
 
+const formatIsoDateOnly = (value) => {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
+const parseIsoDateOnly = (value) => {
+  const raw = String(value || "").trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (!match) return null;
+  const year = Number.parseInt(match[1], 10);
+  const month = Number.parseInt(match[2], 10);
+  const day = Number.parseInt(match[3], 10);
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) {
+    return null;
+  }
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() + 1 !== month ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return date;
+};
+
+const buildLegacyNewspaperToken = (fileName, nowMs = Date.now()) => {
+  if (!LEGACY_NEWSPAPER_TOKEN_SECRET) {
+    const err = new Error("LEGACY_NEWSPAPER_TOKEN_SECRET missing.");
+    err.statusCode = 503;
+    throw err;
+  }
+  const slice = Math.floor(Math.floor(nowMs / 1000) / 600);
+  const bytes = Buffer.alloc(8);
+  bytes.writeBigInt64LE(BigInt(slice), 0);
+  return crypto
+    .createHmac("sha256", `${LEGACY_NEWSPAPER_TOKEN_SECRET}${fileName}`)
+    .update(bytes)
+    .digest("hex")
+    .toUpperCase()
+    .slice(0, 16);
+};
+
+const buildLegacyNewspaperUrl = (date) => {
+  const isoDate = formatIsoDateOnly(date);
+  if (!isoDate) {
+    const err = new Error("Invalid newspaper date.");
+    err.statusCode = 400;
+    throw err;
+  }
+  const fileName = `${isoDate}.pdf`;
+  const token = buildLegacyNewspaperToken(fileName);
+  return `${LEGACY_NEWSPAPER_BASE_URL}/${token}/${fileName}`;
+};
+
+const getActiveNewspaperSubscriptionAccess = async (userId) => {
+  const nowIso = new Date().toISOString();
+  const data = await hasuraRequest(
+    `
+      query GetActiveNewspaperSubscriptionAccess(
+        $user_id: Int!
+        $item_type: access_item_type!
+        $now: timestamptz!
+      ) {
+        user_content_access(
+          where: {
+            user_id: {_eq: $user_id}
+            item_type: {_eq: $item_type}
+            is_active: {_eq: true}
+            _or: [{expires_at: {_is_null: true}}, {expires_at: {_gt: $now}}]
+          }
+          order_by: {expires_at: desc_nulls_last}
+          limit: 1
+        ) {
+          id
+          expires_at
+        }
+      }
+    `,
+    {
+      user_id: userId,
+      item_type: "newspaper_subscription",
+      now: nowIso,
+    }
+  );
+  return data?.user_content_access?.[0] || null;
+};
+
 const getUserWelcomeMailState = async (userId) => {
   const data = await hasuraRequest(
     `
@@ -1632,6 +1732,7 @@ const requireJwt = (req, res, next) => {
     const payload = verifyJwtToken(token);
     req.jwt = payload;
     req.jwtToken = token;
+    req.hasuraAuthMode = "jwt";
     return next();
   } catch (err) {
     return res.status(401).json({ ok: false, error: "Invalid token." });
@@ -1651,6 +1752,7 @@ const optionalJwt = (req, res, next) => {
     const payload = verifyJwtToken(token);
     req.jwt = payload;
     req.jwtToken = token;
+    req.hasuraAuthMode = "jwt";
     return next();
   } catch (err) {
     return res.status(401).json({ ok: false, error: "Invalid token." });
@@ -1742,12 +1844,17 @@ const requireRevenueCatWebhookAuth = (req, res, next) => {
 };
 
 const buildHasuraAuthHeaders = (req) => {
-  const headers = {
-    "x-hasura-admin-secret": HASURA_ADMIN_SECRET,
-  };
-  if (req?.jwtToken) {
+  const headers = {};
+
+  if (req?.hasuraAuthMode === "service") {
+    headers["x-hasura-admin-secret"] = HASURA_ADMIN_SECRET;
+    return headers;
+  }
+
+  if (req?.hasuraAuthMode === "jwt" && req?.jwtToken) {
     headers.Authorization = `Bearer ${req.jwtToken}`;
   }
+
   return headers;
 };
 
@@ -2174,6 +2281,63 @@ app.post("/auth/guest-token", (req, res) => {
     token,
     expiresAt,
   });
+});
+
+app.post("/newspaper/view-url", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  const rawDate = String(req.body?.date || req.body?.publishDate || "").trim();
+  console.log(
+    `[newspaper][view-url][start] id=${requestId} ip=${req.ip} userId=${userId || "-"} date=${rawDate || "-"}`
+  );
+
+  try {
+    if (!userId) {
+      return res.status(401).json({ ok: false, error: "Invalid token user." });
+    }
+
+    const targetDate = parseIsoDateOnly(rawDate);
+    if (!targetDate) {
+      return res.status(400).json({
+        ok: false,
+        error: "date must be in YYYY-MM-DD format.",
+      });
+    }
+
+    const access = await getActiveNewspaperSubscriptionAccess(userId);
+    if (!access) {
+      console.warn(
+        `[newspaper][view-url][forbidden] id=${requestId} ip=${req.ip} userId=${userId} date=${rawDate}`
+      );
+      return res.status(403).json({
+        ok: false,
+        error: "Active newspaper subscription required.",
+      });
+    }
+
+    const isoDate = formatIsoDateOnly(targetDate);
+    const url = buildLegacyNewspaperUrl(targetDate);
+    console.log(
+      `[newspaper][view-url][success] id=${requestId} ip=${req.ip} userId=${userId} date=${isoDate}`
+    );
+    return res.json({
+      ok: true,
+      date: isoDate,
+      url,
+    });
+  } catch (err) {
+    const statusCode =
+      Number.isFinite(err?.statusCode) && err.statusCode >= 400
+        ? err.statusCode
+        : 500;
+    console.error(
+      `[newspaper][view-url][error] id=${requestId} ip=${req.ip} userId=${userId || "-"} date=${rawDate || "-"} msg=${err.message}`
+    );
+    return res.status(statusCode).json({
+      ok: false,
+      error: err.message || "Newspaper view failed.",
+    });
+  }
 });
 
 app.post("/graphql", optionalJwt, async (req, res) => {
