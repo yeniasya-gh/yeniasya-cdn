@@ -19,6 +19,11 @@ cp .env.example .env
 # MAIL_TLS_REJECT_UNAUTHORIZED=true
 # (acil geçici bypass için false yapılabilir, önerilmez)
 # MAIL_API_TOKEN=...
+# Şifre sıfırlama linki:
+# PASSWORD_RESET_WEB_URL=https://cdn.yeniasyadigital.com/sifre-sifirla
+# PASSWORD_RESET_TOKEN_TTL_MINUTES=30
+# PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX=8
+# PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX=10
 # Origin yetkisi için ALLOWED_ORIGINS'i kendi domainlerinle doldur (virgülle ayır)
 # Base64 viewer kapalıdır (istersen ENABLE_BASE64_VIEWER=true)
 # İsteğe bağlı: MAX_BASE64_VIEW_BYTES=5242880
@@ -63,6 +68,15 @@ psql "$DATABASE_URL" -f scripts/manual_newspaper_users_migration.sql
 ```
 - Migration sonrası Hasura'da `manual_newspaper_users` tablosunu track edin.
 
+## Şifre Sıfırlama Token Tablosu
+- Migration dosyası:
+  `scripts/password_reset_tokens_migration.sql`
+- Uygulama:
+```bash
+psql "$DATABASE_URL" -f scripts/password_reset_tokens_migration.sql
+```
+- Migration sonrası Hasura'da `password_reset_tokens` tablosunu track edin.
+
 ## Endpoint'ler
 - `POST /auth/register`
   - JSON body: `{ "name": "...", "email": "...", "password": "...", "phone": "..." }`
@@ -74,6 +88,13 @@ psql "$DATABASE_URL" -f scripts/manual_newspaper_users_migration.sql
   - JSON body: `{ "email": "...", "provider": "google|apple", "name": "...", "phone": "..." }`
   - Kullanıcı varsa JWT döner, yoksa `404 USER_NOT_FOUND`.
   - Yanıt: `{ ok, user, token, expiresAt }`
+- `POST /auth/password-reset/request`
+  - JSON body: `{ "email": "..." }`
+  - Güvenlik için kullanıcı kayıtlı olsun ya da olmasın aynı başarılı yanıtı döner.
+  - Şifre sıfırlama bağlantısını `PASSWORD_RESET_WEB_URL` adresine üretir.
+- `POST /auth/password-reset/confirm`
+  - JSON body: `{ "token": "...", "password": "..." }`
+  - Token tek kullanımlıktır; başarılı işlemden sonra aynı kullanıcıya ait açık tokenlar kapatılır.
 - `POST /graphql`
   - Hasura proxy (JWT zorunlu).
   - Header: `Authorization: Bearer <JWT>`

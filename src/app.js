@@ -46,6 +46,30 @@ const AUTH_RATE_LIMIT_MAX =
   Number.isFinite(AUTH_RATE_LIMIT_MAX_RAW) && AUTH_RATE_LIMIT_MAX_RAW > 0
     ? AUTH_RATE_LIMIT_MAX_RAW
     : 20;
+const PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX_RAW = Number(
+  process.env.PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX || "8"
+);
+const PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX =
+  Number.isFinite(PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX_RAW) &&
+  PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX_RAW > 0
+    ? PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX_RAW
+    : 8;
+const PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX_RAW = Number(
+  process.env.PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX || "10"
+);
+const PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX =
+  Number.isFinite(PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX_RAW) &&
+  PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX_RAW > 0
+    ? PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX_RAW
+    : 10;
+const PASSWORD_RESET_TOKEN_TTL_MINUTES_RAW = Number(
+  process.env.PASSWORD_RESET_TOKEN_TTL_MINUTES || "30"
+);
+const PASSWORD_RESET_TOKEN_TTL_MINUTES =
+  Number.isFinite(PASSWORD_RESET_TOKEN_TTL_MINUTES_RAW) &&
+  PASSWORD_RESET_TOKEN_TTL_MINUTES_RAW > 0
+    ? PASSWORD_RESET_TOKEN_TTL_MINUTES_RAW
+    : 30;
 const UPLOAD_RATE_LIMIT_MAX_RAW = Number(process.env.UPLOAD_RATE_LIMIT_MAX || "60");
 const UPLOAD_RATE_LIMIT_MAX =
   Number.isFinite(UPLOAD_RATE_LIMIT_MAX_RAW) && UPLOAD_RATE_LIMIT_MAX_RAW > 0
@@ -73,6 +97,9 @@ const MAIL_SETTINGS = {
   from: process.env.MAIL_FROM || "",
   token: process.env.MAIL_API_TOKEN || "",
 };
+const PASSWORD_RESET_WEB_URL =
+  process.env.PASSWORD_RESET_WEB_URL ||
+  "https://cdn.yeniasyadigital.com/sifre-sifirla";
 const MAIL_TLS_SERVERNAME = (process.env.MAIL_TLS_SERVERNAME || "")
   .trim()
   .replace(/\.$/, "");
@@ -379,6 +406,16 @@ const authRateLimiter = buildRateLimiter({
   windowMs: RATE_LIMIT_WINDOW_MS,
   max: AUTH_RATE_LIMIT_MAX,
   message: "Too many authentication attempts.",
+});
+const passwordResetRequestRateLimiter = buildRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX,
+  message: "Too many password reset requests.",
+});
+const passwordResetConfirmRateLimiter = buildRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX,
+  message: "Too many password reset attempts.",
 });
 const uploadRateLimiter = buildRateLimiter({
   windowMs: RATE_LIMIT_WINDOW_MS,
@@ -1330,6 +1367,31 @@ const buildOrderSummaryMailHtml = ({ name, orderId, total, rowsHtml }) => {
   `;
 };
 
+const buildPasswordResetMailHtml = ({ name, resetLink, expiresInMinutes }) => {
+  const safeName = escapeHtml(name || "Değerli Okur");
+  const safeResetLink = escapeHtml(resetLink || "");
+  const safeExpires = escapeHtml(String(expiresInMinutes || PASSWORD_RESET_TOKEN_TTL_MINUTES));
+
+  return `
+    <div style="font-family:Arial, sans-serif; background:#fafafa; padding:16px;">
+      <div style="max-width:640px;margin:0 auto;background:#fff;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,0.05);padding:20px;">
+        <div style="text-align:center;margin-bottom:16px;">
+          <h1 style="color:#d32f2f;margin:0;">Yeni Asya Dijital</h1>
+        </div>
+        <p>Merhaba ${safeName},</p>
+        <p>Şifrenizi sıfırlamak için aşağıdaki bağlantıyı kullanın:</p>
+        <p style="margin:16px 0;">
+          <a href="${safeResetLink}" style="background:#d32f2f;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none;">Şifreyi Sıfırla</a>
+        </p>
+        <p>Bu bağlantı tek kullanımlıktır ve ${safeExpires} dakika geçerlidir.</p>
+        <p>Bağlantı çalışmazsa şu adresi kopyalayın:<br><small>${safeResetLink}</small></p>
+        <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+        <p style="font-size:12px;color:#777;text-align:center;">Bu e-posta otomatik gönderilmiştir.</p>
+      </div>
+    </div>
+  `;
+};
+
 const getUserMailProfile = async (userId) => {
   const data = await hasuraRequest(
     `
@@ -1344,6 +1406,139 @@ const getUserMailProfile = async (userId) => {
     { id: userId }
   );
   return data?.users_by_pk || null;
+};
+
+const getActiveUserByEmail = async (email) => {
+  const data = await hasuraRequest(
+    `
+      query GetActiveUserByEmail($email: String!) {
+        users(
+          where: {
+            email: {_eq: $email},
+            is_active: {_eq: true}
+          },
+          limit: 1
+        ) {
+          id
+          name
+          email
+        }
+      }
+    `,
+    { email }
+  );
+  return data?.users?.[0] || null;
+};
+
+const hashPasswordResetToken = (token) =>
+  crypto.createHash("sha256").update(String(token || ""), "utf8").digest("hex");
+
+const createPasswordResetToken = () => crypto.randomBytes(32).toString("base64url");
+
+const buildPasswordResetLink = ({ token, email }) => {
+  const url = new URL(PASSWORD_RESET_WEB_URL);
+  url.searchParams.set("token", token);
+  if (email) {
+    url.searchParams.set("email", email);
+  }
+  return url.toString();
+};
+
+const invalidatePasswordResetTokensForUser = async (userId, usedAt) => {
+  const data = await hasuraRequest(
+    `
+      mutation InvalidatePasswordResetTokens($userId: bigint!, $usedAt: timestamptz!) {
+        update_password_reset_tokens(
+          where: {
+            user_id: {_eq: $userId},
+            used_at: {_is_null: true}
+          },
+          _set: {used_at: $usedAt}
+        ) {
+          affected_rows
+        }
+      }
+    `,
+    { userId, usedAt }
+  );
+  return Number(data?.update_password_reset_tokens?.affected_rows || 0);
+};
+
+const createPasswordResetTokenRecord = async ({
+  userId,
+  tokenHash,
+  expiresAt,
+  requestedIp,
+  userAgent,
+}) => {
+  const data = await hasuraRequest(
+    `
+      mutation CreatePasswordResetToken($object: password_reset_tokens_insert_input!) {
+        insert_password_reset_tokens_one(object: $object) {
+          id
+          user_id
+          token_hash
+          expires_at
+          used_at
+        }
+      }
+    `,
+    {
+      object: {
+        user_id: userId,
+        token_hash: tokenHash,
+        expires_at: expiresAt,
+        requested_ip: requestedIp || null,
+        user_agent: userAgent || null,
+      },
+    }
+  );
+  return data?.insert_password_reset_tokens_one || null;
+};
+
+const getPasswordResetTokenStateByHash = async (tokenHash) => {
+  const data = await hasuraRequest(
+    `
+      query GetPasswordResetTokenStateByHash($tokenHash: String!) {
+        password_reset_tokens(
+          where: {token_hash: {_eq: $tokenHash}},
+          order_by: {created_at: desc},
+          limit: 1
+        ) {
+          id
+          user_id
+          expires_at
+          used_at
+        }
+      }
+    `,
+    { tokenHash }
+  );
+  return data?.password_reset_tokens?.[0] || null;
+};
+
+const markPasswordResetTokenUsed = async (tokenId, usedAt) => {
+  const data = await hasuraRequest(
+    `
+      mutation MarkPasswordResetTokenUsed($id: bigint!, $usedAt: timestamptz!) {
+        update_password_reset_tokens_by_pk(
+          pk_columns: {id: $id},
+          _set: {used_at: $usedAt}
+        ) {
+          id
+          used_at
+        }
+      }
+    `,
+    { id: tokenId, usedAt }
+  );
+  return data?.update_password_reset_tokens_by_pk || null;
+};
+
+const PASSWORD_RESET_GENERIC_RESPONSE = {
+  ok: true,
+  message:
+    "Bu e-posta adresi kayıtlıysa şifre sıfırlama bağlantısı gönderildi.",
 };
 
 const getUserWelcomeMailState = async (userId) => {
@@ -1549,6 +1744,8 @@ app.use(
   ["/auth/register", "/auth/login", "/auth/social-login", "/auth/guest-token"],
   authRateLimiter
 );
+app.use("/auth/password-reset/request", passwordResetRequestRateLimiter);
+app.use("/auth/password-reset/confirm", passwordResetConfirmRateLimiter);
 app.use(["/upload/public", "/upload/private"], uploadRateLimiter);
 
 app.post("/auth/register", async (req, res) => {
@@ -1781,6 +1978,157 @@ app.post("/auth/social-login", async (req, res) => {
       `[auth][social-login][error] id=${requestId} provider=${provider || "-"} email=${emailForLog} msg=${err.message}`
     );
     return res.status(500).json({ ok: false, error: err.message || "Social login failed." });
+  }
+});
+
+app.post("/auth/password-reset/request", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const emailForLog = normalizeEmail(req.body?.email);
+  console.log(
+    `[auth][password-reset][request][start] id=${requestId} ip=${req.ip} email=${emailForLog}`
+  );
+
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const isValidEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
+
+    if (!email || !isValidEmail) {
+      console.log(
+        `[auth][password-reset][request][ignored] id=${requestId} ip=${req.ip} email=${emailForLog || "-"} reason=invalid-email`
+      );
+      return res.json(PASSWORD_RESET_GENERIC_RESPONSE);
+    }
+
+    const user = await getActiveUserByEmail(email);
+    if (!user) {
+      console.log(
+        `[auth][password-reset][request][ignored] id=${requestId} ip=${req.ip} email=${email} reason=user-not-found`
+      );
+      return res.json(PASSWORD_RESET_GENERIC_RESPONSE);
+    }
+
+    const rawToken = createPasswordResetToken();
+    const tokenHash = hashPasswordResetToken(rawToken);
+    const nowIso = new Date().toISOString();
+    const expiresAt = new Date(
+      Date.now() + PASSWORD_RESET_TOKEN_TTL_MINUTES * 60 * 1000
+    ).toISOString();
+
+    await invalidatePasswordResetTokensForUser(user.id, nowIso);
+    await createPasswordResetTokenRecord({
+      userId: user.id,
+      tokenHash,
+      expiresAt,
+      requestedIp: req.ip,
+      userAgent: String(req.get("user-agent") || "").slice(0, 512),
+    });
+
+    const resetLink = buildPasswordResetLink({ token: rawToken, email: user.email });
+    const safeName = String(user.name || "").trim() || user.email.split("@")[0];
+    const text = `Merhaba ${safeName}, sifrenizi sifirlamak icin bu baglantiyi kullanin: ${resetLink}`;
+    const html = buildPasswordResetMailHtml({
+      name: safeName,
+      resetLink,
+      expiresInMinutes: PASSWORD_RESET_TOKEN_TTL_MINUTES,
+    });
+
+    const info = await mailTransporter.sendMail({
+      from: MAIL_SETTINGS.from,
+      to: user.email,
+      subject: "Sifre sifirlama talebiniz",
+      text,
+      html,
+    });
+
+    console.log(
+      `[auth][password-reset][request][success] id=${requestId} ip=${req.ip} email=${email} userId=${user.id} messageId=${info?.messageId || "-"}`
+    );
+    return res.json(PASSWORD_RESET_GENERIC_RESPONSE);
+  } catch (err) {
+    console.error(
+      `[auth][password-reset][request][error] id=${requestId} ip=${req.ip} email=${emailForLog} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Password reset request failed.",
+    });
+  }
+});
+
+app.post("/auth/password-reset/confirm", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  console.log(`[auth][password-reset][confirm][start] id=${requestId} ip=${req.ip}`);
+
+  try {
+    const token = String(req.body?.token || "").trim();
+    const password = String(req.body?.password || "");
+    if (!token || !password) {
+      return res.status(400).json({
+        ok: false,
+        error: "token and password are required.",
+      });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({
+        ok: false,
+        error: "Password is too short.",
+      });
+    }
+
+    const tokenHash = hashPasswordResetToken(token);
+    const tokenState = await getPasswordResetTokenStateByHash(tokenHash);
+    if (!tokenState) {
+      console.warn(
+        `[auth][password-reset][confirm][invalid] id=${requestId} ip=${req.ip} reason=token-not-found`
+      );
+      return res.status(400).json({
+        ok: false,
+        error: "Reset token is invalid or already used.",
+      });
+    }
+    if (tokenState.used_at) {
+      console.warn(
+        `[auth][password-reset][confirm][invalid] id=${requestId} ip=${req.ip} reason=token-used tokenId=${tokenState.id}`
+      );
+      return res.status(400).json({
+        ok: false,
+        error: "Reset token is invalid or already used.",
+      });
+    }
+
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const expiresAtMs = Date.parse(tokenState.expires_at);
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now.getTime()) {
+      await markPasswordResetTokenUsed(tokenState.id, nowIso);
+      console.warn(
+        `[auth][password-reset][confirm][expired] id=${requestId} ip=${req.ip} tokenId=${tokenState.id}`
+      );
+      return res.status(410).json({
+        ok: false,
+        error: "Reset token has expired.",
+      });
+    }
+
+    const passwordHash = await hashPassword(password);
+    await setUserPasswordHash(tokenState.user_id, passwordHash);
+    await invalidatePasswordResetTokensForUser(tokenState.user_id, nowIso);
+
+    console.log(
+      `[auth][password-reset][confirm][success] id=${requestId} ip=${req.ip} userId=${tokenState.user_id}`
+    );
+    return res.json({
+      ok: true,
+      message: "Password updated successfully.",
+    });
+  } catch (err) {
+    console.error(
+      `[auth][password-reset][confirm][error] id=${requestId} ip=${req.ip} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Password reset failed.",
+    });
   }
 });
 
