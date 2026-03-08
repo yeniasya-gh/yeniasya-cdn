@@ -800,6 +800,10 @@ app.get("/privacy", (req, res) => {
   return res.sendFile(path.join(PUBLIC_ROOT, "privacy.html"));
 });
 
+app.get(["/sifre-sifirla", "/reset-password"], (req, res) => {
+  return res.sendFile(path.join(PUBLIC_ROOT, "password-reset.html"));
+});
+
 const buildCorsHeaders = (req) => {
   const requestOrigin = req.get("origin");
   const originAllowed =
