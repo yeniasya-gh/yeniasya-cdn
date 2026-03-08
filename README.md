@@ -33,6 +33,11 @@ cp .env.example .env
 # JWT_AUDIENCE=yeniasya-app
 # JWT_DEFAULT_ROLE=user
 # JWT_ALLOWED_ROLES=user
+# Guest JWT opsiyonelleri:
+# GUEST_JWT_ROLE=guest
+# GUEST_JWT_ALLOWED_ROLES=guest
+# GUEST_JWT_EXPIRES_IN=6h
+# GUEST_TOKEN_RATE_LIMIT_MAX=120
 # Admin push bildirim servisi (opsiyonel):
 # FIREBASE_SERVICE_ACCOUNT_JSON_PATH=/absolute/path/firebase-service-account.json
 # veya FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
@@ -87,6 +92,11 @@ psql "$DATABASE_URL" -f scripts/password_reset_tokens_migration.sql
 - `POST /auth/social-login`
   - JSON body: `{ "email": "...", "provider": "google|apple", "name": "...", "phone": "..." }`
   - Kullanıcı varsa JWT döner, yoksa `404 USER_NOT_FOUND`.
+  - Yanıt: `{ ok, user, token, expiresAt }`
+- `POST /auth/guest-token`
+  - Body zorunlu değildir.
+  - CDN kısa ömürlü bir `guest` JWT üretir.
+  - Bu token yalnızca Hasura'da `guest` rolüne verdiğiniz public izinler kadar erişim sağlamalıdır.
   - Yanıt: `{ ok, user, token, expiresAt }`
 - `POST /auth/password-reset/request`
   - JSON body: `{ "email": "..." }`

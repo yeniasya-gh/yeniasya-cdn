@@ -46,6 +46,13 @@ const AUTH_RATE_LIMIT_MAX =
   Number.isFinite(AUTH_RATE_LIMIT_MAX_RAW) && AUTH_RATE_LIMIT_MAX_RAW > 0
     ? AUTH_RATE_LIMIT_MAX_RAW
     : 20;
+const GUEST_TOKEN_RATE_LIMIT_MAX_RAW = Number(
+  process.env.GUEST_TOKEN_RATE_LIMIT_MAX || "120"
+);
+const GUEST_TOKEN_RATE_LIMIT_MAX =
+  Number.isFinite(GUEST_TOKEN_RATE_LIMIT_MAX_RAW) && GUEST_TOKEN_RATE_LIMIT_MAX_RAW > 0
+    ? GUEST_TOKEN_RATE_LIMIT_MAX_RAW
+    : 120;
 const PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX_RAW = Number(
   process.env.PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX || "8"
 );
@@ -155,8 +162,14 @@ const JWT_ALLOWED_ROLES = (process.env.JWT_ALLOWED_ROLES || JWT_DEFAULT_ROLE)
   .split(",")
   .map((v) => v.trim())
   .filter(Boolean);
-const GUEST_AUTH_USERNAME = process.env.GUEST_AUTH_USERNAME || "";
-const GUEST_AUTH_PASSWORD = process.env.GUEST_AUTH_PASSWORD || "";
+const GUEST_JWT_ROLE = (process.env.GUEST_JWT_ROLE || "guest").trim() || "guest";
+const GUEST_JWT_ALLOWED_ROLES = (
+  process.env.GUEST_JWT_ALLOWED_ROLES || GUEST_JWT_ROLE
+)
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
+const GUEST_JWT_EXPIRES_IN = process.env.GUEST_JWT_EXPIRES_IN || "6h";
 const REVENUECAT_ENTITLEMENT_ACCESS = {
   "yeniasya pro": { itemType: "newspaper_subscription", itemId: null },
 };
@@ -406,6 +419,11 @@ const authRateLimiter = buildRateLimiter({
   windowMs: RATE_LIMIT_WINDOW_MS,
   max: AUTH_RATE_LIMIT_MAX,
   message: "Too many authentication attempts.",
+});
+const guestTokenRateLimiter = buildRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: GUEST_TOKEN_RATE_LIMIT_MAX,
+  message: "Too many guest token requests.",
 });
 const passwordResetRequestRateLimiter = buildRateLimiter({
   windowMs: RATE_LIMIT_WINDOW_MS,
@@ -844,24 +862,26 @@ const hasuraRequest = async (query, variables = {}) => {
   return response.data?.data;
 };
 
-const buildJwt = (user) => {
+const buildJwt = (user, options = {}) => {
   const userId = String(user.id);
-  const roles = JWT_ALLOWED_ROLES.includes(JWT_DEFAULT_ROLE)
-    ? JWT_ALLOWED_ROLES
-    : [JWT_DEFAULT_ROLE, ...JWT_ALLOWED_ROLES];
+  const defaultRole = String(options.defaultRole || JWT_DEFAULT_ROLE).trim() || JWT_DEFAULT_ROLE;
+  const configuredRoles = Array.isArray(options.allowedRoles)
+    ? options.allowedRoles
+    : JWT_ALLOWED_ROLES;
+  const roles = [...new Set([defaultRole, ...configuredRoles.map((v) => String(v).trim())].filter(Boolean))];
   const payload = {
     sub: userId,
     name: user.name || undefined,
     email: user.email || undefined,
     "https://hasura.io/jwt/claims": {
-      "x-hasura-default-role": JWT_DEFAULT_ROLE,
+      "x-hasura-default-role": defaultRole,
       "x-hasura-allowed-roles": roles,
       "x-hasura-user-id": userId,
     },
   };
 
   const token = jwt.sign(payload, JWT_SECRET, {
-    expiresIn: JWT_EXPIRES_IN,
+    expiresIn: options.expiresIn || JWT_EXPIRES_IN,
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
   });
@@ -1745,9 +1765,10 @@ const setUserPasswordHash = async (userId, passwordHash) => {
 };
 
 app.use(
-  ["/auth/register", "/auth/login", "/auth/social-login", "/auth/guest-token"],
+  ["/auth/register", "/auth/login", "/auth/social-login"],
   authRateLimiter
 );
+app.use("/auth/guest-token", guestTokenRateLimiter);
 app.use("/auth/password-reset/request", passwordResetRequestRateLimiter);
 app.use("/auth/password-reset/confirm", passwordResetConfirmRateLimiter);
 app.use(["/upload/public", "/upload/private"], uploadRateLimiter);
@@ -2137,32 +2158,16 @@ app.post("/auth/password-reset/confirm", async (req, res) => {
 });
 
 app.post("/auth/guest-token", (req, res) => {
-  const username = String(req.body?.username || "").trim();
-  const password = String(req.body?.password || "");
-  if (!GUEST_AUTH_USERNAME || !GUEST_AUTH_PASSWORD) {
-    return res.status(503).json({
-      ok: false,
-      error: "Guest auth credentials are not configured.",
-    });
-  }
-  if (!username || !password) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "username and password are required." });
-  }
-  if (
-    !safeTokenCompare(username, GUEST_AUTH_USERNAME) ||
-    !safeTokenCompare(password, GUEST_AUTH_PASSWORD)
-  ) {
-    return res.status(401).json({ ok: false, error: "Invalid credentials." });
-  }
-
   const guestUser = {
     id: "guest",
     name: "Guest",
     email: null,
   };
-  const { token, expiresAt } = buildJwt(guestUser);
+  const { token, expiresAt } = buildJwt(guestUser, {
+    defaultRole: GUEST_JWT_ROLE,
+    allowedRoles: GUEST_JWT_ALLOWED_ROLES,
+    expiresIn: GUEST_JWT_EXPIRES_IN,
+  });
   return res.json({
     ok: true,
     user: { id: guestUser.id, name: guestUser.name },
