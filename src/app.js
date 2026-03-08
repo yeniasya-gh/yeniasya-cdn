@@ -903,6 +903,13 @@ const buildJwt = (user, options = {}) => {
   return { token, expiresAt };
 };
 
+const buildJwtForAppUser = (user) => {
+  return buildJwt(user, {
+    defaultRole: "admin",
+    allowedRoles: ["admin", "user", ...JWT_ALLOWED_ROLES],
+  });
+};
+
 const BCRYPT_HASH_REGEX = /^\$2[abxy]\$\d{2}\$/;
 const SHA256_HEX_REGEX = /^[a-f0-9]{64}$/i;
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
@@ -1955,7 +1962,7 @@ app.post("/auth/register", async (req, res) => {
       return res.status(500).json({ ok: false, error: "User creation failed." });
     }
 
-    const { token, expiresAt } = buildJwt(user);
+    const { token, expiresAt } = buildJwtForAppUser(user);
     console.log(
       `[auth][register][success] id=${requestId} ip=${req.ip} email=${email} userId=${user.id}`
     );
@@ -2037,7 +2044,7 @@ app.post("/auth/login", async (req, res) => {
       payUniqe: user.payUniqe,
       role_id: user.role_id,
     };
-    const { token, expiresAt } = buildJwt(safeUser);
+    const { token, expiresAt } = buildJwtForAppUser(safeUser);
     console.log(
       `[auth][login][success] id=${requestId} ip=${req.ip} email=${email} userId=${safeUser.id}`
     );
@@ -2100,7 +2107,7 @@ app.post("/auth/social-login", async (req, res) => {
       role_id: user.role_id,
     };
 
-    const { token, expiresAt } = buildJwt(safeUser);
+    const { token, expiresAt } = buildJwtForAppUser(safeUser);
     console.log(
       `[auth][social-login][success] id=${requestId} provider=${provider} email=${email} userId=${safeUser.id}`
     );
