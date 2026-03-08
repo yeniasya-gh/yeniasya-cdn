@@ -77,14 +77,6 @@ const PASSWORD_RESET_TOKEN_TTL_MINUTES =
   PASSWORD_RESET_TOKEN_TTL_MINUTES_RAW > 0
     ? PASSWORD_RESET_TOKEN_TTL_MINUTES_RAW
     : 30;
-const LEGACY_NEWSPAPER_TOKEN_SECRET = String(
-  process.env.LEGACY_NEWSPAPER_TOKEN_SECRET || ""
-).trim();
-const LEGACY_NEWSPAPER_BASE_URL = String(
-  process.env.LEGACY_NEWSPAPER_BASE_URL || "https://www.yeniasya.com.tr/e-gazete/content/0"
-)
-  .trim()
-  .replace(/\/+$/, "");
 const UPLOAD_RATE_LIMIT_MAX_RAW = Number(process.env.UPLOAD_RATE_LIMIT_MAX || "60");
 const UPLOAD_RATE_LIMIT_MAX =
   Number.isFinite(UPLOAD_RATE_LIMIT_MAX_RAW) && UPLOAD_RATE_LIMIT_MAX_RAW > 0
@@ -1610,35 +1602,6 @@ const parseIsoDateOnly = (value) => {
   return date;
 };
 
-const buildLegacyNewspaperToken = (fileName, nowMs = Date.now()) => {
-  if (!LEGACY_NEWSPAPER_TOKEN_SECRET) {
-    const err = new Error("LEGACY_NEWSPAPER_TOKEN_SECRET missing.");
-    err.statusCode = 503;
-    throw err;
-  }
-  const slice = Math.floor(Math.floor(nowMs / 1000) / 600);
-  const bytes = Buffer.alloc(8);
-  bytes.writeBigInt64LE(BigInt(slice), 0);
-  return crypto
-    .createHmac("sha256", `${LEGACY_NEWSPAPER_TOKEN_SECRET}${fileName}`)
-    .update(bytes)
-    .digest("hex")
-    .toUpperCase()
-    .slice(0, 16);
-};
-
-const buildLegacyNewspaperUrl = (date) => {
-  const isoDate = formatIsoDateOnly(date);
-  if (!isoDate) {
-    const err = new Error("Invalid newspaper date.");
-    err.statusCode = 400;
-    throw err;
-  }
-  const fileName = `${isoDate}.pdf`;
-  const token = buildLegacyNewspaperToken(fileName);
-  return `${LEGACY_NEWSPAPER_BASE_URL}/${token}/${fileName}`;
-};
-
 const getActiveNewspaperSubscriptionAccess = async (userId) => {
   const nowIso = new Date().toISOString();
   const data = await hasuraRequest(
@@ -1670,6 +1633,26 @@ const getActiveNewspaperSubscriptionAccess = async (userId) => {
     }
   );
   return data?.user_content_access?.[0] || null;
+};
+
+const getNewspaperByPublishDate = async (publishDate) => {
+  const data = await hasuraRequest(
+    `
+      query GetNewspaperByPublishDate($publishDate: date!) {
+        newspaper(
+          where: {publish_date: {_eq: $publishDate}}
+          order_by: {id: desc}
+          limit: 1
+        ) {
+          id
+          publish_date
+          file_url
+        }
+      }
+    `,
+    { publishDate }
+  );
+  return data?.newspaper?.[0] || null;
 };
 
 const getUserWelcomeMailState = async (userId) => {
@@ -2323,7 +2306,14 @@ app.post("/newspaper/view-url", requireJwt, async (req, res) => {
     }
 
     const isoDate = formatIsoDateOnly(targetDate);
-    const url = buildLegacyNewspaperUrl(targetDate);
+    const newspaper = await getNewspaperByPublishDate(isoDate);
+    const url = String(newspaper?.file_url || "").trim();
+    if (!url) {
+      return res.status(404).json({
+        ok: false,
+        error: "Selected newspaper PDF not found.",
+      });
+    }
     console.log(
       `[newspaper][view-url][success] id=${requestId} ip=${req.ip} userId=${userId} date=${isoDate}`
     );
@@ -2331,6 +2321,7 @@ app.post("/newspaper/view-url", requireJwt, async (req, res) => {
       ok: true,
       date: isoDate,
       url,
+      isPrivate: true,
     });
   } catch (err) {
     const statusCode =

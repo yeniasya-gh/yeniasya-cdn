@@ -24,9 +24,6 @@ cp .env.example .env
 # PASSWORD_RESET_TOKEN_TTL_MINUTES=30
 # PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX=8
 # PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX=10
-# Legacy e-gazete imzalı link üretimi:
-# LEGACY_NEWSPAPER_TOKEN_SECRET=...
-# LEGACY_NEWSPAPER_BASE_URL=https://www.yeniasya.com.tr/e-gazete/content/0
 # Origin yetkisi için ALLOWED_ORIGINS'i kendi domainlerinle doldur (virgülle ayır)
 # Base64 viewer kapalıdır (istersen ENABLE_BASE64_VIEWER=true)
 # İsteğe bağlı: MAX_BASE64_VIEW_BYTES=5242880
@@ -111,8 +108,8 @@ psql "$DATABASE_URL" -f scripts/password_reset_tokens_migration.sql
 - `POST /newspaper/view-url`
   - Auth: `Authorization: Bearer <JWT>`
   - JSON body: `{ "date": "YYYY-MM-DD" }`
-  - Aktif e-gazete aboneliği olan kullanıcı için legacy e-gazete görüntüleme URL'i üretir.
-  - Yanıt: `{ ok, date, url }`
+  - Aktif e-gazete aboneliği olan kullanıcı için seçilen tarihin private PDF yolunu döner.
+  - Yanıt: `{ ok, date, url, isPrivate }`
 - `POST /graphql`
   - Hasura proxy (JWT zorunlu).
   - Header: `Authorization: Bearer <JWT>`
