@@ -112,8 +112,11 @@ psql "$DATABASE_URL" -f scripts/password_reset_tokens_migration.sql
   - JSON body: `{ "date": "YYYY-MM-DD" }`
   - Aktif e-gazete aboneliği olan kullanıcı için seçilen tarihin görüntüleme URL'ini döner.
   - Tarih `newspaper` tablosunda varsa sistemdeki `file_url` kullanılır.
-  - Tarih sistemde yoksa eski sistemdeki doğrudan PDF URL'i üretilir.
+  - Tarih sistemde yoksa CDN içindeki legacy PDF proxy URL'i döner.
   - Yanıt: `{ ok, date, url, isPrivate, source }`
+- `GET /newspaper/legacy-file?date=YYYY-MM-DD`
+  - Auth: `Authorization: Bearer <JWT>`
+  - Aktif e-gazete aboneliği olan kullanıcı için eski sistemdeki PDF'i CDN üzerinden proxy eder.
 - `POST /graphql`
   - Hasura proxy (JWT zorunlu).
   - Header: `Authorization: Bearer <JWT>`

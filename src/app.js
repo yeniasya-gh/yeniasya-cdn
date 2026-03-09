@@ -1640,6 +1640,9 @@ const buildLegacyNewspaperUrl = (date) => {
   return `${LEGACY_NEWSPAPER_PDF_BASE_URL}/${fileName}`;
 };
 
+const buildLegacyNewspaperProxyUrl = (isoDate) =>
+  `/newspaper/legacy-file?date=${encodeURIComponent(isoDate)}`;
+
 const isPrivateStorageUrl = (value) => {
   const raw = String(value || "").trim();
   if (!raw) return false;
@@ -2358,7 +2361,7 @@ app.post("/newspaper/view-url", requireJwt, async (req, res) => {
     const newspaper = await getNewspaperByPublishDate(isoDate);
     const storedUrl = String(newspaper?.file_url || "").trim();
     const source = storedUrl ? "system" : "legacy";
-    const url = storedUrl || buildLegacyNewspaperUrl(targetDate);
+    const url = storedUrl || buildLegacyNewspaperProxyUrl(isoDate);
     const isPrivate = storedUrl ? isPrivateStorageUrl(storedUrl) : false;
     console.log(
       `[newspaper][view-url][success] id=${requestId} ip=${req.ip} userId=${userId} date=${isoDate} source=${source}`
@@ -2381,6 +2384,81 @@ app.post("/newspaper/view-url", requireJwt, async (req, res) => {
     return res.status(statusCode).json({
       ok: false,
       error: err.message || "Newspaper view failed.",
+    });
+  }
+});
+
+app.get("/newspaper/legacy-file", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  const rawDate = String(req.query?.date || "").trim();
+  console.log(
+    `[newspaper][legacy-file][start] id=${requestId} ip=${req.ip} userId=${userId || "-"} date=${rawDate || "-"}`
+  );
+
+  try {
+    if (!userId) {
+      return res.status(401).json({ ok: false, error: "Invalid token user." });
+    }
+
+    const targetDate = parseIsoDateOnly(rawDate);
+    if (!targetDate) {
+      return res.status(400).json({
+        ok: false,
+        error: "date must be in YYYY-MM-DD format.",
+      });
+    }
+
+    const access = await getActiveNewspaperSubscriptionAccess(userId);
+    if (!access) {
+      return res.status(403).json({
+        ok: false,
+        error: "Active newspaper subscription required.",
+      });
+    }
+
+    const legacyUrl = buildLegacyNewspaperUrl(targetDate);
+    const upstream = await axios.get(legacyUrl, {
+      responseType: "arraybuffer",
+      timeout: 20000,
+      validateStatus: () => true,
+      headers: {
+        Accept: "application/pdf,*/*",
+        "User-Agent": "Mozilla/5.0",
+        Referer: "https://www.yeniasya.com.tr/",
+      },
+    });
+
+    const contentType = String(upstream.headers?.["content-type"] || "").toLowerCase();
+    const body = Buffer.from(upstream.data || []);
+    if (upstream.status !== 200 || !contentType.includes("application/pdf") || body.length === 0) {
+      const statusCode = upstream.status === 404 ? 404 : 502;
+      console.warn(
+        `[newspaper][legacy-file][upstream] id=${requestId} status=${upstream.status} type=${contentType || "-"} bytes=${body.length}`
+      );
+      return res.status(statusCode).json({
+        ok: false,
+        error: "Legacy newspaper PDF unavailable.",
+      });
+    }
+
+    const isoDate = formatIsoDateOnly(targetDate);
+    res.set({
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `inline; filename="${isoDate}.pdf"`,
+      "Cache-Control": "private, max-age=300",
+    });
+    console.log(
+      `[newspaper][legacy-file][success] id=${requestId} ip=${req.ip} userId=${userId} date=${isoDate} bytes=${body.length}`
+    );
+    return res.status(200).send(body);
+  } catch (err) {
+    console.error(
+      `[newspaper][legacy-file][error] id=${requestId} ip=${req.ip} userId=${userId || "-"} date=${rawDate || "-"} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Legacy newspaper PDF unavailable.",
     });
   }
 });
