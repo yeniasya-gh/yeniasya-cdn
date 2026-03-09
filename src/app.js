@@ -137,6 +137,10 @@ const LEGACY_NEWSPAPER_TOKEN_SECRET = String(
 const LEGACY_NEWSPAPER_BASE_URL = String(
   process.env.LEGACY_NEWSPAPER_BASE_URL || "https://www.yeniasya.com.tr/e-gazete/content/0"
 ).replace(/\/+$/, "");
+const LEGACY_NEWSPAPER_PDF_BASE_URL = String(
+  process.env.LEGACY_NEWSPAPER_PDF_BASE_URL ||
+    "https://www.yeniasya.com.tr/Sites/YeniAsya/Upload/files/EPub"
+).replace(/\/+$/, "");
 const BUNNY_SETTINGS = {
   cdnUrl: process.env.BUNNY_CDN_URL || "yeniasya.b-cdn.net",
   storageZone: process.env.BUNNY_STORAGE_ZONE || "yeniasya",
@@ -1633,8 +1637,7 @@ const buildLegacyNewspaperUrl = (date) => {
     throw err;
   }
   const fileName = `${isoDate}.pdf`;
-  const token = buildLegacyNewspaperToken(fileName);
-  return `${LEGACY_NEWSPAPER_BASE_URL}/${token}/${fileName}`;
+  return `${LEGACY_NEWSPAPER_PDF_BASE_URL}/${fileName}`;
 };
 
 const isPrivateStorageUrl = (value) => {
