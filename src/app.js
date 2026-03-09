@@ -4888,7 +4888,7 @@ app.post("/payment/session", requireJwt, async (req, res, next) => {
     const merchantPassword =
       PARATIKA_MERCHANTPASSWORD || pick("MERCHANTPASSWORD", "merchantPassword");
     const merchant = PARATIKA_MERCHANT || pick("MERCHANT", "merchant");
-    const returnUrl = PARATIKA_RETURNURL || pick("RETURNURL", "returnUrl");
+    const returnUrl = pick("RETURNURL", "returnUrl") || PARATIKA_RETURNURL;
     const sessionType = pick("SESSIONTYPE", "sessionType") || "PAYMENTSESSION";
 
     const missing = [];
