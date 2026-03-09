@@ -33,6 +33,9 @@ cp .env.example .env
 # JWT_AUDIENCE=yeniasya-app
 # JWT_DEFAULT_ROLE=user
 # JWT_ALLOWED_ROLES=user
+# Legacy e-gazete fallback (opsiyonel ama eski tarihleri açmak için gerekli):
+# LEGACY_NEWSPAPER_TOKEN_SECRET=...
+# LEGACY_NEWSPAPER_BASE_URL=https://www.yeniasya.com.tr/e-gazete/content/0
 # Guest JWT opsiyonelleri:
 # GUEST_JWT_ROLE=guest
 # GUEST_JWT_ALLOWED_ROLES=guest
@@ -108,8 +111,10 @@ psql "$DATABASE_URL" -f scripts/password_reset_tokens_migration.sql
 - `POST /newspaper/view-url`
   - Auth: `Authorization: Bearer <JWT>`
   - JSON body: `{ "date": "YYYY-MM-DD" }`
-  - Aktif e-gazete aboneliği olan kullanıcı için seçilen tarihin private PDF yolunu döner.
-  - Yanıt: `{ ok, date, url, isPrivate }`
+  - Aktif e-gazete aboneliği olan kullanıcı için seçilen tarihin görüntüleme URL'ini döner.
+  - Tarih `newspaper` tablosunda varsa sistemdeki `file_url` kullanılır.
+  - Tarih sistemde yoksa `LEGACY_NEWSPAPER_TOKEN_SECRET` ile legacy e-gazete URL'i üretilir.
+  - Yanıt: `{ ok, date, url, isPrivate, source }`
 - `POST /graphql`
   - Hasura proxy (JWT zorunlu).
   - Header: `Authorization: Bearer <JWT>`
