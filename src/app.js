@@ -5239,11 +5239,40 @@ app.all("/payment/return", (req, res) => {
     responseMsg: normalized.responseMsg || "",
     merchantPaymentId: normalized.merchantPaymentId || "",
     pgOrderId: normalized.pgOrderId || "",
+    errorCode: normalized.errorCode || "",
+    errorMsg: normalized.errorMsg || "",
   });
 
-  const redirectTarget = isApproved
-    ? `/payment/pay/success?${params.toString()}`
-    : `/payment/pay/error?${params.toString()}`;
+  const requestedAppReturnOrigin =
+    payload.appReturnOrigin || payload.appreturnorigin || null;
+
+  const resolveAppReturnBase = () => {
+    const candidate = requestedAppReturnOrigin || PAYMENT_RETURN_REDIRECT_URL || "";
+    if (!candidate) return null;
+    try {
+      const parsed = new URL(String(candidate));
+      const origin = parsed.origin;
+      const host = parsed.hostname.toLowerCase();
+      const isLocalhost =
+        host === "localhost" || host === "127.0.0.1" || host === "::1";
+      const isTrustedHost =
+        host === "yeniasyadigital.com" ||
+        host === "www.yeniasyadigital.com" ||
+        host === "cdn.yeniasyadigital.com";
+      if (!isLocalhost && !isTrustedHost) {
+        return null;
+      }
+      return origin;
+    } catch (err) {
+      return null;
+    }
+  };
+
+  const redirectPath = isApproved ? "/payment/pay/success" : "/payment/pay/error";
+  const appReturnBase = resolveAppReturnBase();
+  const redirectTarget = appReturnBase
+    ? new URL(`${redirectPath}?${params.toString()}`, `${appReturnBase}/`).toString()
+    : `${redirectPath}?${params.toString()}`;
 
   return res.redirect(redirectTarget);
 });
