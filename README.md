@@ -22,6 +22,9 @@ cp .env.example .env
 # Şifre sıfırlama linki:
 # PASSWORD_RESET_WEB_URL=https://cdn.yeniasyadigital.com/sifre-sifirla
 # PASSWORD_RESET_TOKEN_TTL_MINUTES=30
+# Hesap aktivasyon linki:
+# EMAIL_VERIFICATION_WEB_URL=https://yeniasyadigital.com/hesap-aktivasyon
+# EMAIL_VERIFICATION_TOKEN_TTL_MINUTES=60
 # PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX=8
 # PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX=10
 # Origin yetkisi için ALLOWED_ORIGINS'i kendi domainlerinle doldur (virgülle ayır)
@@ -84,22 +87,44 @@ psql "$DATABASE_URL" -f scripts/password_reset_tokens_migration.sql
 ```
 - Migration sonrası Hasura'da `password_reset_tokens` tablosunu track edin.
 
+## E-Posta Aktivasyon Token Tablosu
+- Migration dosyası:
+  `scripts/email_verification_tokens_migration.sql`
+- Uygulama:
+```bash
+psql "$DATABASE_URL" -f scripts/email_verification_tokens_migration.sql
+```
+- Migration sonrası Hasura'da `email_verification_tokens` tablosunu track edin.
+
 ## Endpoint'ler
 - `POST /auth/register`
   - JSON body: `{ "name": "...", "email": "...", "password": "...", "phone": "..." }`
-  - Yanıt: `{ ok, user, token, expiresAt }`
+  - Kullanıcıyı oluşturur, aktivasyon maili gönderir ve giriş yaptırmaz.
+  - Yanıt: `{ ok, requiresEmailVerification, email, message }`
 - `POST /auth/login`
   - JSON body: `{ "email": "...", "password": "..." }`
+  - Hesap onaylanmamışsa `403 EMAIL_NOT_VERIFIED` döner.
   - Yanıt: `{ ok, user, token, expiresAt }`
 - `POST /auth/social-login`
   - JSON body: `{ "email": "...", "provider": "google|apple", "name": "...", "phone": "..." }`
   - Kullanıcı varsa JWT döner, yoksa `404 USER_NOT_FOUND`.
+  - Yanıt: `{ ok, user, token, expiresAt }`
+- `POST /auth/social-register`
+  - JSON body: `{ "email": "...", "name": "...", "provider": "google|apple", "phone": "..." }`
+  - Sosyal sağlayıcı ile ilk kayıt olan kullanıcıyı oluşturur, hesabı doğrulanmış kabul eder ve JWT döner.
   - Yanıt: `{ ok, user, token, expiresAt }`
 - `POST /auth/guest-token`
   - Body zorunlu değildir.
   - CDN kısa ömürlü bir `guest` JWT üretir.
   - Bu token yalnızca Hasura'da `guest` rolüne verdiğiniz public izinler kadar erişim sağlamalıdır.
   - Yanıt: `{ ok, user, token, expiresAt }`
+- `POST /auth/email-verification/request`
+  - JSON body: `{ "email": "..." }`
+  - Güvenlik için kullanıcı kayıtlı olsun ya da olmasın aynı başarılı yanıtı döner.
+  - Aktivasyon bağlantısını `EMAIL_VERIFICATION_WEB_URL` adresine üretir.
+- `POST /auth/email-verification/confirm`
+  - JSON body: `{ "token": "..." }`
+  - Token tek kullanımlıktır; başarılı işlemden sonra aynı kullanıcıya ait açık tokenlar kapatılır ve kullanıcı doğrulanır.
 - `POST /auth/password-reset/request`
   - JSON body: `{ "email": "..." }`
   - Güvenlik için kullanıcı kayıtlı olsun ya da olmasın aynı başarılı yanıtı döner.

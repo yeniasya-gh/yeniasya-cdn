@@ -77,6 +77,14 @@ const PASSWORD_RESET_TOKEN_TTL_MINUTES =
   PASSWORD_RESET_TOKEN_TTL_MINUTES_RAW > 0
     ? PASSWORD_RESET_TOKEN_TTL_MINUTES_RAW
     : 30;
+const EMAIL_VERIFICATION_TOKEN_TTL_MINUTES_RAW = Number(
+  process.env.EMAIL_VERIFICATION_TOKEN_TTL_MINUTES || "60"
+);
+const EMAIL_VERIFICATION_TOKEN_TTL_MINUTES =
+  Number.isFinite(EMAIL_VERIFICATION_TOKEN_TTL_MINUTES_RAW) &&
+  EMAIL_VERIFICATION_TOKEN_TTL_MINUTES_RAW > 0
+    ? EMAIL_VERIFICATION_TOKEN_TTL_MINUTES_RAW
+    : 60;
 const UPLOAD_RATE_LIMIT_MAX_RAW = Number(process.env.UPLOAD_RATE_LIMIT_MAX || "60");
 const UPLOAD_RATE_LIMIT_MAX =
   Number.isFinite(UPLOAD_RATE_LIMIT_MAX_RAW) && UPLOAD_RATE_LIMIT_MAX_RAW > 0
@@ -107,6 +115,9 @@ const MAIL_SETTINGS = {
 const PASSWORD_RESET_WEB_URL =
   process.env.PASSWORD_RESET_WEB_URL ||
   "https://cdn.yeniasyadigital.com/sifre-sifirla";
+const EMAIL_VERIFICATION_WEB_URL =
+  process.env.EMAIL_VERIFICATION_WEB_URL ||
+  "https://yeniasyadigital.com/hesap-aktivasyon";
 const MAIL_TLS_SERVERNAME = (process.env.MAIL_TLS_SERVERNAME || "")
   .trim()
   .replace(/\.$/, "");
@@ -1433,6 +1444,37 @@ const buildPasswordResetMailHtml = ({ name, resetLink, expiresInMinutes }) => {
   `;
 };
 
+const buildEmailVerificationMailHtml = ({
+  name,
+  verificationLink,
+  expiresInMinutes,
+}) => {
+  const safeName = escapeHtml(name || "Değerli Okur");
+  const safeVerificationLink = escapeHtml(verificationLink || "");
+  const safeExpires = escapeHtml(
+    String(expiresInMinutes || EMAIL_VERIFICATION_TOKEN_TTL_MINUTES)
+  );
+
+  return `
+    <div style="font-family:Arial, sans-serif; background:#fafafa; padding:16px;">
+      <div style="max-width:640px;margin:0 auto;background:#fff;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,0.05);padding:20px;">
+        <div style="text-align:center;margin-bottom:16px;">
+          <h1 style="color:#d32f2f;margin:0;">Yeni Asya Dijital</h1>
+        </div>
+        <p>Merhaba ${safeName},</p>
+        <p>Hesabınızı aktifleştirmek için aşağıdaki bağlantıyı kullanın:</p>
+        <p style="margin:16px 0;">
+          <a href="${safeVerificationLink}" style="background:#d32f2f;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none;">Hesabı Aktifleştir</a>
+        </p>
+        <p>Bağlantı tek kullanımlıktır ve ${safeExpires} dakika geçerlidir.</p>
+        <p>Bağlantı çalışmazsa şu adresi kopyalayın:<br><small>${safeVerificationLink}</small></p>
+        <hr style="margin:20px 0;border:none;border-top:1px solid #eee;">
+        <p style="font-size:12px;color:#777;text-align:center;">Bu e-posta otomatik gönderilmiştir.</p>
+      </div>
+    </div>
+  `;
+};
+
 const getUserMailProfile = async (userId) => {
   const data = await hasuraRequest(
     `
@@ -1449,6 +1491,28 @@ const getUserMailProfile = async (userId) => {
   return data?.users_by_pk || null;
 };
 
+const getUserByEmailForAuth = async (email) => {
+  const data = await hasuraRequest(
+    `
+      query GetUserByEmailForAuth($email: String!) {
+        users(where: {email: {_eq: $email}}, limit: 1) {
+          id
+          name
+          email
+          phone
+          payUniqe
+          role_id
+          password
+          is_active
+          email_verified_at
+        }
+      }
+    `,
+    { email }
+  );
+  return data?.users?.[0] || null;
+};
+
 const getActiveUserByEmail = async (email) => {
   const data = await hasuraRequest(
     `
@@ -1463,6 +1527,7 @@ const getActiveUserByEmail = async (email) => {
           id
           name
           email
+          email_verified_at
         }
       }
     `,
@@ -1475,9 +1540,19 @@ const hashPasswordResetToken = (token) =>
   crypto.createHash("sha256").update(String(token || ""), "utf8").digest("hex");
 
 const createPasswordResetToken = () => crypto.randomBytes(32).toString("base64url");
+const createEmailVerificationToken = () => crypto.randomBytes(32).toString("base64url");
 
 const buildPasswordResetLink = ({ token, email }) => {
   const url = new URL(PASSWORD_RESET_WEB_URL);
+  url.searchParams.set("token", token);
+  if (email) {
+    url.searchParams.set("email", email);
+  }
+  return url.toString();
+};
+
+const buildEmailVerificationLink = ({ token, email }) => {
+  const url = new URL(EMAIL_VERIFICATION_WEB_URL);
   url.searchParams.set("token", token);
   if (email) {
     url.searchParams.set("email", email);
@@ -1576,10 +1651,168 @@ const markPasswordResetTokenUsed = async (tokenId, usedAt) => {
   return data?.update_password_reset_tokens_by_pk || null;
 };
 
+const invalidateEmailVerificationTokensForUser = async (userId, usedAt) => {
+  const data = await hasuraRequest(
+    `
+      mutation InvalidateEmailVerificationTokens($userId: bigint!, $usedAt: timestamptz!) {
+        update_email_verification_tokens(
+          where: {
+            user_id: {_eq: $userId},
+            used_at: {_is_null: true}
+          },
+          _set: {used_at: $usedAt}
+        ) {
+          affected_rows
+        }
+      }
+    `,
+    { userId, usedAt }
+  );
+  return Number(data?.update_email_verification_tokens?.affected_rows || 0);
+};
+
+const createEmailVerificationTokenRecord = async ({
+  userId,
+  tokenHash,
+  expiresAt,
+  requestedIp,
+  userAgent,
+}) => {
+  const data = await hasuraRequest(
+    `
+      mutation CreateEmailVerificationToken($object: email_verification_tokens_insert_input!) {
+        insert_email_verification_tokens_one(object: $object) {
+          id
+          user_id
+          token_hash
+          expires_at
+          used_at
+        }
+      }
+    `,
+    {
+      object: {
+        user_id: userId,
+        token_hash: tokenHash,
+        expires_at: expiresAt,
+        requested_ip: requestedIp || null,
+        user_agent: userAgent || null,
+      },
+    }
+  );
+  return data?.insert_email_verification_tokens_one || null;
+};
+
+const getEmailVerificationTokenStateByHash = async (tokenHash) => {
+  const data = await hasuraRequest(
+    `
+      query GetEmailVerificationTokenStateByHash($tokenHash: String!) {
+        email_verification_tokens(
+          where: {token_hash: {_eq: $tokenHash}},
+          order_by: {created_at: desc},
+          limit: 1
+        ) {
+          id
+          user_id
+          expires_at
+          used_at
+        }
+      }
+    `,
+    { tokenHash }
+  );
+  return data?.email_verification_tokens?.[0] || null;
+};
+
+const markEmailVerificationTokenUsed = async (tokenId, usedAt) => {
+  const data = await hasuraRequest(
+    `
+      mutation MarkEmailVerificationTokenUsed($id: bigint!, $usedAt: timestamptz!) {
+        update_email_verification_tokens_by_pk(
+          pk_columns: {id: $id},
+          _set: {used_at: $usedAt}
+        ) {
+          id
+          used_at
+        }
+      }
+    `,
+    { id: tokenId, usedAt }
+  );
+  return data?.update_email_verification_tokens_by_pk || null;
+};
+
+const markUserEmailVerified = async (userId, verifiedAt) => {
+  const data = await hasuraRequest(
+    `
+      mutation MarkUserEmailVerified($id: bigint!, $verifiedAt: timestamptz!) {
+        update_users_by_pk(
+          pk_columns: {id: $id},
+          _set: {email_verified_at: $verifiedAt}
+        ) {
+          id
+          name
+          email
+          phone
+          payUniqe
+          role_id
+          email_verified_at
+        }
+      }
+    `,
+    { id: userId, verifiedAt }
+  );
+  return data?.update_users_by_pk || null;
+};
+
+const sendEmailVerificationMail = async ({ user, req }) => {
+  const rawToken = createEmailVerificationToken();
+  const tokenHash = hashPasswordResetToken(rawToken);
+  const nowIso = new Date().toISOString();
+  const expiresAt = new Date(
+    Date.now() + EMAIL_VERIFICATION_TOKEN_TTL_MINUTES * 60 * 1000
+  ).toISOString();
+
+  await invalidateEmailVerificationTokensForUser(user.id, nowIso);
+  await createEmailVerificationTokenRecord({
+    userId: user.id,
+    tokenHash,
+    expiresAt,
+    requestedIp: req.ip,
+    userAgent: String(req.get("user-agent") || "").slice(0, 512),
+  });
+
+  const verificationLink = buildEmailVerificationLink({
+    token: rawToken,
+    email: user.email,
+  });
+  const safeName = String(user.name || "").trim() || user.email.split("@")[0];
+  const text = `Merhaba ${safeName}, hesabınızı aktifleştirmek için bu bağlantıyı kullanın: ${verificationLink}`;
+  const html = buildEmailVerificationMailHtml({
+    name: safeName,
+    verificationLink,
+    expiresInMinutes: EMAIL_VERIFICATION_TOKEN_TTL_MINUTES,
+  });
+
+  return mailTransporter.sendMail({
+    from: MAIL_SETTINGS.from,
+    to: user.email,
+    subject: "Hesabınızı aktifleştirin",
+    text,
+    html,
+  });
+};
+
 const PASSWORD_RESET_GENERIC_RESPONSE = {
   ok: true,
   message:
     "Bu e-posta adresi kayıtlıysa şifre sıfırlama bağlantısı gönderildi.",
+};
+
+const EMAIL_VERIFICATION_GENERIC_RESPONSE = {
+  ok: true,
+  message:
+    "Bu e-posta adresi kayıtlıysa aktivasyon bağlantısı gönderildi.",
 };
 
 const formatIsoDateOnly = (value) => {
@@ -1764,6 +1997,54 @@ const rollbackWelcomeMailClaim = async (userId, claimedAt) => {
   return Number(data?.update_users?.affected_rows || 0);
 };
 
+const sendWelcomeMailOnce = async (userId) => {
+  const claimedAt = new Date().toISOString();
+  const claim = await claimWelcomeMailSend(userId, claimedAt);
+  if (Number(claim?.affected_rows || 0) === 0) {
+    const userState = await getUserWelcomeMailState(userId);
+    return {
+      ok: true,
+      skipped: true,
+      reason: "already_sent",
+      welcomeMailSentAt: userState?.welcome_mail_sent_at || null,
+    };
+  }
+
+  const user = claim?.returning?.[0];
+  const email = normalizeEmail(user?.email);
+  if (!email) {
+    await rollbackWelcomeMailClaim(userId, claimedAt);
+    throw new Error("User email is missing.");
+  }
+  const name = String(user?.name || "").trim() || email.split("@")[0];
+
+  try {
+    const subject = `Yeni Asya’ya hoş geldiniz, ${name}`;
+    const html = buildWelcomeMailHtml(name);
+    const text = `Merhaba ${name}, aramıza katıldığınız için teşekkürler. Keyifli okumalar!`;
+
+    const info = await mailTransporter.sendMail({
+      from: MAIL_SETTINGS.from,
+      to: email,
+      subject,
+      text,
+      html,
+    });
+
+    return {
+      ok: true,
+      sent: true,
+      messageId: info.messageId,
+      accepted: info.accepted,
+      rejected: info.rejected,
+      welcomeMailSentAt: claimedAt,
+    };
+  } catch (err) {
+    await rollbackWelcomeMailClaim(userId, claimedAt);
+    throw err;
+  }
+};
+
 const requireJwt = (req, res, next) => {
   const raw = req.get("authorization") || "";
   const token = raw.toLowerCase().startsWith("bearer ") ? raw.slice(7) : raw;
@@ -1917,7 +2198,10 @@ app.use(
   ["/auth/register", "/auth/login", "/auth/social-login"],
   authRateLimiter
 );
+app.use("/auth/social-register", authRateLimiter);
 app.use("/auth/guest-token", guestTokenRateLimiter);
+app.use("/auth/email-verification/request", passwordResetRequestRateLimiter);
+app.use("/auth/email-verification/confirm", passwordResetConfirmRateLimiter);
 app.use("/auth/password-reset/request", passwordResetRequestRateLimiter);
 app.use("/auth/password-reset/confirm", passwordResetConfirmRateLimiter);
 app.use(["/upload/public", "/upload/private"], uploadRateLimiter);
@@ -1949,21 +2233,25 @@ app.post("/auth/register", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Password is too short." });
     }
 
-    const existing = await hasuraRequest(
-      `
-        query GetUserByEmail($email: String!) {
-          users(where: {email: {_eq: $email}}, limit: 1) {
-            id
-          }
-        }
-      `,
-      { email }
-    );
-    if (existing?.users?.length) {
+    const existing = await getUserByEmailForAuth(email);
+    if (existing?.id && existing.email_verified_at) {
       console.warn(
         `[auth][register][exists] id=${requestId} ip=${req.ip} email=${email}`
       );
       return res.status(409).json({ ok: false, error: "Email already in use." });
+    }
+    if (existing?.id && !existing.email_verified_at) {
+      await sendEmailVerificationMail({ user: existing, req });
+      console.log(
+        `[auth][register][resent] id=${requestId} ip=${req.ip} email=${email} userId=${existing.id}`
+      );
+      return res.json({
+        ok: true,
+        requiresEmailVerification: true,
+        email,
+        message:
+          "Üye kaydı başarılı. E-posta adresinize gönderilen bağlantı ile hesabınızı aktifleştirin.",
+      });
     }
 
     const passwordHash = await hashPassword(password);
@@ -1997,11 +2285,17 @@ app.post("/auth/register", async (req, res) => {
       return res.status(500).json({ ok: false, error: "User creation failed." });
     }
 
-    const { token, expiresAt } = buildJwtForAppUser(user);
+    await sendEmailVerificationMail({ user, req });
     console.log(
       `[auth][register][success] id=${requestId} ip=${req.ip} email=${email} userId=${user.id}`
     );
-    return res.json({ ok: true, user, token, expiresAt });
+    return res.json({
+      ok: true,
+      requiresEmailVerification: true,
+      email,
+      message:
+        "Üye kaydı başarılı. E-posta adresinize gönderilen bağlantı ile hesabınızı aktifleştirin.",
+    });
   } catch (err) {
     console.error(
       `[auth][register][error] id=${requestId} ip=${req.ip} email=${emailForLog} msg=${err.message}`
@@ -2026,23 +2320,7 @@ app.post("/auth/login", async (req, res) => {
       return res.status(400).json({ ok: false, error: "email and password are required." });
     }
 
-    const data = await hasuraRequest(
-      `
-        query GetUserByEmail($email: String!) {
-          users(where: {email: {_eq: $email}}, limit: 1) {
-            id
-            name
-            email
-            phone
-            payUniqe
-            role_id
-            password
-          }
-        }
-      `,
-      { email }
-    );
-    const user = data?.users?.[0];
+    const user = await getUserByEmailForAuth(email);
     if (!user || !user.password) {
       console.warn(
         `[auth][login][invalid] id=${requestId} ip=${req.ip} email=${email}`
@@ -2069,6 +2347,17 @@ app.post("/auth/login", async (req, res) => {
           `[auth][login][password-upgrade-failed] id=${requestId} ip=${req.ip} email=${email} userId=${user.id} msg=${upgradeErr.message}`
         );
       }
+    }
+
+    if (!user.email_verified_at) {
+      console.warn(
+        `[auth][login][unverified] id=${requestId} ip=${req.ip} email=${email} userId=${user.id}`
+      );
+      return res.status(403).json({
+        ok: false,
+        code: "EMAIL_NOT_VERIFIED",
+        error: "Please verify your email address first.",
+      });
     }
 
     const safeUser = {
@@ -2110,27 +2399,16 @@ app.post("/auth/social-login", async (req, res) => {
       });
     }
 
-    const data = await hasuraRequest(
-      `
-        query GetUserByEmailForSocial($email: String!) {
-          users(where: {email: {_eq: $email}}, limit: 1) {
-            id
-            name
-            email
-            phone
-            payUniqe
-            role_id
-          }
-        }
-      `,
-      { email }
-    );
-    const user = data?.users?.[0];
+    let user = await getUserByEmailForAuth(email);
     if (!user) {
       console.log(
         `[auth][social-login][not-found] id=${requestId} provider=${provider} email=${email}`
       );
       return res.status(404).json({ ok: false, error: "USER_NOT_FOUND" });
+    }
+
+    if (!user.email_verified_at) {
+      user = await markUserEmailVerified(user.id, new Date().toISOString());
     }
 
     const safeUser = {
@@ -2152,6 +2430,195 @@ app.post("/auth/social-login", async (req, res) => {
       `[auth][social-login][error] id=${requestId} provider=${provider || "-"} email=${emailForLog} msg=${err.message}`
     );
     return res.status(500).json({ ok: false, error: err.message || "Social login failed." });
+  }
+});
+
+app.post("/auth/social-register", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const emailForLog = normalizeEmail(req.body?.email);
+  const provider = String(req.body?.provider || "").trim().toLowerCase();
+  console.log(
+    `[auth][social-register][start] id=${requestId} ip=${req.ip} provider=${provider || "-"} email=${emailForLog}`
+  );
+
+  try {
+    const name = String(req.body?.name || "").trim();
+    const email = normalizeEmail(req.body?.email);
+    const phone = req.body?.phone ? String(req.body.phone).trim() : null;
+    const allowedProviders = new Set(["google", "apple"]);
+
+    if (!name || !email || !allowedProviders.has(provider)) {
+      return res.status(400).json({
+        ok: false,
+        error: "name, email and provider (google|apple) are required.",
+      });
+    }
+
+    const existing = await getUserByEmailForAuth(email);
+    if (existing?.id) {
+      return res.status(409).json({ ok: false, error: "Email already in use." });
+    }
+
+    const passwordHash = await hashPassword(crypto.randomBytes(24).toString("base64url"));
+    const payUniqe = crypto.randomUUID();
+    const verifiedAt = new Date().toISOString();
+    const created = await hasuraRequest(
+      `
+        mutation CreateSocialUser($object: users_insert_input!) {
+          insert_users_one(object: $object) {
+            id
+            name
+            email
+            phone
+            payUniqe
+            role_id
+            email_verified_at
+          }
+        }
+      `,
+      {
+        object: {
+          name,
+          email,
+          phone,
+          password: passwordHash,
+          payUniqe,
+          email_verified_at: verifiedAt,
+        },
+      }
+    );
+
+    const user = created?.insert_users_one;
+    if (!user) {
+      return res.status(500).json({ ok: false, error: "User creation failed." });
+    }
+
+    const { token, expiresAt } = buildJwtForAppUser(user);
+    try {
+      await sendWelcomeMailOnce(user.id);
+    } catch (mailErr) {
+      console.warn(
+        `[auth][social-register][welcome-mail-failed] id=${requestId} userId=${user.id} msg=${mailErr.message}`
+      );
+    }
+    console.log(
+      `[auth][social-register][success] id=${requestId} ip=${req.ip} provider=${provider} email=${email} userId=${user.id}`
+    );
+    return res.json({ ok: true, user, token, expiresAt });
+  } catch (err) {
+    console.error(
+      `[auth][social-register][error] id=${requestId} ip=${req.ip} provider=${provider || "-"} email=${emailForLog} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Social register failed.",
+    });
+  }
+});
+
+app.post("/auth/email-verification/request", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const emailForLog = normalizeEmail(req.body?.email);
+  console.log(
+    `[auth][email-verification][request][start] id=${requestId} ip=${req.ip} email=${emailForLog}`
+  );
+
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const isValidEmail = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
+    if (!email || !isValidEmail) {
+      return res.json(EMAIL_VERIFICATION_GENERIC_RESPONSE);
+    }
+
+    const user = await getActiveUserByEmail(email);
+    if (!user || user.email_verified_at) {
+      return res.json(EMAIL_VERIFICATION_GENERIC_RESPONSE);
+    }
+
+    const info = await sendEmailVerificationMail({ user, req });
+    console.log(
+      `[auth][email-verification][request][success] id=${requestId} ip=${req.ip} email=${email} userId=${user.id} messageId=${info?.messageId || "-"}`
+    );
+    return res.json(EMAIL_VERIFICATION_GENERIC_RESPONSE);
+  } catch (err) {
+    console.error(
+      `[auth][email-verification][request][error] id=${requestId} ip=${req.ip} email=${emailForLog} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Email verification request failed.",
+    });
+  }
+});
+
+app.post("/auth/email-verification/confirm", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  console.log(
+    `[auth][email-verification][confirm][start] id=${requestId} ip=${req.ip}`
+  );
+
+  try {
+    const token = String(req.body?.token || "").trim();
+    if (!token) {
+      return res.status(400).json({
+        ok: false,
+        error: "token is required.",
+      });
+    }
+
+    const tokenHash = hashPasswordResetToken(token);
+    const tokenState = await getEmailVerificationTokenStateByHash(tokenHash);
+    if (!tokenState) {
+      return res.status(400).json({
+        ok: false,
+        error: "Verification token is invalid or already used.",
+      });
+    }
+    if (tokenState.used_at) {
+      return res.status(400).json({
+        ok: false,
+        error: "Verification token is invalid or already used.",
+      });
+    }
+
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const expiresAtMs = Date.parse(tokenState.expires_at);
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= now.getTime()) {
+      await markEmailVerificationTokenUsed(tokenState.id, nowIso);
+      return res.status(410).json({
+        ok: false,
+        error: "Verification token has expired.",
+      });
+    }
+
+    const user = await markUserEmailVerified(tokenState.user_id, nowIso);
+    await invalidateEmailVerificationTokensForUser(tokenState.user_id, nowIso);
+
+    try {
+      await sendWelcomeMailOnce(tokenState.user_id);
+    } catch (mailErr) {
+      console.warn(
+        `[auth][email-verification][confirm][welcome-mail-failed] id=${requestId} userId=${tokenState.user_id} msg=${mailErr.message}`
+      );
+    }
+
+    console.log(
+      `[auth][email-verification][confirm][success] id=${requestId} ip=${req.ip} userId=${tokenState.user_id}`
+    );
+    return res.json({
+      ok: true,
+      user,
+      message: "E-posta adresiniz doğrulandı.",
+    });
+  } catch (err) {
+    console.error(
+      `[auth][email-verification][confirm][error] id=${requestId} ip=${req.ip} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Email verification failed.",
+    });
   }
 });
 
