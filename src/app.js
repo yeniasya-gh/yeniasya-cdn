@@ -172,8 +172,15 @@ const ENABLE_BASE64_VIEWER =
 const MAX_BASE64_VIEW_BYTES = Number(process.env.MAX_BASE64_VIEW_BYTES || "5242880");
 const HASURA_ENDPOINT = process.env.HASURA_ENDPOINT || "";
 const HASURA_ADMIN_SECRET = process.env.HASURA_ADMIN_SECRET || "";
+const HASURA_HTTP_TIMEOUT_MS = Number(process.env.HASURA_HTTP_TIMEOUT_MS || "15000");
 const HASURA_ALLOW_JWTLESS =
   (process.env.HASURA_ALLOW_JWTLESS || "").toLowerCase() === "true";
+const HOME_BOOTSTRAP_HASURA_TIMEOUT_MS = Number(
+  process.env.HOME_BOOTSTRAP_HASURA_TIMEOUT_MS || "30000"
+);
+const HOME_BOOTSTRAP_CACHE_TTL_MS = Number(
+  process.env.HOME_BOOTSTRAP_CACHE_TTL_MS || "60000"
+);
 const JWT_SECRET = process.env.JWT_SECRET || "";
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1d";
 const JWT_ISSUER = process.env.JWT_ISSUER || "yeniasya";
@@ -230,6 +237,16 @@ const bunnyHttp = axios.create({
   headers: {
     AccessKey: BUNNY_SETTINGS.accessKey,
   },
+  httpsAgent: new https.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 30_000,
+    maxSockets: 64,
+    maxFreeSockets: 16,
+  }),
+});
+
+const hasuraHttp = axios.create({
+  timeout: HASURA_HTTP_TIMEOUT_MS,
   httpsAgent: new https.Agent({
     keepAlive: true,
     keepAliveMsecs: 30_000,
@@ -843,6 +860,30 @@ app.get(["/sifre-sifirla", "/reset-password"], (req, res) => {
   return res.sendFile(path.join(PUBLIC_ROOT, "password-reset.html"));
 });
 
+app.get("/home/bootstrap", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  try {
+    const { data, cache } = await getCachedHomeBootstrap();
+    const maxAgeSeconds = Math.max(
+      1,
+      Math.floor(HOME_BOOTSTRAP_CACHE_TTL_MS / 1000)
+    );
+    res.set(
+      "Cache-Control",
+      `public, max-age=${maxAgeSeconds}, stale-while-revalidate=300`
+    );
+    return res.json({ ok: true, cache, data });
+  } catch (err) {
+    console.error(
+      `[home][bootstrap][error] id=${requestId} ip=${req.ip} msg=${err.message}`
+    );
+    return res.status(503).json({
+      ok: false,
+      error: "Home bootstrap unavailable.",
+    });
+  }
+});
+
 const buildCorsHeaders = (req) => {
   const requestOrigin = req.get("origin");
   const originAllowed =
@@ -858,11 +899,12 @@ const buildCorsHeaders = (req) => {
   };
 };
 
-const hasuraRequest = async (query, variables = {}) => {
-  const response = await axios.post(
+const hasuraRequest = async (query, variables = {}, options = {}) => {
+  const response = await hasuraHttp.post(
     HASURA_ENDPOINT,
     { query, variables },
     {
+      timeout: options.timeout || HASURA_HTTP_TIMEOUT_MS,
       headers: {
         "Content-Type": "application/json",
         "x-hasura-admin-secret": HASURA_ADMIN_SECRET,
@@ -881,6 +923,137 @@ const hasuraRequest = async (query, variables = {}) => {
   }
 
   return response.data?.data;
+};
+
+const HOME_BOOTSTRAP_QUERY = `
+  query GetHomeBootstrap {
+    magazines: magazine(order_by: {id: desc}) {
+      id
+      name
+      category
+      cover_image_url
+      period
+      description
+      created_at
+    }
+    books(order_by: {id: desc}) {
+      id
+      title
+      cover_url
+      price
+      discount_price
+      description
+      min_description
+      author_rel: authorByAuthorId {
+        id
+        name
+      }
+    }
+    newspapers: newspaper(order_by: {publish_date: desc}) {
+      id
+      image_url
+      publish_date
+      created_at
+    }
+    attachments: ekler(order_by: {created_at: desc}) {
+      id
+      ad
+      aciklama
+      fiyat
+      pdf_url
+      photo_url
+      is_public
+      created_at
+    }
+    sliders: slider(
+      where: {is_active: {_eq: true}},
+      order_by: {sort_order: asc, created_at: desc}
+    ) {
+      id
+      title
+      subtitle
+      description
+      image_url
+      link_url
+      sort_order
+      is_active
+      created_at
+      updated_at
+    }
+    homeBookEntries: home_showcase(
+      where: {product_type: {_eq: "book"}, is_active: {_eq: true}},
+      order_by: {sort_order: asc, created_at: desc}
+    ) {
+      id
+      product_type
+      product_id
+      sort_order
+      is_active
+      created_at
+    }
+    homeMagazineEntries: home_showcase(
+      where: {product_type: {_eq: "magazine"}, is_active: {_eq: true}},
+      order_by: {sort_order: asc, created_at: desc}
+    ) {
+      id
+      product_type
+      product_id
+      sort_order
+      is_active
+      created_at
+    }
+  }
+`;
+
+const homeBootstrapCache = {
+  value: null,
+  expiresAt: 0,
+  inflight: null,
+};
+
+const fetchHomeBootstrap = async () => {
+  const data = await hasuraRequest(HOME_BOOTSTRAP_QUERY, {}, {
+    timeout: HOME_BOOTSTRAP_HASURA_TIMEOUT_MS,
+  });
+  return {
+    sliders: data?.sliders || [],
+    magazines: data?.magazines || [],
+    books: data?.books || [],
+    newspapers: data?.newspapers || [],
+    attachments: data?.attachments || [],
+    homeBookEntries: data?.homeBookEntries || [],
+    homeMagazineEntries: data?.homeMagazineEntries || [],
+    fetchedAt: new Date().toISOString(),
+  };
+};
+
+const getCachedHomeBootstrap = async () => {
+  const now = Date.now();
+  if (homeBootstrapCache.value && homeBootstrapCache.expiresAt > now) {
+    return { data: homeBootstrapCache.value, cache: "hit" };
+  }
+
+  if (!homeBootstrapCache.inflight) {
+    homeBootstrapCache.inflight = fetchHomeBootstrap()
+      .then((data) => {
+        homeBootstrapCache.value = data;
+        homeBootstrapCache.expiresAt = Date.now() + HOME_BOOTSTRAP_CACHE_TTL_MS;
+        return data;
+      })
+      .finally(() => {
+        homeBootstrapCache.inflight = null;
+      });
+  }
+
+  try {
+    const data = await homeBootstrapCache.inflight;
+    return { data, cache: "miss" };
+  } catch (err) {
+    if (homeBootstrapCache.value) {
+      return { data: homeBootstrapCache.value, cache: "stale" };
+    }
+    throw err;
+  }
 };
 
 const buildJwt = (user, options = {}) => {
@@ -2937,7 +3110,7 @@ app.post("/graphql", optionalJwt, async (req, res) => {
       return res.status(400).json({ ok: false, error: "query is required." });
     }
 
-    const response = await axios.post(
+    const response = await hasuraHttp.post(
       HASURA_ENDPOINT,
       { query, variables, operationName },
       {
@@ -2966,7 +3139,7 @@ app.post("/hasura", requireJwtOrServiceAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "query is required." });
     }
 
-    const response = await axios.post(
+    const response = await hasuraHttp.post(
       HASURA_ENDPOINT,
       { query, variables, operationName },
       {
