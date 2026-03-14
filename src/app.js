@@ -323,6 +323,48 @@ const hasuraHttp = axios.create({
 
 let homePostgresPool = null;
 
+const decodeUriComponentSafe = (value) => {
+  try {
+    return decodeURIComponent(value);
+  } catch (_) {
+    return value;
+  }
+};
+
+const normalizePostgresCredential = (value) =>
+  encodeURIComponent(decodeUriComponentSafe(String(value || "")));
+
+// node-postgres expects reserved URL characters in credentials to be encoded.
+const normalizePostgresConnectionString = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return raw;
+
+  const schemeMatch = raw.match(/^([a-z][a-z0-9+.-]*:\/\/)(.*)$/i);
+  if (!schemeMatch) return raw;
+
+  const [, scheme, remainder] = schemeMatch;
+  const slashIndex = remainder.indexOf("/");
+  if (slashIndex < 0) return raw;
+
+  const authority = remainder.slice(0, slashIndex);
+  const pathAndMore = remainder.slice(slashIndex);
+  const atIndex = authority.lastIndexOf("@");
+  if (atIndex < 0) return raw;
+
+  const userInfo = authority.slice(0, atIndex);
+  const hostInfo = authority.slice(atIndex + 1);
+  const colonIndex = userInfo.indexOf(":");
+  const rawUser = colonIndex >= 0 ? userInfo.slice(0, colonIndex) : userInfo;
+  const rawPassword = colonIndex >= 0 ? userInfo.slice(colonIndex + 1) : "";
+  const normalizedUser = normalizePostgresCredential(rawUser);
+  const normalizedPassword =
+    colonIndex >= 0 ? `:${normalizePostgresCredential(rawPassword)}` : "";
+
+  return `${scheme}${normalizedUser}${normalizedPassword}@${hostInfo}${pathAndMore}`;
+};
+
+const HOME_POSTGRES_CONNECTION_STRING = normalizePostgresConnectionString(HOME_POSTGRES_URL);
+
 const isHomePostgresSslEnabled = () => {
   if (HOME_POSTGRES_SSL) return true;
   return ["require", "verify-ca", "verify-full"].includes(HOME_POSTGRES_SSLMODE);
@@ -339,10 +381,10 @@ const getHomePostgresPool = () => {
   if (homePostgresPool) return homePostgresPool;
 
   const ssl = buildHomePostgresSslConfig();
-  const hasConnectionString = !!String(HOME_POSTGRES_URL || "").trim();
+  const hasConnectionString = !!String(HOME_POSTGRES_CONNECTION_STRING || "").trim();
   const poolConfig = hasConnectionString
     ? {
-        connectionString: HOME_POSTGRES_URL,
+        connectionString: HOME_POSTGRES_CONNECTION_STRING,
       }
     : {
         host: HOME_POSTGRES_HOST,
@@ -1224,7 +1266,7 @@ const buildHomeErrorPayload = ({ req, requestId, section, err }) => {
     ip: req?.ip || null,
     method: req?.method || null,
     postgresConfig: {
-      hasConnectionString: !!String(HOME_POSTGRES_URL || "").trim(),
+      hasConnectionString: !!String(HOME_POSTGRES_CONNECTION_STRING || "").trim(),
       hasHost: !!String(HOME_POSTGRES_HOST || "").trim(),
       hasDatabase: !!String(HOME_POSTGRES_DATABASE || "").trim(),
       hasUser: !!String(HOME_POSTGRES_USER || "").trim(),
