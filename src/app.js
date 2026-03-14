@@ -1351,8 +1351,8 @@ const homeBooksSql = `
       ELSE jsonb_build_object('id', a.id, 'name', a.name)
     END AS author_rel
   FROM public.books AS b
-  LEFT JOIN public.category AS c ON c.id = b.category_id
-  LEFT JOIN public.author AS a ON a.id = b.author_id
+  LEFT JOIN public.categories AS c ON c.id = b.category_id
+  LEFT JOIN public.authors AS a ON a.id = b.author_id
   WHERE COALESCE(b.is_published, TRUE) = TRUE
   ORDER BY b.id DESC
 `;
