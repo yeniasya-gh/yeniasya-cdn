@@ -36,6 +36,18 @@ cp .env.example .env
 # JWT_AUDIENCE=yeniasya-app
 # JWT_DEFAULT_ROLE=user
 # JWT_ALLOWED_ROLES=user
+# Anasayfa Postgres (Hasura yerine direkt DB erişimi):
+# HOME_POSTGRES_URL=postgres://user:pass@host:5432/dbname
+# veya ayrı alanlarla:
+# HOME_POSTGRES_HOST=localhost
+# HOME_POSTGRES_PORT=5432
+# HOME_POSTGRES_DATABASE=yeniasya
+# HOME_POSTGRES_USER=postgres
+# HOME_POSTGRES_PASSWORD=...
+# HOME_POSTGRES_SSL=true
+# HOME_POSTGRES_SSL_REJECT_UNAUTHORIZED=true
+# HOME_POSTGRES_QUERY_TIMEOUT_MS=10000
+# HOME_POSTGRES_POOL_MAX=10
 # Legacy e-gazete fallback (opsiyonel ama eski tarihleri açmak için gerekli):
 # LEGACY_NEWSPAPER_PDF_BASE_URL=https://www.yeniasya.com.tr/Sites/YeniAsya/Upload/files/EPub
 # Guest JWT opsiyonelleri:
@@ -138,6 +150,18 @@ psql "$DATABASE_URL" -f scripts/content_publication_status_migration.sql
   - CDN kısa ömürlü bir `guest` JWT üretir.
   - Bu token yalnızca Hasura'da `guest` rolüne verdiğiniz public izinler kadar erişim sağlamalıdır.
   - Yanıt: `{ ok, user, token, expiresAt }`
+- `GET /home/bootstrap`
+  - Anasayfa bootstrap verisini direkt Postgres'ten toplu döner.
+  - Yanıt: `{ ok, cache, data: { sliders, magazines, books, newspapers, attachments, homeBookEntries, homeMagazineEntries } }`
+- `GET /home/sliders`
+- `GET /home/magazines`
+- `GET /home/books`
+- `GET /home/newspapers`
+- `GET /home/attachments`
+- `GET /home/showcase/books`
+- `GET /home/showcase/magazines`
+  - Anasayfa fallback yüklemeleri için section bazlı endpointlerdir.
+  - Hepsi direkt Postgres'ten okunur ve `{ ok, cache, data: [...] }` döner.
 - `GET /auth/me`
   - Auth: `Authorization: Bearer <JWT>`
   - Oturumdaki kullanıcının güvenli profil özetini döner.

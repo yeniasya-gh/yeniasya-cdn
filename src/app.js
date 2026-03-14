@@ -13,6 +13,7 @@ const axios = require("axios");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const helmet = require("helmet");
+const { Pool } = require("pg");
 const rateLimit = require("express-rate-limit");
 
 const PORT = process.env.PORT || 3001;
@@ -181,6 +182,71 @@ const HOME_BOOTSTRAP_HASURA_TIMEOUT_MS = Number(
 const HOME_BOOTSTRAP_CACHE_TTL_MS = Number(
   process.env.HOME_BOOTSTRAP_CACHE_TTL_MS || "60000"
 );
+const HOME_POSTGRES_URL =
+  process.env.HOME_POSTGRES_URL ||
+  process.env.POSTGRES_URL ||
+  process.env.DATABASE_URL ||
+  "";
+const HOME_POSTGRES_HOST =
+  process.env.HOME_POSTGRES_HOST || process.env.POSTGRES_HOST || process.env.PGHOST || "";
+const HOME_POSTGRES_PORT_RAW = Number(
+  process.env.HOME_POSTGRES_PORT || process.env.POSTGRES_PORT || process.env.PGPORT || "5432"
+);
+const HOME_POSTGRES_PORT =
+  Number.isInteger(HOME_POSTGRES_PORT_RAW) && HOME_POSTGRES_PORT_RAW > 0
+    ? HOME_POSTGRES_PORT_RAW
+    : 5432;
+const HOME_POSTGRES_DATABASE =
+  process.env.HOME_POSTGRES_DATABASE ||
+  process.env.POSTGRES_DATABASE ||
+  process.env.PGDATABASE ||
+  "";
+const HOME_POSTGRES_USER =
+  process.env.HOME_POSTGRES_USER || process.env.POSTGRES_USER || process.env.PGUSER || "";
+const HOME_POSTGRES_PASSWORD =
+  process.env.HOME_POSTGRES_PASSWORD ||
+  process.env.POSTGRES_PASSWORD ||
+  process.env.PGPASSWORD ||
+  "";
+const HOME_POSTGRES_SSL =
+  (process.env.HOME_POSTGRES_SSL || process.env.POSTGRES_SSL || "").toLowerCase() === "true";
+const HOME_POSTGRES_SSLMODE = String(
+  process.env.HOME_POSTGRES_SSLMODE || process.env.POSTGRES_SSLMODE || process.env.PGSSLMODE || ""
+)
+  .trim()
+  .toLowerCase();
+const HOME_POSTGRES_SSL_REJECT_UNAUTHORIZED =
+  process.env.HOME_POSTGRES_SSL_REJECT_UNAUTHORIZED === "false" ||
+  process.env.POSTGRES_SSL_REJECT_UNAUTHORIZED === "false"
+    ? false
+    : true;
+const HOME_POSTGRES_POOL_MAX_RAW = Number(process.env.HOME_POSTGRES_POOL_MAX || "10");
+const HOME_POSTGRES_POOL_MAX =
+  Number.isInteger(HOME_POSTGRES_POOL_MAX_RAW) && HOME_POSTGRES_POOL_MAX_RAW > 0
+    ? HOME_POSTGRES_POOL_MAX_RAW
+    : 10;
+const HOME_POSTGRES_IDLE_TIMEOUT_MS_RAW = Number(
+  process.env.HOME_POSTGRES_IDLE_TIMEOUT_MS || "30000"
+);
+const HOME_POSTGRES_IDLE_TIMEOUT_MS =
+  Number.isFinite(HOME_POSTGRES_IDLE_TIMEOUT_MS_RAW) && HOME_POSTGRES_IDLE_TIMEOUT_MS_RAW >= 0
+    ? HOME_POSTGRES_IDLE_TIMEOUT_MS_RAW
+    : 30000;
+const HOME_POSTGRES_CONNECTION_TIMEOUT_MS_RAW = Number(
+  process.env.HOME_POSTGRES_CONNECTION_TIMEOUT_MS || "5000"
+);
+const HOME_POSTGRES_CONNECTION_TIMEOUT_MS =
+  Number.isFinite(HOME_POSTGRES_CONNECTION_TIMEOUT_MS_RAW) &&
+  HOME_POSTGRES_CONNECTION_TIMEOUT_MS_RAW >= 0
+    ? HOME_POSTGRES_CONNECTION_TIMEOUT_MS_RAW
+    : 5000;
+const HOME_POSTGRES_QUERY_TIMEOUT_MS_RAW = Number(
+  process.env.HOME_POSTGRES_QUERY_TIMEOUT_MS || "10000"
+);
+const HOME_POSTGRES_QUERY_TIMEOUT_MS =
+  Number.isFinite(HOME_POSTGRES_QUERY_TIMEOUT_MS_RAW) && HOME_POSTGRES_QUERY_TIMEOUT_MS_RAW > 0
+    ? HOME_POSTGRES_QUERY_TIMEOUT_MS_RAW
+    : 10000;
 const JWT_SECRET = process.env.JWT_SECRET || "";
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1d";
 const JWT_ISSUER = process.env.JWT_ISSUER || "yeniasya";
@@ -254,6 +320,73 @@ const hasuraHttp = axios.create({
     maxFreeSockets: 16,
   }),
 });
+
+let homePostgresPool = null;
+
+const isHomePostgresSslEnabled = () => {
+  if (HOME_POSTGRES_SSL) return true;
+  return ["require", "verify-ca", "verify-full"].includes(HOME_POSTGRES_SSLMODE);
+};
+
+const buildHomePostgresSslConfig = () => {
+  if (!isHomePostgresSslEnabled()) return undefined;
+  return {
+    rejectUnauthorized: HOME_POSTGRES_SSL_REJECT_UNAUTHORIZED,
+  };
+};
+
+const getHomePostgresPool = () => {
+  if (homePostgresPool) return homePostgresPool;
+
+  const ssl = buildHomePostgresSslConfig();
+  const hasConnectionString = !!String(HOME_POSTGRES_URL || "").trim();
+  const poolConfig = hasConnectionString
+    ? {
+        connectionString: HOME_POSTGRES_URL,
+      }
+    : {
+        host: HOME_POSTGRES_HOST,
+        port: HOME_POSTGRES_PORT,
+        database: HOME_POSTGRES_DATABASE,
+        user: HOME_POSTGRES_USER,
+        password: HOME_POSTGRES_PASSWORD,
+      };
+
+  if (
+    !hasConnectionString &&
+    (!HOME_POSTGRES_HOST || !HOME_POSTGRES_DATABASE || !HOME_POSTGRES_USER)
+  ) {
+    throw new Error(
+      "Home Postgres configuration missing. Set HOME_POSTGRES_URL or HOME_POSTGRES_HOST/PORT/DATABASE/USER/PASSWORD."
+    );
+  }
+
+  homePostgresPool = new Pool({
+    ...poolConfig,
+    max: HOME_POSTGRES_POOL_MAX,
+    idleTimeoutMillis: HOME_POSTGRES_IDLE_TIMEOUT_MS,
+    connectionTimeoutMillis: HOME_POSTGRES_CONNECTION_TIMEOUT_MS,
+    allowExitOnIdle: false,
+    ...(ssl ? { ssl } : {}),
+  });
+
+  homePostgresPool.on("error", (err) => {
+    console.error(`[home][db][pool-error] ${err?.message || err}`);
+  });
+
+  return homePostgresPool;
+};
+
+const homePostgresQuery = async (text, values = []) => {
+  const pool = getHomePostgresPool();
+  const result = await pool.query({
+    text,
+    values,
+    query_timeout: HOME_POSTGRES_QUERY_TIMEOUT_MS,
+    statement_timeout: HOME_POSTGRES_QUERY_TIMEOUT_MS,
+  });
+  return result.rows || [];
+};
 
 const isRetryableBunnyError = (err) => {
   const status = err?.response?.status;
@@ -887,6 +1020,52 @@ app.get("/home/bootstrap", async (req, res) => {
   }
 });
 
+const sendHomeSectionResponse = async (req, res, key) => {
+  const requestId = crypto.randomUUID();
+  try {
+    const { data, cache } = await getCachedHomeSection(key);
+    const maxAgeSeconds = Math.max(
+      1,
+      Math.floor(HOME_BOOTSTRAP_CACHE_TTL_MS / 1000)
+    );
+    res.set(
+      "Cache-Control",
+      `public, max-age=${maxAgeSeconds}, stale-while-revalidate=300`
+    );
+    return res.json({ ok: true, cache, data });
+  } catch (err) {
+    console.error(
+      `[home][${key}][error] id=${requestId} ip=${req.ip} msg=${err.message}`
+    );
+    return res.status(503).json({
+      ok: false,
+      error: `${key} unavailable.`,
+    });
+  }
+};
+
+app.get("/home/sliders", async (req, res) =>
+  sendHomeSectionResponse(req, res, "sliders")
+);
+app.get("/home/magazines", async (req, res) =>
+  sendHomeSectionResponse(req, res, "magazines")
+);
+app.get("/home/books", async (req, res) =>
+  sendHomeSectionResponse(req, res, "books")
+);
+app.get("/home/newspapers", async (req, res) =>
+  sendHomeSectionResponse(req, res, "newspapers")
+);
+app.get("/home/attachments", async (req, res) =>
+  sendHomeSectionResponse(req, res, "attachments")
+);
+app.get("/home/showcase/books", async (req, res) =>
+  sendHomeSectionResponse(req, res, "homeBookEntries")
+);
+app.get("/home/showcase/magazines", async (req, res) =>
+  sendHomeSectionResponse(req, res, "homeMagazineEntries")
+);
+
 const buildCorsHeaders = (req) => {
   const requestOrigin = req.get("origin");
   const originAllowed =
@@ -928,142 +1107,202 @@ const hasuraRequest = async (query, variables = {}, options = {}) => {
   return response.data?.data;
 };
 
-const HOME_BOOTSTRAP_QUERY = `
-  query GetHomeBootstrap {
-    magazines: magazine(order_by: {id: desc}) {
-      id
-      name
-      category
-      cover_image_url
-      period
-      description
-      created_at
-    }
-    books(
-      where: {is_published: {_eq: true}},
-      order_by: {id: desc}
-    ) {
-      id
-      title
-      cover_url
-      price
-      discount_price
-      description
-      min_description
-      category_rel: categoryByCategoryId {
-        id
-        name
-      }
-      author_rel: authorByAuthorId {
-        id
-        name
-      }
-    }
-    newspapers: newspaper(order_by: {publish_date: desc}) {
-      id
-      image_url
-      publish_date
-      created_at
-    }
-    attachments: ekler(order_by: {created_at: desc}) {
-      id
-      ad
-      aciklama
-      fiyat
-      pdf_url
-      photo_url
-      is_public
-      created_at
-    }
-    sliders: slider(
-      where: {is_active: {_eq: true}},
-      order_by: {sort_order: asc, created_at: desc}
-    ) {
-      id
-      title
-      subtitle
-      description
-      image_url
-      link_url
-      sort_order
-      is_active
-      created_at
-      updated_at
-    }
-    homeBookEntries: home_showcase(
-      where: {product_type: {_eq: "book"}, is_active: {_eq: true}},
-      order_by: {sort_order: asc, created_at: desc}
-    ) {
-      id
-      product_type
-      product_id
-      sort_order
-      is_active
-      created_at
-    }
-    homeMagazineEntries: home_showcase(
-      where: {product_type: {_eq: "magazine"}, is_active: {_eq: true}},
-      order_by: {sort_order: asc, created_at: desc}
-    ) {
-      id
-      product_type
-      product_id
-      sort_order
-      is_active
-      created_at
-    }
-  }
-`;
+const HOME_SECTION_KEYS = [
+  "sliders",
+  "magazines",
+  "books",
+  "newspapers",
+  "attachments",
+  "homeBookEntries",
+  "homeMagazineEntries",
+];
 
-const homeBootstrapCache = {
+const createHomeSectionCacheEntry = () => ({
   value: null,
   expiresAt: 0,
   inflight: null,
+});
+
+const homeSectionCaches = Object.fromEntries(
+  HOME_SECTION_KEYS.map((key) => [key, createHomeSectionCacheEntry()])
+);
+
+const homeBooksSql = `
+  SELECT
+    b.id,
+    b.title,
+    b.cover_url,
+    b.price,
+    b.discount_price,
+    b.description,
+    b.min_description,
+    CASE
+      WHEN c.id IS NULL THEN NULL
+      ELSE jsonb_build_object('id', c.id, 'name', c.name)
+    END AS category_rel,
+    CASE
+      WHEN a.id IS NULL THEN NULL
+      ELSE jsonb_build_object('id', a.id, 'name', a.name)
+    END AS author_rel
+  FROM public.books AS b
+  LEFT JOIN public.category AS c ON c.id = b.category_id
+  LEFT JOIN public.author AS a ON a.id = b.author_id
+  WHERE COALESCE(b.is_published, TRUE) = TRUE
+  ORDER BY b.id DESC
+`;
+
+const homeMagazinesSql = `
+  SELECT
+    id,
+    name,
+    category,
+    cover_image_url,
+    period,
+    description,
+    created_at
+  FROM public.magazine
+  ORDER BY id DESC
+`;
+
+const homeNewspapersSql = `
+  SELECT
+    id,
+    image_url,
+    publish_date,
+    created_at
+  FROM public.newspaper
+  ORDER BY publish_date DESC
+`;
+
+const homeAttachmentsSql = `
+  SELECT
+    id,
+    ad,
+    aciklama,
+    fiyat,
+    pdf_url,
+    photo_url,
+    is_public,
+    created_at
+  FROM public.ekler
+  ORDER BY created_at DESC
+`;
+
+const homeSlidersSql = `
+  SELECT
+    id,
+    title,
+    subtitle,
+    description,
+    image_url,
+    link_url,
+    sort_order,
+    is_active,
+    created_at,
+    updated_at
+  FROM public.slider
+  WHERE is_active = TRUE
+  ORDER BY sort_order ASC NULLS LAST, created_at DESC
+`;
+
+const homeShowcaseSql = `
+  SELECT
+    id,
+    product_type,
+    product_id,
+    sort_order,
+    is_active,
+    created_at
+  FROM public.home_showcase
+  WHERE product_type = $1
+    AND is_active = TRUE
+  ORDER BY sort_order ASC NULLS LAST, created_at DESC
+`;
+
+const homeSectionLoaders = {
+  sliders: async () => homePostgresQuery(homeSlidersSql),
+  magazines: async () => homePostgresQuery(homeMagazinesSql),
+  books: async () => homePostgresQuery(homeBooksSql),
+  newspapers: async () => homePostgresQuery(homeNewspapersSql),
+  attachments: async () => homePostgresQuery(homeAttachmentsSql),
+  homeBookEntries: async () => homePostgresQuery(homeShowcaseSql, ["book"]),
+  homeMagazineEntries: async () => homePostgresQuery(homeShowcaseSql, ["magazine"]),
 };
 
-const fetchHomeBootstrap = async () => {
-  const data = await hasuraRequest(HOME_BOOTSTRAP_QUERY, {}, {
-    timeout: HOME_BOOTSTRAP_HASURA_TIMEOUT_MS,
-  });
-  return {
-    sliders: data?.sliders || [],
-    magazines: data?.magazines || [],
-    books: data?.books || [],
-    newspapers: data?.newspapers || [],
-    attachments: data?.attachments || [],
-    homeBookEntries: data?.homeBookEntries || [],
-    homeMagazineEntries: data?.homeMagazineEntries || [],
-    fetchedAt: new Date().toISOString(),
-  };
+const cloneHomeSectionValue = (value) =>
+  Array.isArray(value)
+    ? value.map((item) =>
+        item && typeof item === "object" && !Array.isArray(item) ? { ...item } : item
+      )
+    : [];
+
+const fetchHomeSection = async (key) => {
+  const loader = homeSectionLoaders[key];
+  if (typeof loader !== "function") {
+    throw new Error(`Unknown home section: ${key}`);
+  }
+  const rows = await loader();
+  return cloneHomeSectionValue(rows);
 };
 
-const getCachedHomeBootstrap = async () => {
-  const now = Date.now();
-  if (homeBootstrapCache.value && homeBootstrapCache.expiresAt > now) {
-    return { data: homeBootstrapCache.value, cache: "hit" };
+const getCachedHomeSection = async (key) => {
+  const cacheEntry = homeSectionCaches[key];
+  if (!cacheEntry) {
+    throw new Error(`Unknown home section cache: ${key}`);
   }
 
-  if (!homeBootstrapCache.inflight) {
-    homeBootstrapCache.inflight = fetchHomeBootstrap()
+  const now = Date.now();
+  if (cacheEntry.value && cacheEntry.expiresAt > now) {
+    return { data: cloneHomeSectionValue(cacheEntry.value), cache: "hit" };
+  }
+
+  if (!cacheEntry.inflight) {
+    cacheEntry.inflight = fetchHomeSection(key)
       .then((data) => {
-        homeBootstrapCache.value = data;
-        homeBootstrapCache.expiresAt = Date.now() + HOME_BOOTSTRAP_CACHE_TTL_MS;
+        cacheEntry.value = data;
+        cacheEntry.expiresAt = Date.now() + HOME_BOOTSTRAP_CACHE_TTL_MS;
         return data;
       })
       .finally(() => {
-        homeBootstrapCache.inflight = null;
+        cacheEntry.inflight = null;
       });
   }
 
   try {
-    const data = await homeBootstrapCache.inflight;
-    return { data, cache: "miss" };
+    const data = await cacheEntry.inflight;
+    return { data: cloneHomeSectionValue(data), cache: "miss" };
   } catch (err) {
-    if (homeBootstrapCache.value) {
-      return { data: homeBootstrapCache.value, cache: "stale" };
+    if (cacheEntry.value) {
+      return { data: cloneHomeSectionValue(cacheEntry.value), cache: "stale" };
     }
     throw err;
   }
+};
+
+const summarizeHomeCacheState = (states) => {
+  if (!Array.isArray(states) || states.length === 0) return "miss";
+  if (states.every((state) => state === "hit")) return "hit";
+  if (states.some((state) => state === "stale")) return "stale";
+  if (states.some((state) => state === "miss")) return "miss";
+  return states[0];
+};
+
+const getCachedHomeBootstrap = async () => {
+  const sections = await Promise.all(HOME_SECTION_KEYS.map((key) => getCachedHomeSection(key)));
+  const data = {
+    sliders: sections[0].data,
+    magazines: sections[1].data,
+    books: sections[2].data,
+    newspapers: sections[3].data,
+    attachments: sections[4].data,
+    homeBookEntries: sections[5].data,
+    homeMagazineEntries: sections[6].data,
+    fetchedAt: new Date().toISOString(),
+  };
+  return {
+    data,
+    cache: summarizeHomeCacheState(sections.map((section) => section.cache)),
+  };
 };
 
 const buildJwt = (user, options = {}) => {
