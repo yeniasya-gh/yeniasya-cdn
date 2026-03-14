@@ -1511,6 +1511,231 @@ const getCachedHomeBootstrap = async () => {
   };
 };
 
+const USER_ACCESS_ITEM_TYPES = new Set([
+  "book",
+  "magazine",
+  "magazine_issue",
+  "newspaper_subscription",
+  "ek",
+]);
+
+const normalizeUserAccessItemType = (value) => {
+  const normalized = String(value || "").trim();
+  if (!normalized) return null;
+  return USER_ACCESS_ITEM_TYPES.has(normalized) ? normalized : null;
+};
+
+const sortUserAccessEntries = (entries) => {
+  const parseDate = (value) => {
+    if (!value) return 0;
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? 0 : parsed.getTime();
+  };
+
+  entries.sort((a, b) => {
+    const startedCmp = parseDate(b.started_at) - parseDate(a.started_at);
+    if (startedCmp !== 0) return startedCmp;
+    const expiresCmp = parseDate(b.expires_at) - parseDate(a.expires_at);
+    if (expiresCmp !== 0) return expiresCmp;
+    return Number(b.id || 0) - Number(a.id || 0);
+  });
+
+  return entries;
+};
+
+const getManualNewspaperAccessRows = async ({ userId }) => {
+  try {
+    const rows = await homePostgresQuery(
+      `
+        SELECT
+          id::int AS id,
+          starts_at,
+          ends_at,
+          is_active,
+          note
+        FROM public.manual_newspaper_users
+        WHERE user_id = $1
+          AND is_active = TRUE
+        ORDER BY ends_at DESC NULLS LAST, starts_at DESC NULLS LAST, id DESC
+      `,
+      [userId]
+    );
+
+    return rows.map((row) => ({
+      id: `manual_${row.id}`,
+      item_id: null,
+      item_type: "newspaper_subscription",
+      started_at: row.starts_at,
+      expires_at: row.ends_at,
+      is_active: row.is_active === true,
+      source: "manual_newspaper",
+      note: row.note || null,
+    }));
+  } catch (err) {
+    const message = String(err?.message || "").toLowerCase();
+    if (String(err?.code || "") === "42P01" || message.includes("manual_newspaper_users")) {
+      return [];
+    }
+    throw err;
+  }
+};
+
+const getUserAccessEntriesFromPostgres = async ({ userId, itemType = null }) => {
+  const values = [userId];
+  let itemTypeWhere = "";
+  if (itemType) {
+    values.push(itemType);
+    itemTypeWhere = ` AND item_type = $${values.length}`;
+  }
+
+  const rows = await homePostgresQuery(
+    `
+      SELECT
+        id::int AS id,
+        CASE WHEN item_id IS NULL THEN NULL ELSE item_id::int END AS item_id,
+        item_type,
+        started_at,
+        expires_at,
+        is_active
+      FROM public.user_content_access
+      WHERE user_id = $1
+        AND is_active = TRUE
+        ${itemTypeWhere}
+      ORDER BY started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC
+    `,
+    values
+  );
+
+  const entries = rows.map((row) => ({
+    ...row,
+    source: "user_content_access",
+  }));
+
+  if (!itemType || itemType === "newspaper_subscription") {
+    entries.push(...(await getManualNewspaperAccessRows({ userId })));
+  }
+
+  return sortUserAccessEntries(entries);
+};
+
+const getUserOrdersFromPostgres = async ({ userId, includeItems = false }) => {
+  const orders = await homePostgresQuery(
+    `
+      SELECT
+        id::int AS id,
+        total_paid,
+        status::text AS status,
+        CASE WHEN promo_code_id IS NULL THEN NULL ELSE promo_code_id::int END AS promo_code_id,
+        promo_code,
+        promo_discount_percent,
+        promo_discount_amount,
+        created_at
+      FROM public.orders
+      WHERE user_id = $1
+      ORDER BY created_at DESC, id DESC
+    `,
+    [userId]
+  );
+
+  if (!includeItems || orders.length === 0) {
+    return orders.map((order) => ({ ...order }));
+  }
+
+  const orderIds = orders.map((order) => Number(order.id)).filter(Number.isFinite);
+  if (orderIds.length === 0) {
+    return orders.map((order) => ({ ...order, order_items: [] }));
+  }
+
+  const items = await homePostgresQuery(
+    `
+      SELECT
+        id::int AS id,
+        order_id::int AS order_id,
+        title,
+        quantity::int AS quantity,
+        unit_price,
+        line_total,
+        product_type,
+        metadata
+      FROM public.order_items
+      WHERE order_id = ANY($1::bigint[])
+      ORDER BY id ASC
+    `,
+    [orderIds]
+  );
+
+  const itemsByOrderId = new Map();
+  for (const item of items) {
+    const orderId = Number(item.order_id);
+    if (!itemsByOrderId.has(orderId)) {
+      itemsByOrderId.set(orderId, []);
+    }
+    itemsByOrderId.get(orderId).push({ ...item });
+  }
+
+  return orders.map((order) => ({
+    ...order,
+    order_items: itemsByOrderId.get(Number(order.id)) || [],
+  }));
+};
+
+const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
+  const rows = await homePostgresQuery(
+    `
+      SELECT
+        id::int AS id,
+        total_paid,
+        status::text AS status,
+        created_at,
+        CASE
+          WHEN delivery_address_id IS NULL THEN NULL
+          ELSE delivery_address_id::int
+        END AS delivery_address_id,
+        CASE
+          WHEN billing_address_id IS NULL THEN NULL
+          ELSE billing_address_id::int
+        END AS billing_address_id,
+        CASE
+          WHEN promo_code_id IS NULL THEN NULL
+          ELSE promo_code_id::int
+        END AS promo_code_id,
+        promo_code,
+        promo_discount_percent,
+        promo_discount_amount
+      FROM public.orders
+      WHERE id = $1
+        AND user_id = $2
+      LIMIT 1
+    `,
+    [orderId, userId]
+  );
+
+  const order = rows[0];
+  if (!order) return null;
+
+  const items = await homePostgresQuery(
+    `
+      SELECT
+        id::int AS id,
+        title,
+        quantity::int AS quantity,
+        unit_price,
+        line_total,
+        product_type,
+        metadata
+      FROM public.order_items
+      WHERE order_id = $1
+      ORDER BY id ASC
+    `,
+    [orderId]
+  );
+
+  return {
+    ...order,
+    order_items: items.map((item) => ({ ...item })),
+  };
+};
+
 const buildJwt = (user, options = {}) => {
   const userId = String(user.id);
   const defaultRole = String(options.defaultRole || JWT_DEFAULT_ROLE).trim() || JWT_DEFAULT_ROLE;
@@ -3381,6 +3606,101 @@ app.delete("/auth/me/avatar", requireJwt, async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: "Avatar remove failed.",
+      requestId,
+    });
+  }
+});
+
+app.get("/auth/me/access", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: "Invalid user token." });
+  }
+
+  const rawItemType = req.query?.itemType;
+  const itemType =
+    rawItemType === undefined ? null : normalizeUserAccessItemType(rawItemType);
+
+  if (rawItemType !== undefined && !itemType) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid itemType.",
+      requestId,
+    });
+  }
+
+  try {
+    const data = await getUserAccessEntriesFromPostgres({ userId, itemType });
+    return res.json({ ok: true, data, requestId });
+  } catch (err) {
+    console.error(
+      `[auth][me][access][error] id=${requestId} userId=${userId} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Access records fetch failed.",
+      requestId,
+    });
+  }
+});
+
+app.get("/auth/me/orders", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: "Invalid user token." });
+  }
+
+  try {
+    const includeItems = toBool(req.query?.includeItems);
+    const data = await getUserOrdersFromPostgres({ userId, includeItems });
+    return res.json({ ok: true, data, requestId });
+  } catch (err) {
+    console.error(
+      `[auth][me][orders][error] id=${requestId} userId=${userId} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Orders fetch failed.",
+      requestId,
+    });
+  }
+});
+
+app.get("/auth/me/orders/:id", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: "Invalid user token." });
+  }
+
+  const orderId = toPositiveIntOrNull(req.params?.id);
+  if (!orderId) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid order id.",
+      requestId,
+    });
+  }
+
+  try {
+    const order = await getUserOrderDetailFromPostgres({ userId, orderId });
+    if (!order) {
+      return res.status(404).json({
+        ok: false,
+        error: "Order not found.",
+        requestId,
+      });
+    }
+    return res.json({ ok: true, order, requestId });
+  } catch (err) {
+    console.error(
+      `[auth][me][order-detail][error] id=${requestId} userId=${userId} orderId=${orderId} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Order detail fetch failed.",
       requestId,
     });
   }

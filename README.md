@@ -167,6 +167,17 @@ psql "$DATABASE_URL" -f scripts/content_publication_status_migration.sql
 - `GET /auth/me`
   - Auth: `Authorization: Bearer <JWT>`
   - Oturumdaki kullanıcının güvenli profil özetini döner.
+- `GET /auth/me/access`
+  - Auth: `Authorization: Bearer <JWT>`
+  - Query: `itemType` opsiyoneldir. (`book`, `magazine`, `magazine_issue`, `newspaper_subscription`, `ek`)
+  - Oturumdaki kullanıcının aktif erişim kayıtlarını direkt Postgres'ten döner.
+- `GET /auth/me/orders`
+  - Auth: `Authorization: Bearer <JWT>`
+  - Query: `includeItems=true` verilirse sipariş kalemlerini de ekler.
+  - Oturumdaki kullanıcının sipariş geçmişini direkt Postgres'ten döner.
+- `GET /auth/me/orders/:id`
+  - Auth: `Authorization: Bearer <JWT>`
+  - Oturumdaki kullanıcıya ait tek sipariş detayını ve kalemlerini direkt Postgres'ten döner.
 - `PATCH /auth/me`
   - Auth: `Authorization: Bearer <JWT>`
   - JSON body: `{ "name": "...", "phone": "..." }`
