@@ -69,6 +69,7 @@ cp .env.example .env
 # BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS=15000
 # BUNNY_STREAM_IDLE_TIMEOUT_MS=30000
 # BUNNY_DEBUG=true
+# CDN_PUBLIC_HOST=cdn.yeniasyadigital.com
 ```
 3) Bağımlılıklar:
 ```bash
@@ -226,6 +227,10 @@ psql "$DATABASE_URL" -f scripts/content_publication_status_migration.sql
   - Dosya yolu: `storage/<type>/private/`.  
   - Yanıt `url` değeri: `/private/<type>/<filename>`.
   - Auth: `Authorization: Bearer <JWT>`.
+- `POST /upload/delete`
+  - Auth: `Authorization: Bearer <JWT>` (admin rol).
+  - JSON body: `{ "url": "https://yeniasya.b-cdn.net/kitap/private/..." }` veya `{ "path": "/kitap/private/..." }`
+  - Sadece yönetilen CDN/Bunny path'lerini siler. Eski asset cleanup akışları için kullanılır.
 - `GET /public/:type/:filename`  
   - Direkt erişim, auth yok.
 - `GET /private/:type/:filename`  

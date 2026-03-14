@@ -158,6 +158,11 @@ const BUNNY_SETTINGS = {
   storageZone: process.env.BUNNY_STORAGE_ZONE || "yeniasya",
   accessKey: process.env.BUNNY_ACCESS_KEY || "",
 };
+const CDN_PUBLIC_HOST = String(process.env.CDN_PUBLIC_HOST || "cdn.yeniasyadigital.com")
+  .trim()
+  .replace(/^https?:\/\//i, "")
+  .replace(/\/.*$/, "")
+  .toLowerCase();
 const BUNNY_HTTP_TIMEOUT_MS = Number(process.env.BUNNY_HTTP_TIMEOUT_MS || "20000");
 const BUNNY_HTTP_RETRIES = Number(process.env.BUNNY_HTTP_RETRIES || "1");
 const BUNNY_HTTP_RETRY_BASE_DELAY_MS = Number(
@@ -489,6 +494,86 @@ const bunnyRequest = async (config, { retries = BUNNY_HTTP_RETRIES } = {}) => {
 
 const PUBLIC_TYPES = ["kitap", "gazete", "dergi", "ek", "slider", "profil"];
 const PRIVATE_TYPES = ["kitap", "gazete", "dergi", "ek"];
+const MANAGED_CDN_HOSTS = Array.from(
+  new Set(
+    [BUNNY_SETTINGS.cdnUrl, CDN_PUBLIC_HOST]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean)
+  )
+);
+
+const normalizeManagedFilePath = (value) => String(value || "").replace(/\/{2,}/g, "/");
+
+const decodePathSegment = (value) => {
+  try {
+    return decodeURIComponent(value);
+  } catch (_) {
+    return value;
+  }
+};
+
+const parseManagedFileReference = (input) => {
+  const raw = String(input || "").trim();
+  if (!raw) return null;
+
+  let pathCandidate = raw;
+  if (/^https?:\/\//i.test(raw)) {
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch (_) {
+      return null;
+    }
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    if (!MANAGED_CDN_HOSTS.includes((parsed.host || "").toLowerCase())) return null;
+    pathCandidate = parsed.pathname || "";
+  } else if (/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(:\d+)?\//i.test(raw)) {
+    return parseManagedFileReference(`https://${raw}`);
+  }
+
+  const normalizedPath = normalizeManagedFilePath(
+    pathCandidate.startsWith("/") ? pathCandidate : `/${pathCandidate}`
+  );
+
+  let type;
+  let scope;
+  let filename;
+
+  const directMatch = normalizedPath.match(/^\/([a-z0-9_-]+)\/(public|private)\/([^/]+)$/i);
+  const routedMatch = normalizedPath.match(/^\/(public|private)\/([a-z0-9_-]+)\/([^/]+)$/i);
+  const privateAliasMatch = normalizedPath.match(/^\/private\/([a-z0-9_-]+)\/([^/]+)$/i);
+
+  if (directMatch) {
+    type = directMatch[1].toLowerCase();
+    scope = directMatch[2].toLowerCase();
+    filename = directMatch[3];
+  } else if (routedMatch) {
+    scope = routedMatch[1].toLowerCase();
+    type = routedMatch[2].toLowerCase();
+    filename = routedMatch[3];
+  } else if (privateAliasMatch) {
+    scope = "private";
+    type = privateAliasMatch[1].toLowerCase();
+    filename = privateAliasMatch[2];
+  } else {
+    return null;
+  }
+
+  if (scope === "public" && !PUBLIC_TYPES.includes(type)) return null;
+  if (scope === "private" && !PRIVATE_TYPES.includes(type)) return null;
+
+  const decodedFilename = decodePathSegment(filename);
+  if (!decodedFilename || /[/?#]/.test(decodedFilename)) return null;
+
+  const storagePath = `/${type}/${scope}/${decodedFilename}`;
+  return {
+    type,
+    scope,
+    filename: decodedFilename,
+    storagePath,
+    normalizedUrl: `https://${BUNNY_SETTINGS.cdnUrl}${storagePath}`,
+  };
+};
 
 const parsePrivatePath = (input) => {
   if (!input) return null;
@@ -2403,31 +2488,11 @@ const toSafeUser = (user) => {
 };
 
 const normalizeAvatarUrl = (value) => {
-  const raw = String(value || "").trim();
-  if (!raw) return null;
-
-  const normalizePath = (pathValue) => pathValue.replace(/\/{2,}/g, "/");
-  const isAllowedPath = (pathValue) => /^\/profil\/public\/.+$/i.test(pathValue);
-
-  if (/^https?:\/\//i.test(raw)) {
-    let parsed;
-    try {
-      parsed = new URL(raw);
-    } catch (_) {
-      return null;
-    }
-    if (!["http:", "https:"].includes(parsed.protocol)) return null;
-    if (parsed.host !== BUNNY_SETTINGS.cdnUrl) return null;
-    const normalizedPath = normalizePath(parsed.pathname || "");
-    if (!isAllowedPath(normalizedPath)) return null;
-    return `https://${BUNNY_SETTINGS.cdnUrl}${normalizedPath}`;
+  const parsed = parseManagedFileReference(value);
+  if (!parsed || parsed.type !== "profil" || parsed.scope !== "public") {
+    return null;
   }
-
-  const normalizedPath = raw.startsWith("/")
-    ? normalizePath(raw)
-    : normalizePath(`/${raw}`);
-  if (!isAllowedPath(normalizedPath)) return null;
-  return `https://${BUNNY_SETTINGS.cdnUrl}${normalizedPath}`;
+  return parsed.normalizedUrl;
 };
 
 const updateUserProfileFields = async ({ userId, name, phone }) => {
@@ -3179,7 +3244,7 @@ app.use("/auth/email-verification/request", passwordResetRequestRateLimiter);
 app.use("/auth/email-verification/confirm", passwordResetConfirmRateLimiter);
 app.use("/auth/password-reset/request", passwordResetRequestRateLimiter);
 app.use("/auth/password-reset/confirm", passwordResetConfirmRateLimiter);
-app.use(["/upload/public", "/upload/private"], uploadRateLimiter);
+app.use(["/upload/public", "/upload/private", "/upload/delete"], uploadRateLimiter);
 
 app.post("/auth/register", async (req, res) => {
   const requestId = crypto.randomUUID();
@@ -3567,9 +3632,20 @@ app.put("/auth/me/avatar", requireJwt, async (req, res) => {
       });
     }
 
+    const currentUser = await findUserById(userId);
+    if (!currentUser) {
+      return res.status(404).json({ ok: false, error: "User not found." });
+    }
+    const previousAvatarUrl = normalizeAvatarUrl(currentUser.avatar_url);
     const updated = await updateUserAvatarUrl({ userId, avatarUrl });
     if (!updated) {
       return res.status(404).json({ ok: false, error: "User not found." });
+    }
+
+    if (previousAvatarUrl && previousAvatarUrl !== avatarUrl) {
+      await cleanupManagedBunnyFile(previousAvatarUrl, {
+        logPrefix: `[auth][me][avatar][cleanup] id=${requestId} userId=${userId}`,
+      });
     }
 
     return res.json({ ok: true, user: toSafeUser(updated), requestId });
@@ -3593,9 +3669,20 @@ app.delete("/auth/me/avatar", requireJwt, async (req, res) => {
   }
 
   try {
+    const currentUser = await findUserById(userId);
+    if (!currentUser) {
+      return res.status(404).json({ ok: false, error: "User not found." });
+    }
+    const previousAvatarUrl = normalizeAvatarUrl(currentUser.avatar_url);
     const updated = await updateUserAvatarUrl({ userId, avatarUrl: null });
     if (!updated) {
       return res.status(404).json({ ok: false, error: "User not found." });
+    }
+
+    if (previousAvatarUrl) {
+      await cleanupManagedBunnyFile(previousAvatarUrl, {
+        logPrefix: `[auth][me][avatar-delete][cleanup] id=${requestId} userId=${userId}`,
+      });
     }
 
     return res.json({ ok: true, user: toSafeUser(updated), requestId });
@@ -4187,6 +4274,7 @@ const findUserById = async (userId) => {
           name
           email
           phone
+          avatar_url
           role_id
           payUniqe
         }
@@ -4197,11 +4285,7 @@ const findUserById = async (userId) => {
   return data?.users_by_pk || null;
 };
 
-const ensureNotificationAdminActor = async (req) => {
-  if (req?.hasuraAuthMode === "service") {
-    return { mode: "service", actor: null };
-  }
-
+const ensureAdminJwtActor = async (req) => {
   const jwtPayload = req?.jwt;
   const jwtUserId = extractJwtUserId(jwtPayload);
   if (!jwtUserId) {
@@ -4224,6 +4308,15 @@ const ensureNotificationAdminActor = async (req) => {
     throw err;
   }
 
+  return actor;
+};
+
+const ensureNotificationAdminActor = async (req) => {
+  if (req?.hasuraAuthMode === "service") {
+    return { mode: "service", actor: null };
+  }
+
+  const actor = await ensureAdminJwtActor(req);
   return { mode: "jwt", actor };
 };
 
@@ -5879,6 +5972,49 @@ const uploadToBunny = async (filePath, type, scope, filename) => {
   }
 };
 
+const deleteFromBunny = async (fileReference) => {
+  const parsed =
+    typeof fileReference === "string" ? parseManagedFileReference(fileReference) : fileReference;
+  if (!parsed?.storagePath) {
+    throw new Error("Managed CDN file reference is required.");
+  }
+
+  try {
+    await bunnyRequest(
+      {
+        method: "DELETE",
+        url: parsed.storagePath,
+      },
+      { retries: 0 }
+    );
+    return { deleted: true, ...parsed };
+  } catch (err) {
+    const statusCode = err.response?.status || 500;
+    if (statusCode === 404) {
+      return { deleted: false, ...parsed };
+    }
+    const errorMsg = err.response?.data?.Message || err.response?.data || err.message;
+    console.error(`[BunnyCDN Delete Error] ${statusCode}: ${JSON.stringify(errorMsg)}`);
+    console.error(`[BunnyCDN Delete Details] URL: ${bunnyHttp.defaults.baseURL}${parsed.storagePath}`);
+    throw new Error(`BunnyCDN delete failed (${statusCode}): ${JSON.stringify(errorMsg)}`);
+  }
+};
+
+const cleanupManagedBunnyFile = async (fileReference, { logPrefix = "[bunny][cleanup]" } = {}) => {
+  const parsed =
+    typeof fileReference === "string" ? parseManagedFileReference(fileReference) : fileReference;
+  if (!parsed?.storagePath) {
+    return { skipped: true, deleted: false };
+  }
+
+  try {
+    return await deleteFromBunny(parsed);
+  } catch (err) {
+    console.warn(`${logPrefix} path=${parsed.storagePath} msg=${err?.message || err}`);
+    return { skipped: false, deleted: false, error: err };
+  }
+};
+
 const cleanupTempUpload = async (filePath) => {
   if (!filePath) return;
   try {
@@ -6139,6 +6275,40 @@ app.post("/upload/private", requireJwt, upload.single("file"), async (req, res, 
     next(err);
   } finally {
     await cleanupTempUpload(tempFilePath);
+  }
+});
+
+app.post("/upload/delete", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+
+  try {
+    await ensureAdminJwtActor(req);
+    const parsed = parseManagedFileReference(req.body?.url || req.body?.path);
+    if (!parsed) {
+      return res.status(400).json({
+        ok: false,
+        error: "Managed CDN url/path is required.",
+        requestId,
+      });
+    }
+
+    const result = await deleteFromBunny(parsed);
+    return res.json({
+      ok: true,
+      deleted: result.deleted,
+      type: parsed.type,
+      scope: parsed.scope,
+      path: parsed.storagePath,
+      requestId,
+    });
+  } catch (err) {
+    const statusCode = err?.statusCode || 502;
+    console.error(`[upload][delete][error] id=${requestId} msg=${err?.message || err}`);
+    return res.status(statusCode).json({
+      ok: false,
+      error: statusCode === 403 ? "Admin privileges required." : "Delete failed.",
+      requestId,
+    });
   }
 });
 
