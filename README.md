@@ -96,6 +96,26 @@ psql "$DATABASE_URL" -f scripts/email_verification_tokens_migration.sql
 ```
 - Migration sonrası Hasura'da `email_verification_tokens` tablosunu track edin.
 
+## Kullanıcı Profil Fotoğrafı Kolonu
+- Migration dosyası:
+  `scripts/users_avatar_url_migration.sql`
+- Uygulama:
+```bash
+psql "$DATABASE_URL" -f scripts/users_avatar_url_migration.sql
+```
+- Not:
+  `users.avatar_url` kolonu CDN üzerinde profil fotoğrafı URL'ini tutar.
+
+## İçerik Yayın Durumu Kolonları
+- Migration dosyası:
+  `scripts/content_publication_status_migration.sql`
+- Uygulama:
+```bash
+psql "$DATABASE_URL" -f scripts/content_publication_status_migration.sql
+```
+- Not:
+  `books.is_published` ve `magazine_issue.is_published` alanları public listelerde görünürlüğü kontrol eder; satın alınmış içerik kütüphane tarafında erişilebilir kalır.
+
 ## Endpoint'ler
 - `POST /auth/register`
   - JSON body: `{ "name": "...", "email": "...", "password": "...", "phone": "..." }`
@@ -118,6 +138,20 @@ psql "$DATABASE_URL" -f scripts/email_verification_tokens_migration.sql
   - CDN kısa ömürlü bir `guest` JWT üretir.
   - Bu token yalnızca Hasura'da `guest` rolüne verdiğiniz public izinler kadar erişim sağlamalıdır.
   - Yanıt: `{ ok, user, token, expiresAt }`
+- `GET /auth/me`
+  - Auth: `Authorization: Bearer <JWT>`
+  - Oturumdaki kullanıcının güvenli profil özetini döner.
+- `PATCH /auth/me`
+  - Auth: `Authorization: Bearer <JWT>`
+  - JSON body: `{ "name": "...", "phone": "..." }`
+  - Kullanıcının ad/telefon bilgilerini günceller.
+- `PUT /auth/me/avatar`
+  - Auth: `Authorization: Bearer <JWT>`
+  - JSON body: `{ "avatarUrl": "https://yeniasya.b-cdn.net/profil/public/..." }`
+  - Kullanıcının profil fotoğrafını günceller.
+- `DELETE /auth/me/avatar`
+  - Auth: `Authorization: Bearer <JWT>`
+  - Kullanıcının profil fotoğrafını kaldırır.
 - `POST /auth/email-verification/request`
   - JSON body: `{ "email": "..." }`
   - Güvenlik için kullanıcı kayıtlı olsun ya da olmasın aynı başarılı yanıtı döner.
@@ -147,23 +181,28 @@ psql "$DATABASE_URL" -f scripts/email_verification_tokens_migration.sql
   - Header: `Authorization: Bearer <JWT>`
   - JSON body: `{ "query": "...", "variables": { ... }, "operationName": "..." }`
 - `POST /upload/public`  
-  - Form-data alanları: `file` (foto/pdf), `type` (kitap|gazete|dergi|ek|slider).  
+  - Form-data alanları: `file` (foto/pdf), `type` (kitap|gazete|dergi|ek|slider|profil).  
   - Dosya yolları: `storage/<type>/public/`.
-  - Header: `x-api-key: <AUTH_TOKEN>` veya `Authorization: Bearer <AUTH_TOKEN>`.
+  - Auth: `Authorization: Bearer <JWT>`.
 - `POST /upload/private`  
   - Form-data: `file` ve `type` (kitap|gazete|dergi|ek).  
   - Dosya yolu: `storage/<type>/private/`.  
   - Yanıt `url` değeri: `/private/<type>/<filename>`.
-  - Header: `x-api-key: <AUTH_TOKEN>` veya `Authorization: Bearer <AUTH_TOKEN>`.
+  - Auth: `Authorization: Bearer <JWT>`.
 - `GET /public/:type/:filename`  
   - Direkt erişim, auth yok.
 - `GET /private/:type/:filename`  
-  - Header: `x-api-key: <AUTH_TOKEN>` veya `Authorization: Bearer <AUTH_TOKEN>`.
+  - Auth: `Authorization: Bearer <JWT>` veya `x-api-key: <AUTH_TOKEN>`.
 - `POST /private/view`  
   - JSON body: `{"path": "/private/<type>/<file.pdf>"}` (pdf uzantısı zorunlu).  
-  - Header: `x-api-key: <AUTH_TOKEN>` veya `Authorization: Bearer <AUTH_TOKEN>`.  
+  - Auth: `Authorization: Bearer <JWT>` veya `x-api-key: <AUTH_TOKEN>`.  
   - PDF inline açılır, cache kapalı, frame-ancestors ALLOWED_FRAME_ANCESTORS ile kontrol edilir.
+- `POST /private/view-file`
+  - JSON body: `{"path": "/private/<type>/<file.pdf>"}` (pdf uzantısı zorunlu).
+  - Auth: `Authorization: Bearer <JWT>` veya `x-api-key: <AUTH_TOKEN>`.
+  - Ham PDF byte stream döner; web istemcisi için fallback endpoint olarak kullanılabilir.
 - `GET /private/view-file`
+  - Auth: `Authorization: Bearer <JWT>` veya `x-api-key: <AUTH_TOKEN>`.
   - Base64 viewer (varsayılan kapalı).  
   - Aktif etmek için `ENABLE_BASE64_VIEWER=true` ve opsiyonel `MAX_BASE64_VIEW_BYTES`.
 - `POST /admin/notifications/send`

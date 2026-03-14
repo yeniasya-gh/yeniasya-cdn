@@ -312,7 +312,7 @@ const bunnyRequest = async (config, { retries = BUNNY_HTTP_RETRIES } = {}) => {
   }
 };
 
-const PUBLIC_TYPES = ["kitap", "gazete", "dergi", "ek", "slider"];
+const PUBLIC_TYPES = ["kitap", "gazete", "dergi", "ek", "slider", "profil"];
 const PRIVATE_TYPES = ["kitap", "gazete", "dergi", "ek"];
 
 const parsePrivatePath = (input) => {
@@ -418,6 +418,9 @@ const paths = {
   },
   slider: {
     public: path.join(STORAGE_ROOT, "slider", "public"),
+  },
+  profil: {
+    public: path.join(STORAGE_ROOT, "profil", "public"),
   },
 };
 
@@ -936,7 +939,10 @@ const HOME_BOOTSTRAP_QUERY = `
       description
       created_at
     }
-    books(order_by: {id: desc}) {
+    books(
+      where: {is_published: {_eq: true}},
+      order_by: {id: desc}
+    ) {
       id
       title
       cover_url
@@ -944,6 +950,10 @@ const HOME_BOOTSTRAP_QUERY = `
       discount_price
       description
       min_description
+      category_rel: categoryByCategoryId {
+        id
+        name
+      }
       author_rel: authorByAuthorId {
         id
         name
@@ -1673,6 +1683,7 @@ const getUserByEmailForAuth = async (email) => {
           name
           email
           phone
+          avatar_url
           payUniqe
           role_id
           password
@@ -1684,6 +1695,126 @@ const getUserByEmailForAuth = async (email) => {
     { email }
   );
   return data?.users?.[0] || null;
+};
+
+const getUserByIdForAuth = async (id) => {
+  const data = await hasuraRequest(
+    `
+      query GetUserByIdForAuth($id: bigint!) {
+        users_by_pk(id: $id) {
+          id
+          name
+          email
+          phone
+          avatar_url
+          payUniqe
+          role_id
+          email_verified_at
+          is_active
+        }
+      }
+    `,
+    { id }
+  );
+  return data?.users_by_pk || null;
+};
+
+const toSafeUser = (user) => {
+  if (!user) return null;
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    phone: user.phone,
+    avatar_url: user.avatar_url || null,
+    payUniqe: user.payUniqe,
+    role_id: user.role_id,
+  };
+};
+
+const normalizeAvatarUrl = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+
+  const normalizePath = (pathValue) => pathValue.replace(/\/{2,}/g, "/");
+  const isAllowedPath = (pathValue) => /^\/profil\/public\/.+$/i.test(pathValue);
+
+  if (/^https?:\/\//i.test(raw)) {
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch (_) {
+      return null;
+    }
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    if (parsed.host !== BUNNY_SETTINGS.cdnUrl) return null;
+    const normalizedPath = normalizePath(parsed.pathname || "");
+    if (!isAllowedPath(normalizedPath)) return null;
+    return `https://${BUNNY_SETTINGS.cdnUrl}${normalizedPath}`;
+  }
+
+  const normalizedPath = raw.startsWith("/")
+    ? normalizePath(raw)
+    : normalizePath(`/${raw}`);
+  if (!isAllowedPath(normalizedPath)) return null;
+  return `https://${BUNNY_SETTINGS.cdnUrl}${normalizedPath}`;
+};
+
+const updateUserProfileFields = async ({ userId, name, phone }) => {
+  const data = await hasuraRequest(
+    `
+      mutation UpdateUserProfileFields(
+        $id: bigint!,
+        $name: String!,
+        $phone: String
+      ) {
+        update_users_by_pk(
+          pk_columns: {id: $id},
+          _set: {
+            name: $name,
+            phone: $phone
+          }
+        ) {
+          id
+          name
+          email
+          phone
+          avatar_url
+          payUniqe
+          role_id
+          email_verified_at
+          is_active
+        }
+      }
+    `,
+    { id: userId, name, phone }
+  );
+  return data?.update_users_by_pk || null;
+};
+
+const updateUserAvatarUrl = async ({ userId, avatarUrl }) => {
+  const data = await hasuraRequest(
+    `
+      mutation UpdateUserAvatarUrl($id: bigint!, $avatarUrl: String) {
+        update_users_by_pk(
+          pk_columns: {id: $id},
+          _set: {avatar_url: $avatarUrl}
+        ) {
+          id
+          name
+          email
+          phone
+          avatar_url
+          payUniqe
+          role_id
+          email_verified_at
+          is_active
+        }
+      }
+    `,
+    { id: userId, avatarUrl }
+  );
+  return data?.update_users_by_pk || null;
 };
 
 const getActiveUserByEmail = async (email) => {
@@ -1927,6 +2058,7 @@ const markUserEmailVerified = async (userId, verifiedAt) => {
           name
           email
           phone
+          avatar_url
           payUniqe
           role_id
           email_verified_at
@@ -2437,6 +2569,7 @@ app.post("/auth/register", async (req, res) => {
             name
             email
             phone
+            avatar_url
             payUniqe
             role_id
           }
@@ -2538,6 +2671,7 @@ app.post("/auth/login", async (req, res) => {
       name: user.name,
       email: user.email,
       phone: user.phone,
+      avatar_url: user.avatar_url || null,
       payUniqe: user.payUniqe,
       role_id: user.role_id,
     };
@@ -2589,6 +2723,7 @@ app.post("/auth/social-login", async (req, res) => {
       name: user.name,
       email: user.email,
       phone: user.phone,
+      avatar_url: user.avatar_url || null,
       payUniqe: user.payUniqe,
       role_id: user.role_id,
     };
@@ -2643,6 +2778,7 @@ app.post("/auth/social-register", async (req, res) => {
             name
             email
             phone
+            avatar_url
             payUniqe
             role_id
             email_verified_at
@@ -2685,6 +2821,122 @@ app.post("/auth/social-register", async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: err.message || "Social register failed.",
+    });
+  }
+});
+
+app.get("/auth/me", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: "Invalid user token." });
+  }
+
+  try {
+    const user = await getUserByIdForAuth(userId);
+    if (!user || user.is_active === false) {
+      return res.status(404).json({ ok: false, error: "User not found." });
+    }
+    return res.json({ ok: true, user: toSafeUser(user), requestId });
+  } catch (err) {
+    console.error(`[auth][me][error] id=${requestId} userId=${userId} msg=${err.message}`);
+    return res.status(500).json({ ok: false, error: "User fetch failed.", requestId });
+  }
+});
+
+app.patch("/auth/me", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: "Invalid user token." });
+  }
+
+  try {
+    const name = String(req.body?.name || "").trim();
+    const phoneRaw = req.body?.phone;
+    const phone =
+      phoneRaw === undefined || phoneRaw === null || String(phoneRaw).trim() === ""
+        ? null
+        : String(phoneRaw).trim();
+
+    if (!name) {
+      return res.status(400).json({ ok: false, error: "name is required." });
+    }
+
+    const updated = await updateUserProfileFields({ userId, name, phone });
+    if (!updated) {
+      return res.status(404).json({ ok: false, error: "User not found." });
+    }
+
+    return res.json({ ok: true, user: toSafeUser(updated), requestId });
+  } catch (err) {
+    console.error(
+      `[auth][me][update][error] id=${requestId} userId=${userId} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Profile update failed.",
+      requestId,
+    });
+  }
+});
+
+app.put("/auth/me/avatar", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: "Invalid user token." });
+  }
+
+  try {
+    const avatarUrl = normalizeAvatarUrl(req.body?.avatarUrl || req.body?.avatar_url);
+    if (!avatarUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: "avatarUrl must be a valid /profil/public URL.",
+      });
+    }
+
+    const updated = await updateUserAvatarUrl({ userId, avatarUrl });
+    if (!updated) {
+      return res.status(404).json({ ok: false, error: "User not found." });
+    }
+
+    return res.json({ ok: true, user: toSafeUser(updated), requestId });
+  } catch (err) {
+    console.error(
+      `[auth][me][avatar][error] id=${requestId} userId=${userId} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Avatar update failed.",
+      requestId,
+    });
+  }
+});
+
+app.delete("/auth/me/avatar", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: "Invalid user token." });
+  }
+
+  try {
+    const updated = await updateUserAvatarUrl({ userId, avatarUrl: null });
+    if (!updated) {
+      return res.status(404).json({ ok: false, error: "User not found." });
+    }
+
+    return res.json({ ok: true, user: toSafeUser(updated), requestId });
+  } catch (err) {
+    console.error(
+      `[auth][me][avatar-delete][error] id=${requestId} userId=${userId} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Avatar remove failed.",
+      requestId,
     });
   }
 });
@@ -5134,7 +5386,86 @@ app.get("/public/:type/:filename", (req, res) => {
   return res.redirect(cdnUrl);
 });
 
-app.get("/private/:type/:filename", requireAuth, async (req, res) => {
+const buildPrivatePdfHeaders = (filename, options = {}) => {
+  const headers = {
+    "Content-Type": "application/pdf",
+    "Cache-Control": "no-store, no-cache, must-revalidate, private",
+    Pragma: "no-cache",
+    "X-Content-Type-Options": "nosniff",
+  };
+
+  if (filename) {
+    headers["Content-Disposition"] = `inline; filename="${sanitizeFilename(path.basename(String(filename)))}"`;
+  }
+
+  if (options.withFrameAncestors) {
+    headers["Content-Security-Policy"] = `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`;
+  }
+
+  return headers;
+};
+
+const streamPrivatePdfFromPath = async ({
+  req,
+  res,
+  route,
+  action,
+  rawPath,
+  headers,
+  successMessage,
+}) => {
+  const parsed = parsePrivatePath(rawPath);
+  if (!parsed) {
+    logPdfRequest({
+      req,
+      scope: "private",
+      route,
+      action,
+      filename: rawPath,
+      status: 400,
+      outcome: "error",
+      message: "Invalid path format.",
+    });
+    res.status(400).json({
+      ok: false,
+      error: "path must be like /private/<type>/<file.pdf>",
+    });
+    return;
+  }
+
+  const logBase = {
+    req,
+    scope: "private",
+    route,
+    action,
+    type: parsed.type,
+    filename: parsed.filename,
+  };
+
+  try {
+    const bunnyResponse = await fetchStreamFromBunny(parsed.type, "private", parsed.filename);
+    await pipeBunnyStreamToResponse({
+      req,
+      res,
+      bunnyResponse,
+      logBase,
+      headers,
+      successMessage,
+    });
+  } catch (err) {
+    logPdfRequest({
+      ...logBase,
+      status: err.message.includes("404") ? 404 : 500,
+      outcome: "error",
+      message: "Fetch from BunnyCDN failed.",
+      error: err,
+    });
+    const status = err.message.includes("404") ? 404 : 500;
+    res.status(status).json({ ok: false, error: "File not found or fetch failed." });
+  }
+};
+
+app.get("/private/:type/:filename", requireJwtOrServiceAuth, async (req, res) => {
   const type = (req.params.type || "").toLowerCase();
   if (!PRIVATE_TYPES.includes(type)) {
     logPdfRequest({
@@ -5185,66 +5516,33 @@ app.get("/private/:type/:filename", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/private/view", requireJwt, async (req, res) => {
+app.post("/private/view", requireJwtOrServiceAuth, async (req, res) => {
   const rawPath = req.body?.path || req.body?.pdf || req.body?.file;
-  const parsed = parsePrivatePath(rawPath);
-  if (!parsed) {
-    logPdfRequest({
-      req,
-      scope: "private",
-      route: "/private/view",
-      action: "view-inline",
-      filename: rawPath,
-      status: 400,
-      outcome: "error",
-      message: "Invalid path format.",
-    });
-    return res.status(400).json({
-      ok: false,
-      error: "path must be like /private/<type>/<file.pdf>",
-    });
-  }
-
-  const logBase = {
+  await streamPrivatePdfFromPath({
     req,
-    scope: "private",
+    res,
     route: "/private/view",
     action: "view-inline",
-    type: parsed.type,
-    filename: parsed.filename,
-  };
-
-  try {
-    const bunnyResponse = await fetchStreamFromBunny(parsed.type, "private", parsed.filename);
-    await pipeBunnyStreamToResponse({
-      req,
-      res,
-      bunnyResponse,
-      logBase,
-      headers: {
-        "Content-Type": "application/pdf",
-        "Content-Disposition": `inline; filename="${sanitizeFilename(parsed.filename)}"`,
-        "Cache-Control": "no-store, no-cache, must-revalidate, private",
-        Pragma: "no-cache",
-        "X-Content-Type-Options": "nosniff",
-        "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
-      },
-      successMessage: "Inline PDF served from BunnyCDN.",
-    });
-  } catch (err) {
-    logPdfRequest({
-      ...logBase,
-      status: err.message.includes("404") ? 404 : 500,
-      outcome: "error",
-      message: "Fetch from BunnyCDN failed.",
-      error: err,
-    });
-    const status = err.message.includes("404") ? 404 : 500;
-    res.status(status).json({ ok: false, error: "File not found or fetch failed." });
-  }
+    rawPath,
+    headers: buildPrivatePdfHeaders(rawPath, { withFrameAncestors: true }),
+    successMessage: "Inline PDF served from BunnyCDN.",
+  });
 });
 
-app.get("/private/view-file", requireAuth, async (req, res) => {
+app.post("/private/view-file", requireJwtOrServiceAuth, async (req, res) => {
+  const rawPath = req.body?.path || req.body?.pdf || req.body?.file;
+  await streamPrivatePdfFromPath({
+    req,
+    res,
+    route: "/private/view-file",
+    action: "view-file-raw",
+    rawPath,
+    headers: buildPrivatePdfHeaders(rawPath),
+    successMessage: "Raw PDF served from BunnyCDN.",
+  });
+});
+
+app.get("/private/view-file", requireJwtOrServiceAuth, async (req, res) => {
   if (!ENABLE_BASE64_VIEWER) {
     return res.status(404).json({ ok: false, error: "Not found." });
   }
