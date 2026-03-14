@@ -1010,12 +1010,22 @@ app.get("/home/bootstrap", async (req, res) => {
     );
     return res.json({ ok: true, cache, data });
   } catch (err) {
-    console.error(
-      `[home][bootstrap][error] id=${requestId} ip=${req.ip} msg=${err.message}`
-    );
+    const payload = await logHomeServerError({
+      req,
+      requestId,
+      section: "bootstrap",
+      err,
+    });
     return res.status(503).json({
       ok: false,
       error: "Home bootstrap unavailable.",
+      code: payload.code,
+      requestId,
+      details: {
+        message: payload.message,
+        hint: payload.hint,
+        driverCode: payload.driverCode,
+      },
     });
   }
 });
@@ -1034,12 +1044,22 @@ const sendHomeSectionResponse = async (req, res, key) => {
     );
     return res.json({ ok: true, cache, data });
   } catch (err) {
-    console.error(
-      `[home][${key}][error] id=${requestId} ip=${req.ip} msg=${err.message}`
-    );
+    const payload = await logHomeServerError({
+      req,
+      requestId,
+      section: key,
+      err,
+    });
     return res.status(503).json({
       ok: false,
       error: `${key} unavailable.`,
+      code: payload.code,
+      requestId,
+      details: {
+        message: payload.message,
+        hint: payload.hint,
+        driverCode: payload.driverCode,
+      },
     });
   }
 };
@@ -1105,6 +1125,150 @@ const hasuraRequest = async (query, variables = {}, options = {}) => {
   }
 
   return response.data?.data;
+};
+
+const HOME_ERROR_HINTS = {
+  HOME_DB_CONFIG_MISSING:
+    "HOME_POSTGRES_URL veya HOME_POSTGRES_HOST/PORT/DATABASE/USER/PASSWORD env değerlerini kontrol edin.",
+  HOME_DB_AUTH_FAILED:
+    "Postgres kullanıcı adı/şifre bilgisini kontrol edin.",
+  HOME_DB_UNREACHABLE:
+    "Postgres host/port, firewall ve ağ erişimini kontrol edin.",
+  HOME_DB_SSL_REQUIRED:
+    "Postgres SSL ayarlarını HOME_POSTGRES_SSL ve HOME_POSTGRES_SSL_REJECT_UNAUTHORIZED ile doğrulayın.",
+  HOME_DB_TIMEOUT:
+    "DB erişimi veya sorgu süresi aşılıyor; ağ ve query timeout ayarlarını kontrol edin.",
+  HOME_DB_QUERY_FAILED:
+    "SQL tarafında tablo/kolon adı veya izin problemi olabilir.",
+};
+
+const classifyHomeError = (err) => {
+  const message = String(err?.message || err || "").trim();
+  const code = String(err?.code || "").trim();
+  const lower = message.toLowerCase();
+
+  if (message.includes("Home Postgres configuration missing")) {
+    return {
+      code: "HOME_DB_CONFIG_MISSING",
+      message: "Home database configuration missing.",
+      hint: HOME_ERROR_HINTS.HOME_DB_CONFIG_MISSING,
+    };
+  }
+
+  if (["28P01", "28000"].includes(code) || lower.includes("password authentication failed")) {
+    return {
+      code: "HOME_DB_AUTH_FAILED",
+      message: "Home database authentication failed.",
+      hint: HOME_ERROR_HINTS.HOME_DB_AUTH_FAILED,
+    };
+  }
+
+  if (
+    ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "57P03"].includes(code) ||
+    lower.includes("connect econnrefused") ||
+    lower.includes("getaddrinfo") ||
+    lower.includes("could not connect") ||
+    lower.includes("connection terminated unexpectedly")
+  ) {
+    return {
+      code: "HOME_DB_UNREACHABLE",
+      message: "Home database is unreachable.",
+      hint: HOME_ERROR_HINTS.HOME_DB_UNREACHABLE,
+    };
+  }
+
+  if (
+    code === "ETIMEDOUT" ||
+    lower.includes("timeout") ||
+    lower.includes("statement timeout") ||
+    lower.includes("query read timeout")
+  ) {
+    return {
+      code: "HOME_DB_TIMEOUT",
+      message: "Home database request timed out.",
+      hint: HOME_ERROR_HINTS.HOME_DB_TIMEOUT,
+    };
+  }
+
+  if (
+    lower.includes("ssl") ||
+    lower.includes("self signed certificate") ||
+    lower.includes("no pg_hba.conf entry")
+  ) {
+    return {
+      code: "HOME_DB_SSL_REQUIRED",
+      message: "Home database SSL configuration failed.",
+      hint: HOME_ERROR_HINTS.HOME_DB_SSL_REQUIRED,
+    };
+  }
+
+  return {
+    code: "HOME_DB_QUERY_FAILED",
+    message: "Home database query failed.",
+    hint: HOME_ERROR_HINTS.HOME_DB_QUERY_FAILED,
+  };
+};
+
+const buildHomeErrorPayload = ({ req, requestId, section, err }) => {
+  const classification = classifyHomeError(err);
+  return {
+    requestId,
+    section,
+    code: classification.code,
+    message: classification.message,
+    hint: classification.hint,
+    driverCode: err?.code || null,
+    detail:
+      err?.detail || err?.severity || err?.routine || err?.where || err?.schema || null,
+    path: sanitizeUrlForLog(req?.originalUrl || req?.url),
+    ip: req?.ip || null,
+    method: req?.method || null,
+    postgresConfig: {
+      hasConnectionString: !!String(HOME_POSTGRES_URL || "").trim(),
+      hasHost: !!String(HOME_POSTGRES_HOST || "").trim(),
+      hasDatabase: !!String(HOME_POSTGRES_DATABASE || "").trim(),
+      hasUser: !!String(HOME_POSTGRES_USER || "").trim(),
+      sslEnabled: isHomePostgresSslEnabled(),
+      sslRejectUnauthorized: HOME_POSTGRES_SSL_REJECT_UNAUTHORIZED,
+      poolMax: HOME_POSTGRES_POOL_MAX,
+      queryTimeoutMs: HOME_POSTGRES_QUERY_TIMEOUT_MS,
+    },
+  };
+};
+
+const logHomeServerError = async ({ req, requestId, section, err }) => {
+  const payload = buildHomeErrorPayload({ req, requestId, section, err });
+  const line = `[home][${section}][error] ${JSON.stringify(payload)}`;
+  if (err?.stack) {
+    console.error(line, err.stack);
+  } else {
+    console.error(line);
+  }
+
+  try {
+    await hasuraRequest(
+      `
+        mutation LogServerHomeError($input: app_error_logs_insert_input!) {
+          insert_app_error_logs_one(object: $input) { id }
+        }
+      `,
+      {
+        input: {
+          service: "CDN/HomeService",
+          operation: section,
+          message: payload.message,
+          stack_trace: err?.stack || null,
+          payload,
+        },
+      }
+    );
+  } catch (logErr) {
+    console.error(
+      `[home][${section}][app_error_logs_failed] requestId=${requestId} msg=${logErr?.message || logErr}`
+    );
+  }
+
+  return payload;
 };
 
 const HOME_SECTION_KEYS = [

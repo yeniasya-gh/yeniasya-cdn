@@ -153,6 +153,7 @@ psql "$DATABASE_URL" -f scripts/content_publication_status_migration.sql
 - `GET /home/bootstrap`
   - Anasayfa bootstrap verisini direkt Postgres'ten toplu döner.
   - Yanıt: `{ ok, cache, data: { sliders, magazines, books, newspapers, attachments, homeBookEntries, homeMagazineEntries } }`
+  - Hata durumunda `503` ve `{ ok, error, code, requestId, details }` döner.
 - `GET /home/sliders`
 - `GET /home/magazines`
 - `GET /home/books`
@@ -162,6 +163,7 @@ psql "$DATABASE_URL" -f scripts/content_publication_status_migration.sql
 - `GET /home/showcase/magazines`
   - Anasayfa fallback yüklemeleri için section bazlı endpointlerdir.
   - Hepsi direkt Postgres'ten okunur ve `{ ok, cache, data: [...] }` döner.
+  - Hata durumunda `requestId` ile birlikte daha açıklayıcı `code/details` alanları döner ve sunucu `app_error_logs` tablosuna da kayıt düşmeye çalışır.
 - `GET /auth/me`
   - Auth: `Authorization: Bearer <JWT>`
   - Oturumdaki kullanıcının güvenli profil özetini döner.
