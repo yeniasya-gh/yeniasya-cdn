@@ -20,10 +20,10 @@ cp .env.example .env
 # (acil geçici bypass için false yapılabilir, önerilmez)
 # MAIL_API_TOKEN=...
 # Şifre sıfırlama linki:
-# PASSWORD_RESET_WEB_URL=https://cdn.yeniasyadigital.com/sifre-sifirla
+# PASSWORD_RESET_WEB_URL=https://cdn.yeniasyadijital.com/sifre-sifirla
 # PASSWORD_RESET_TOKEN_TTL_MINUTES=30
 # Hesap aktivasyon linki:
-# EMAIL_VERIFICATION_WEB_URL=https://yeniasyadigital.com/hesap-aktivasyon
+# EMAIL_VERIFICATION_WEB_URL=https://yeniasyadijital.com/hesap-aktivasyon
 # EMAIL_VERIFICATION_TOKEN_TTL_MINUTES=60
 # PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX=8
 # PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX=10
@@ -69,7 +69,7 @@ cp .env.example .env
 # BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS=15000
 # BUNNY_STREAM_IDLE_TIMEOUT_MS=30000
 # BUNNY_DEBUG=true
-# CDN_PUBLIC_HOST=cdn.yeniasyadigital.com
+# CDN_PUBLIC_HOST=cdn.yeniasyadijital.com
 ```
 3) Bağımlılıklar:
 ```bash
@@ -165,6 +165,11 @@ psql "$DATABASE_URL" -f scripts/content_publication_status_migration.sql
   - Anasayfa fallback yüklemeleri için section bazlı endpointlerdir.
   - Hepsi direkt Postgres'ten okunur ve `{ ok, cache, data: [...] }` döner.
   - Hata durumunda `requestId` ile birlikte daha açıklayıcı `code/details` alanları döner ve sunucu `app_error_logs` tablosuna da kayıt düşmeye çalışır.
+- `GET /app/feature-flags?id=1|2`
+  - Mobil uygulamanın sürüme göre gazete/dergi görünürlüğünü belirleyen `app_feature_flags` kaydını direkt Postgres'ten döner.
+  - `id=1` Android, `id=2` iOS için kullanılır.
+  - Yanıt: `{ ok, cache, data: { id, version, hide_magazines, hide_newspapers } | null }`
+  - Hata durumunda `503` ve `{ ok, error, code, requestId, details }` döner; sunucu ayrıca `app_error_logs` tablosuna kayıt düşmeye çalışır.
 - `GET /auth/me`
   - Auth: `Authorization: Bearer <JWT>`
   - Oturumdaki kullanıcının güvenli profil özetini döner.
@@ -272,7 +277,7 @@ psql "$DATABASE_URL" -f scripts/content_publication_status_migration.sql
 - İzin verilen MIME: `application/pdf`, `image/jpeg`, `image/png`, `image/webp`.
 - 50MB üstü dosyalar reddedilir.
 - Private dosyalar `storage/<type>/private` dizinlerine yazılır.
-- CORS: `.env` içinde `ALLOWED_ORIGINS` (örn. `http://localhost:3000,https://cdn.yeniasyadigital.com`) ve `ALLOWED_HEADERS` (varsayılan `content-type,x-api-key,authorization,x-mail-token`).
+- CORS: `.env` içinde `ALLOWED_ORIGINS` (örn. `http://localhost:3000,https://cdn.yeniasyadijital.com`) ve `ALLOWED_HEADERS` (varsayılan `content-type,x-api-key,authorization,x-mail-token`).
 - Frame koruması: `.env` içinde `ALLOWED_FRAME_ANCESTORS` ile whitelist belirleyin.
 - Ödeme test endpoint'i sadece `NODE_ENV=development` iken çalışır ve `TEST_MERCHANT`, `TEST_MERCHANTUSER`, `TEST_MERCHANTPASSWORD`, `TEST_RETURNURL` ister.
 

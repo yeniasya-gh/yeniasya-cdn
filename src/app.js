@@ -115,10 +115,10 @@ const MAIL_SETTINGS = {
 };
 const PASSWORD_RESET_WEB_URL =
   process.env.PASSWORD_RESET_WEB_URL ||
-  "https://cdn.yeniasyadigital.com/sifre-sifirla";
+  "https://cdn.yeniasyadijital.com/sifre-sifirla";
 const EMAIL_VERIFICATION_WEB_URL =
   process.env.EMAIL_VERIFICATION_WEB_URL ||
-  "https://yeniasyadigital.com/hesap-aktivasyon";
+  "https://yeniasyadijital.com/hesap-aktivasyon";
 const MAIL_TLS_SERVERNAME = (process.env.MAIL_TLS_SERVERNAME || "")
   .trim()
   .replace(/\.$/, "");
@@ -158,7 +158,7 @@ const BUNNY_SETTINGS = {
   storageZone: process.env.BUNNY_STORAGE_ZONE || "yeniasya",
   accessKey: process.env.BUNNY_ACCESS_KEY || "",
 };
-const CDN_PUBLIC_HOST = String(process.env.CDN_PUBLIC_HOST || "cdn.yeniasyadigital.com")
+const CDN_PUBLIC_HOST = String(process.env.CDN_PUBLIC_HOST || "cdn.yeniasyadijital.com")
   .trim()
   .replace(/^https?:\/\//i, "")
   .replace(/\/.*$/, "")
@@ -1213,6 +1213,50 @@ app.get("/home/showcase/magazines", async (req, res) =>
   sendHomeSectionResponse(req, res, "homeMagazineEntries")
 );
 
+app.get("/app/feature-flags", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const flagId = Number(req.query.id || "");
+  if (!Number.isInteger(flagId) || flagId <= 0) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid feature flag id.",
+      code: "APP_FEATURE_FLAGS_INVALID_ID",
+    });
+  }
+
+  try {
+    const { data, cache } = await getCachedAppFeatureFlags(flagId);
+    const maxAgeSeconds = Math.max(
+      1,
+      Math.floor(APP_FEATURE_FLAGS_CACHE_TTL_MS / 1000)
+    );
+    res.set(
+      "Cache-Control",
+      `public, max-age=${maxAgeSeconds}, stale-while-revalidate=300`
+    );
+    return res.json({ ok: true, cache, data });
+  } catch (err) {
+    const payload = await logHomeServerError({
+      req,
+      requestId,
+      section: "appFeatureFlags",
+      err,
+      serviceLabel: "CDN/AppFeatureFlags",
+    });
+    return res.status(503).json({
+      ok: false,
+      error: "App feature flags unavailable.",
+      code: payload.code,
+      requestId,
+      details: {
+        message: payload.message,
+        hint: payload.hint,
+        driverCode: payload.driverCode,
+      },
+    });
+  }
+});
+
 const buildCorsHeaders = (req) => {
   const requestOrigin = req.get("origin");
   const originAllowed =
@@ -1363,7 +1407,13 @@ const buildHomeErrorPayload = ({ req, requestId, section, err }) => {
   };
 };
 
-const logHomeServerError = async ({ req, requestId, section, err }) => {
+const logHomeServerError = async ({
+  req,
+  requestId,
+  section,
+  err,
+  serviceLabel = "CDN/HomeService",
+}) => {
   const payload = buildHomeErrorPayload({ req, requestId, section, err });
   const line = `[home][${section}][error] ${JSON.stringify(payload)}`;
   if (err?.stack) {
@@ -1381,7 +1431,7 @@ const logHomeServerError = async ({ req, requestId, section, err }) => {
       `,
       {
         input: {
-          service: "CDN/HomeService",
+          service: serviceLabel,
           operation: section,
           message: payload.message,
           stack_trace: err?.stack || null,
@@ -1396,6 +1446,76 @@ const logHomeServerError = async ({ req, requestId, section, err }) => {
   }
 
   return payload;
+};
+
+const APP_FEATURE_FLAGS_CACHE_TTL_MS_RAW = Number(
+  process.env.APP_FEATURE_FLAGS_CACHE_TTL_MS || "60000"
+);
+const APP_FEATURE_FLAGS_CACHE_TTL_MS =
+  Number.isFinite(APP_FEATURE_FLAGS_CACHE_TTL_MS_RAW) &&
+  APP_FEATURE_FLAGS_CACHE_TTL_MS_RAW > 0
+    ? APP_FEATURE_FLAGS_CACHE_TTL_MS_RAW
+    : 60000;
+
+const appFeatureFlagsCache = new Map();
+
+const appFeatureFlagsSql = `
+  SELECT
+    id::int AS id,
+    version,
+    hide_magazines,
+    hide_newspapers
+  FROM public.app_feature_flags
+  WHERE id = $1
+  LIMIT 1
+`;
+
+const clonePlainObject = (value) =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? { ...value }
+    : null;
+
+const getCachedAppFeatureFlags = async (id) => {
+  const key = Number(id);
+  if (!Number.isInteger(key) || key <= 0) {
+    throw new Error("Invalid app feature flags id.");
+  }
+
+  const existing =
+    appFeatureFlagsCache.get(key) || {
+      value: null,
+      expiresAt: 0,
+      inflight: null,
+    };
+  appFeatureFlagsCache.set(key, existing);
+
+  const now = Date.now();
+  if (existing.value && existing.expiresAt > now) {
+    return { data: clonePlainObject(existing.value), cache: "hit" };
+  }
+
+  if (!existing.inflight) {
+    existing.inflight = homePostgresQuery(appFeatureFlagsSql, [key])
+      .then((rows) => {
+        const row = rows[0] ? clonePlainObject(rows[0]) : null;
+        existing.value = row;
+        existing.expiresAt = Date.now() + APP_FEATURE_FLAGS_CACHE_TTL_MS;
+        return row;
+      })
+      .finally(() => {
+        existing.inflight = null;
+      });
+  }
+
+  try {
+    const data = await existing.inflight;
+    return { data: clonePlainObject(data), cache: "miss" };
+  } catch (err) {
+    if (existing.value) {
+      return { data: clonePlainObject(existing.value), cache: "stale" };
+    }
+    throw err;
+  }
 };
 
 const HOME_SECTION_KEYS = [
@@ -7254,9 +7374,9 @@ app.all("/payment/return", (req, res) => {
       const isLocalhost =
         host === "localhost" || host === "127.0.0.1" || host === "::1";
       const isTrustedHost =
-        host === "yeniasyadigital.com" ||
-        host === "www.yeniasyadigital.com" ||
-        host === "cdn.yeniasyadigital.com";
+        host === "yeniasyadijital.com" ||
+        host === "www.yeniasyadijital.com" ||
+        host === "cdn.yeniasyadijital.com";
       if (!isLocalhost && !isTrustedHost) {
         return null;
       }
