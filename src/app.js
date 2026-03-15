@@ -1538,6 +1538,27 @@ const homeSectionCaches = Object.fromEntries(
   HOME_SECTION_KEYS.map((key) => [key, createHomeSectionCacheEntry()])
 );
 
+const HOME_MAGAZINE_DESCRIPTION_PREVIEW_LENGTH = 220;
+const HOME_ATTACHMENT_DESCRIPTION_PREVIEW_LENGTH = 180;
+
+const buildHomePreviewSql = (columnRef, maxLength) => `
+  CASE
+    WHEN ${columnRef} IS NULL THEN NULL
+    WHEN length(trim(${columnRef})) <= ${maxLength} THEN trim(${columnRef})
+    ELSE rtrim(substr(trim(${columnRef}), 1, ${maxLength - 3})) || '...'
+  END
+`;
+
+const homeMagazineDescriptionPreviewSql = buildHomePreviewSql(
+  "m.description",
+  HOME_MAGAZINE_DESCRIPTION_PREVIEW_LENGTH
+);
+
+const homeAttachmentDescriptionPreviewSql = buildHomePreviewSql(
+  "e.aciklama",
+  HOME_ATTACHMENT_DESCRIPTION_PREVIEW_LENGTH
+);
+
 const homeBooksSql = `
   SELECT
     b.id,
@@ -1545,7 +1566,6 @@ const homeBooksSql = `
     b.cover_url,
     b.price,
     b.discount_price,
-    b.description,
     b.min_description,
     CASE
       WHEN c.id IS NULL THEN NULL
@@ -1564,39 +1584,36 @@ const homeBooksSql = `
 
 const homeMagazinesSql = `
   SELECT
-    id,
-    name,
-    category,
-    cover_image_url,
-    period,
-    description,
-    created_at
-  FROM public.magazine
-  ORDER BY id DESC
+    m.id,
+    m.name,
+    m.category,
+    m.cover_image_url,
+    m.period,
+    ${homeMagazineDescriptionPreviewSql} AS description
+  FROM public.magazine AS m
+  ORDER BY m.id DESC
 `;
 
 const homeNewspapersSql = `
   SELECT
     id,
     image_url,
-    publish_date,
-    created_at
+    publish_date
   FROM public.newspaper
   ORDER BY publish_date DESC
 `;
 
 const homeAttachmentsSql = `
   SELECT
-    id,
-    ad,
-    aciklama,
-    fiyat,
-    pdf_url,
-    photo_url,
-    is_public,
-    created_at
-  FROM public.ekler
-  ORDER BY created_at DESC
+    e.id,
+    e.ad,
+    ${homeAttachmentDescriptionPreviewSql} AS aciklama,
+    e.fiyat,
+    e.pdf_url,
+    e.photo_url,
+    e.is_public
+  FROM public.ekler AS e
+  ORDER BY e.created_at DESC
 `;
 
 const homeSlidersSql = `
@@ -1606,11 +1623,7 @@ const homeSlidersSql = `
     subtitle,
     description,
     image_url,
-    link_url,
-    sort_order,
-    is_active,
-    created_at,
-    updated_at
+    link_url
   FROM public.slider
   WHERE is_active = TRUE
   ORDER BY sort_order ASC NULLS LAST, created_at DESC
