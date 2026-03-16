@@ -1257,6 +1257,50 @@ app.get("/app/feature-flags", async (req, res) => {
   }
 });
 
+app.get("/magazines/:id/issues/public", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const magazineId = Number.parseInt(req.params.id, 10);
+  if (!Number.isInteger(magazineId) || magazineId <= 0) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid magazine id.",
+      code: "MAGAZINE_PUBLIC_ISSUES_INVALID_ID",
+    });
+  }
+
+  try {
+    const { data, cache } = await getCachedPublicMagazineIssues(magazineId);
+    const maxAgeSeconds = Math.max(
+      1,
+      Math.floor(MAGAZINE_PUBLIC_ISSUES_CACHE_TTL_MS / 1000)
+    );
+    res.set(
+      "Cache-Control",
+      `public, max-age=${maxAgeSeconds}, stale-while-revalidate=300`
+    );
+    return res.json({ ok: true, cache, data });
+  } catch (err) {
+    const payload = await logHomeServerError({
+      req,
+      requestId,
+      section: "magazinePublicIssues",
+      err,
+      serviceLabel: "CDN/MagazineIssues",
+    });
+    return res.status(503).json({
+      ok: false,
+      error: "Magazine issues unavailable.",
+      code: payload.code,
+      requestId,
+      details: {
+        message: payload.message,
+        hint: payload.hint,
+        driverCode: payload.driverCode,
+      },
+    });
+  }
+});
+
 const buildCorsHeaders = (req) => {
   const requestOrigin = req.get("origin");
   const originAllowed =
@@ -1456,8 +1500,19 @@ const APP_FEATURE_FLAGS_CACHE_TTL_MS =
   APP_FEATURE_FLAGS_CACHE_TTL_MS_RAW > 0
     ? APP_FEATURE_FLAGS_CACHE_TTL_MS_RAW
     : 60000;
+const MAGAZINE_PUBLIC_ISSUES_CACHE_TTL_MS_RAW = Number(
+  process.env.MAGAZINE_PUBLIC_ISSUES_CACHE_TTL_MS ||
+    process.env.HOME_BOOTSTRAP_CACHE_TTL_MS ||
+    "60000"
+);
+const MAGAZINE_PUBLIC_ISSUES_CACHE_TTL_MS =
+  Number.isFinite(MAGAZINE_PUBLIC_ISSUES_CACHE_TTL_MS_RAW) &&
+  MAGAZINE_PUBLIC_ISSUES_CACHE_TTL_MS_RAW > 0
+    ? MAGAZINE_PUBLIC_ISSUES_CACHE_TTL_MS_RAW
+    : 60000;
 
 const appFeatureFlagsCache = new Map();
+const magazinePublicIssuesCache = new Map();
 
 const appFeatureFlagsSql = `
   SELECT
@@ -1474,6 +1529,13 @@ const clonePlainObject = (value) =>
   value && typeof value === "object" && !Array.isArray(value)
     ? { ...value }
     : null;
+
+const cloneMagazinePublicIssues = (value) =>
+  Array.isArray(value)
+    ? value.map((item) =>
+        item && typeof item === "object" && !Array.isArray(item) ? { ...item } : item
+      )
+    : [];
 
 const getCachedAppFeatureFlags = async (id) => {
   const key = Number(id);
@@ -1513,6 +1575,110 @@ const getCachedAppFeatureFlags = async (id) => {
   } catch (err) {
     if (existing.value) {
       return { data: clonePlainObject(existing.value), cache: "stale" };
+    }
+    throw err;
+  }
+};
+
+const magazinePublicIssuesSql = `
+  SELECT
+    id::int AS id,
+    magazine_id::int AS magazine_id,
+    issue_number::int AS issue_number,
+    photo_url,
+    price,
+    description,
+    added_at,
+    EXTRACT(YEAR FROM added_at)::int AS publish_year
+  FROM public.magazine_issue
+  WHERE magazine_id = $1
+    AND COALESCE(is_published, TRUE) = TRUE
+  ORDER BY issue_number DESC NULLS LAST, added_at DESC NULLS LAST, id DESC
+`;
+
+const loadPublicMagazineIssuesFromHasura = async (magazineId) => {
+  const data = await hasuraRequest(
+    `
+      query GetPublicMagazineIssues($magazine_id: Int!) {
+        magazine_issue(
+          where: {
+            magazine_id: {_eq: $magazine_id}
+            is_published: {_eq: true}
+          }
+          order_by: {issue_number: desc}
+        ) {
+          id
+          magazine_id
+          issue_number
+          photo_url
+          price
+          description
+          added_at
+        }
+      }
+    `,
+    { magazine_id: magazineId },
+    { timeout: HOME_BOOTSTRAP_HASURA_TIMEOUT_MS }
+  );
+  return cloneMagazinePublicIssues(data?.magazine_issue);
+};
+
+const loadPublicMagazineIssues = async (magazineId) => {
+  try {
+    const rows = await homePostgresQuery(magazinePublicIssuesSql, [magazineId]);
+    return cloneMagazinePublicIssues(rows);
+  } catch (primaryError) {
+    try {
+      return await loadPublicMagazineIssuesFromHasura(magazineId);
+    } catch (fallbackError) {
+      if (!fallbackError.code && primaryError?.code) {
+        fallbackError.code = primaryError.code;
+      }
+      if (!fallbackError.detail && primaryError?.detail) {
+        fallbackError.detail = primaryError.detail;
+      }
+      throw fallbackError;
+    }
+  }
+};
+
+const getCachedPublicMagazineIssues = async (magazineId) => {
+  const key = Number.parseInt(String(magazineId), 10);
+  if (!Number.isInteger(key) || key <= 0) {
+    throw new Error("Invalid magazine id.");
+  }
+
+  const existing =
+    magazinePublicIssuesCache.get(key) || {
+      value: null,
+      expiresAt: 0,
+      inflight: null,
+    };
+  magazinePublicIssuesCache.set(key, existing);
+
+  const now = Date.now();
+  if (existing.value && existing.expiresAt > now) {
+    return { data: cloneMagazinePublicIssues(existing.value), cache: "hit" };
+  }
+
+  if (!existing.inflight) {
+    existing.inflight = loadPublicMagazineIssues(key)
+      .then((data) => {
+        existing.value = data;
+        existing.expiresAt = Date.now() + MAGAZINE_PUBLIC_ISSUES_CACHE_TTL_MS;
+        return data;
+      })
+      .finally(() => {
+        existing.inflight = null;
+      });
+  }
+
+  try {
+    const data = await existing.inflight;
+    return { data: cloneMagazinePublicIssues(data), cache: "miss" };
+  } catch (err) {
+    if (existing.value) {
+      return { data: cloneMagazinePublicIssues(existing.value), cache: "stale" };
     }
     throw err;
   }
@@ -1598,7 +1764,8 @@ const homeNewspapersSql = `
   SELECT
     id,
     image_url,
-    publish_date
+    publish_date,
+    file_url
   FROM public.newspaper
   ORDER BY publish_date DESC
 `;
@@ -3094,6 +3261,25 @@ const getActiveNewspaperSubscriptionAccess = async (userId) => {
 };
 
 const getNewspaperByPublishDate = async (publishDate) => {
+  try {
+    const rows = await homePostgresQuery(
+      `
+        SELECT
+          id::int AS id,
+          publish_date,
+          file_url
+        FROM public.newspaper
+        WHERE publish_date = $1::date
+        ORDER BY id DESC
+        LIMIT 1
+      `,
+      [publishDate]
+    );
+    return rows[0] || null;
+  } catch (_) {
+    // Fallback to Hasura if home postgres is unavailable.
+  }
+
   const data = await hasuraRequest(
     `
       query GetNewspaperByPublishDate($publishDate: date!) {
@@ -4206,8 +4392,9 @@ app.post("/newspaper/view-url", requireJwt, async (req, res) => {
   const requestId = crypto.randomUUID();
   const userId = extractJwtUserId(req.jwt);
   const rawDate = String(req.body?.date || req.body?.publishDate || "").trim();
+  const preferLocal = req.body?.preferLocal === true || req.body?.localOnly === true;
   console.log(
-    `[newspaper][view-url][start] id=${requestId} ip=${req.ip} userId=${userId || "-"} date=${rawDate || "-"}`
+    `[newspaper][view-url][start] id=${requestId} ip=${req.ip} userId=${userId || "-"} date=${rawDate || "-"} preferLocal=${preferLocal}`
   );
 
   try {
@@ -4237,6 +4424,16 @@ app.post("/newspaper/view-url", requireJwt, async (req, res) => {
     const isoDate = formatIsoDateOnly(targetDate);
     const newspaper = await getNewspaperByPublishDate(isoDate);
     const storedUrl = String(newspaper?.file_url || "").trim();
+    if (!storedUrl && preferLocal) {
+      console.warn(
+        `[newspaper][view-url][local-miss] id=${requestId} ip=${req.ip} userId=${userId} date=${isoDate}`
+      );
+      return res.status(404).json({
+        ok: false,
+        code: "LOCAL_NEWSPAPER_NOT_FOUND",
+        error: "Selected date is not available in local newspaper storage.",
+      });
+    }
     const source = storedUrl ? "system" : "legacy";
     const url = storedUrl || buildLegacyNewspaperProxyUrl(isoDate);
     const isPrivate = storedUrl ? isPrivateStorageUrl(storedUrl) : false;
@@ -6972,22 +7169,17 @@ app.get("/private/view-secure", requireJwt, async (req, res) => {
   }
 
   try {
-    const data = await fetchFromBunny(parsed.type, "private", parsed.filename);
-    res.set({
-      ...corsHeaders,
-      "Content-Type": "application/pdf",
-      "Content-Disposition": `inline; filename="${sanitizeFilename(parsed.filename)}"`,
-      "Cache-Control": "no-store, no-cache, must-revalidate, private",
-      Pragma: "no-cache",
-      "X-Content-Type-Options": "nosniff",
-      "Content-Security-Policy": `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`,
-    });
-    res.send(data);
-    logPdfRequest({
-      ...logBase,
-      status: 200,
-      outcome: "success",
-      message: "Secure PDF delivered from BunnyCDN.",
+    const bunnyResponse = await fetchStreamFromBunny(parsed.type, "private", parsed.filename);
+    await pipeBunnyStreamToResponse({
+      req,
+      res,
+      bunnyResponse,
+      logBase,
+      headers: {
+        ...corsHeaders,
+        ...buildPrivatePdfHeaders(parsed.filename, { withFrameAncestors: true }),
+      },
+      successMessage: "Secure PDF delivered from BunnyCDN.",
     });
   } catch (err) {
     logPdfRequest({
