@@ -1810,7 +1810,7 @@ const homeNewspapersSql = `
   SELECT
     id,
     image_url,
-    publish_date,
+    publish_date::text AS publish_date,
     file_url
   FROM public.newspaper
   ORDER BY publish_date DESC
