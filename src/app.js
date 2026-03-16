@@ -168,6 +168,18 @@ const BUNNY_HTTP_RETRIES = Number(process.env.BUNNY_HTTP_RETRIES || "1");
 const BUNNY_HTTP_RETRY_BASE_DELAY_MS = Number(
   process.env.BUNNY_HTTP_RETRY_BASE_DELAY_MS || "400"
 );
+const BUNNY_UPLOAD_TIMEOUT_MS_RAW = Number(
+  process.env.BUNNY_UPLOAD_TIMEOUT_MS || "120000"
+);
+const BUNNY_UPLOAD_TIMEOUT_MS =
+  Number.isFinite(BUNNY_UPLOAD_TIMEOUT_MS_RAW) && BUNNY_UPLOAD_TIMEOUT_MS_RAW > 0
+    ? BUNNY_UPLOAD_TIMEOUT_MS_RAW
+    : 120000;
+const BUNNY_UPLOAD_RETRIES_RAW = Number(process.env.BUNNY_UPLOAD_RETRIES || "1");
+const BUNNY_UPLOAD_RETRIES =
+  Number.isInteger(BUNNY_UPLOAD_RETRIES_RAW) && BUNNY_UPLOAD_RETRIES_RAW >= 0
+    ? BUNNY_UPLOAD_RETRIES_RAW
+    : 1;
 const BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS = Number(
   process.env.BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS || "15000"
 );
@@ -710,6 +722,39 @@ const buildRateLimiter = ({ windowMs, max, message, skip }) =>
     skip,
   });
 
+const hasAdminRoleInBearerToken = (token) => {
+  if (!token) return false;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET, {
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
+    const claims = payload?.["https://hasura.io/jwt/claims"] || {};
+    const defaultRole = String(claims["x-hasura-default-role"] || "")
+      .trim()
+      .toLowerCase();
+    const allowedRoles = Array.isArray(claims["x-hasura-allowed-roles"])
+      ? claims["x-hasura-allowed-roles"].map((value) =>
+          String(value || "").trim().toLowerCase()
+        )
+      : [];
+    return defaultRole === "admin" || allowedRoles.includes("admin");
+  } catch (_) {
+    return false;
+  }
+};
+
+const shouldSkipUploadRateLimit = (req) => {
+  const authHeader = String(req.get("authorization") || "").trim();
+  const bearerToken = authHeader.toLowerCase().startsWith("bearer ")
+    ? authHeader.slice(7).trim()
+    : "";
+
+  if (!bearerToken) return false;
+  if (AUTH_TOKEN && safeTokenCompare(bearerToken, AUTH_TOKEN)) return true;
+  return hasAdminRoleInBearerToken(bearerToken);
+};
+
 const globalRateLimiter = buildRateLimiter({
   windowMs: RATE_LIMIT_WINDOW_MS,
   max: RATE_LIMIT_MAX,
@@ -740,6 +785,7 @@ const uploadRateLimiter = buildRateLimiter({
   windowMs: RATE_LIMIT_WINDOW_MS,
   max: UPLOAD_RATE_LIMIT_MAX,
   message: "Too many upload attempts.",
+  skip: shouldSkipUploadRateLimit,
 });
 
 app.use(globalRateLimiter);
@@ -6282,13 +6328,14 @@ const uploadToBunny = async (filePath, type, scope, filename) => {
         method: "PUT",
         url,
         data: fs.createReadStream(filePath),
+        timeout: BUNNY_UPLOAD_TIMEOUT_MS,
         headers: {
           "Content-Type": "application/octet-stream",
         },
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
       },
-      { retries: 0 }
+      { retries: BUNNY_UPLOAD_RETRIES }
     );
     return response.data;
   } catch (err) {
