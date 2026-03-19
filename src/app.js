@@ -299,6 +299,41 @@ const REVENUECAT_DEFAULT_ENTITLEMENT_ID =
   process.env.REVENUECAT_DEFAULT_ENTITLEMENT_ID || "Yeniasya Pro";
 const REVENUECAT_WEB_CHECKOUT_PLATFORM =
   process.env.REVENUECAT_WEB_CHECKOUT_PLATFORM || "paratika";
+const REVENUECAT_ACCESS_SOURCE = "revenuecat";
+const REVENUECAT_RECONCILE_ENABLED =
+  (process.env.REVENUECAT_RECONCILE_ENABLED || "true").toLowerCase() === "true";
+const REVENUECAT_RECONCILE_INTERVAL_MINUTES_RAW = Number(
+  process.env.REVENUECAT_RECONCILE_INTERVAL_MINUTES || "30"
+);
+const REVENUECAT_RECONCILE_INTERVAL_MINUTES =
+  Number.isFinite(REVENUECAT_RECONCILE_INTERVAL_MINUTES_RAW) &&
+  REVENUECAT_RECONCILE_INTERVAL_MINUTES_RAW > 0
+    ? REVENUECAT_RECONCILE_INTERVAL_MINUTES_RAW
+    : 30;
+const REVENUECAT_RECONCILE_BATCH_SIZE_RAW = Number(
+  process.env.REVENUECAT_RECONCILE_BATCH_SIZE || "50"
+);
+const REVENUECAT_RECONCILE_BATCH_SIZE =
+  Number.isInteger(REVENUECAT_RECONCILE_BATCH_SIZE_RAW) &&
+  REVENUECAT_RECONCILE_BATCH_SIZE_RAW > 0
+    ? REVENUECAT_RECONCILE_BATCH_SIZE_RAW
+    : 50;
+const REVENUECAT_RECONCILE_STARTUP_DELAY_MS_RAW = Number(
+  process.env.REVENUECAT_RECONCILE_STARTUP_DELAY_MS || "15000"
+);
+const REVENUECAT_RECONCILE_STARTUP_DELAY_MS =
+  Number.isFinite(REVENUECAT_RECONCILE_STARTUP_DELAY_MS_RAW) &&
+  REVENUECAT_RECONCILE_STARTUP_DELAY_MS_RAW >= 0
+    ? REVENUECAT_RECONCILE_STARTUP_DELAY_MS_RAW
+    : 15000;
+const REVENUECAT_SYNC_DELETE_EXPIRY_GRACE_MS_RAW = Number(
+  process.env.REVENUECAT_SYNC_DELETE_EXPIRY_GRACE_MS || "300000"
+);
+const REVENUECAT_SYNC_DELETE_EXPIRY_GRACE_MS =
+  Number.isFinite(REVENUECAT_SYNC_DELETE_EXPIRY_GRACE_MS_RAW) &&
+  REVENUECAT_SYNC_DELETE_EXPIRY_GRACE_MS_RAW >= 0
+    ? REVENUECAT_SYNC_DELETE_EXPIRY_GRACE_MS_RAW
+    : 300000;
 const REVENUECAT_ACTIVE_EVENT_TYPES = new Set([
   "INITIAL_PURCHASE",
   "RENEWAL",
@@ -339,6 +374,9 @@ const hasuraHttp = axios.create({
 });
 
 let homePostgresPool = null;
+let userContentAccessGrantSourceSupported = true;
+let revenueCatReconcileTimer = null;
+let revenueCatReconcileRunning = false;
 
 const decodeUriComponentSafe = (value) => {
   try {
@@ -445,6 +483,81 @@ const homePostgresQuery = async (text, values = []) => {
     statement_timeout: HOME_POSTGRES_QUERY_TIMEOUT_MS,
   });
   return result.rows || [];
+};
+
+const homePostgresQueryWithClient = async (client, text, values = []) => {
+  const result = await client.query({
+    text,
+    values,
+    query_timeout: HOME_POSTGRES_QUERY_TIMEOUT_MS,
+    statement_timeout: HOME_POSTGRES_QUERY_TIMEOUT_MS,
+  });
+  return result.rows || [];
+};
+
+const withHomePostgresClient = async (callback) => {
+  const client = await getHomePostgresPool().connect();
+  try {
+    return await callback(client);
+  } finally {
+    client.release();
+  }
+};
+
+const isMissingUserContentAccessGrantSourceError = (err) =>
+  String(err?.code || "") === "42703" &&
+  String(err?.message || "").toLowerCase().includes("grant_source");
+
+const parseTimestampOrNull = (value) => {
+  const normalized = normalizeRevenueCatAppUserId(value);
+  if (!normalized) return null;
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+const pickLaterExpiryEntry = (first, second) => {
+  if (!first) return second;
+  if (!second) return first;
+
+  const firstExpiry = parseTimestampOrNull(first.expires_at);
+  const secondExpiry = parseTimestampOrNull(second.expires_at);
+  if (!firstExpiry) return second;
+  if (!secondExpiry) return first;
+  return secondExpiry.getTime() > firstExpiry.getTime() ? second : first;
+};
+
+const isRevenueCatManagedAccessRow = (row, expirationDate) => {
+  if (!row) return false;
+  const grantSource = String(row.grant_source || "")
+    .trim()
+    .toLowerCase();
+  if (grantSource === REVENUECAT_ACCESS_SOURCE) {
+    return true;
+  }
+
+  const rowExpiry = parseTimestampOrNull(row.expires_at);
+  const rcExpiry = parseTimestampOrNull(expirationDate);
+  if (!rowExpiry || !rcExpiry) {
+    return false;
+  }
+
+  return (
+    Math.abs(rowExpiry.getTime() - rcExpiry.getTime()) <=
+    REVENUECAT_SYNC_DELETE_EXPIRY_GRACE_MS
+  );
+};
+
+const hasManualOverrideExpiry = (row, expirationDate) => {
+  if (!row) return false;
+  const rowExpiry = parseTimestampOrNull(row.expires_at);
+  const rcExpiry = parseTimestampOrNull(expirationDate);
+  if (!rowExpiry) {
+    return true;
+  }
+  if (!rcExpiry) {
+    return false;
+  }
+  return rowExpiry.getTime() > rcExpiry.getTime() + REVENUECAT_SYNC_DELETE_EXPIRY_GRACE_MS;
 };
 
 const isRetryableBunnyError = (err) => {
@@ -3269,12 +3382,117 @@ const isPrivateStorageUrl = (value) => {
   const path = (parsed?.pathname || raw).toLowerCase();
   return (
     path.startsWith("/private/") ||
-    /^\/(kitap|dergi|gazete|ek|slider)\/private\/.+/.test(path)
+      /^\/(kitap|dergi|gazete|ek|slider)\/private\/.+/.test(path)
   );
+};
+
+const getActiveNewspaperAccessRowFromPostgres = async ({
+  userId,
+  nowIso,
+  client = null,
+  requireCurrent = true,
+}) => {
+  const currentWhere = requireCurrent
+    ? "AND (expires_at IS NULL OR expires_at > $2::timestamptz)"
+    : "";
+  const queryWithGrantSource = `
+    SELECT
+      id::int AS id,
+      expires_at,
+      started_at,
+      grant_source
+    FROM public.user_content_access
+    WHERE user_id = $1
+      AND item_type = 'newspaper_subscription'::public.access_item_type
+      AND item_id IS NULL
+      AND is_active = TRUE
+      ${currentWhere}
+    ORDER BY expires_at DESC NULLS LAST, started_at DESC NULLS LAST, id DESC
+    LIMIT 1
+  `;
+  const queryWithoutGrantSource = `
+    SELECT
+      id::int AS id,
+      expires_at,
+      started_at,
+      NULL::text AS grant_source
+    FROM public.user_content_access
+    WHERE user_id = $1
+      AND item_type = 'newspaper_subscription'::public.access_item_type
+      AND item_id IS NULL
+      AND is_active = TRUE
+      ${currentWhere}
+    ORDER BY expires_at DESC NULLS LAST, started_at DESC NULLS LAST, id DESC
+    LIMIT 1
+  `;
+  const queryRunner = client
+    ? (text, values) => homePostgresQueryWithClient(client, text, values)
+    : homePostgresQuery;
+  const values = requireCurrent ? [userId, nowIso] : [userId];
+
+  if (!userContentAccessGrantSourceSupported) {
+    const rows = await queryRunner(queryWithoutGrantSource, values);
+    return rows[0] || null;
+  }
+
+  try {
+    const rows = await queryRunner(queryWithGrantSource, values);
+    return rows[0] || null;
+  } catch (err) {
+    if (!isMissingUserContentAccessGrantSourceError(err)) {
+      throw err;
+    }
+    userContentAccessGrantSourceSupported = false;
+    const rows = await queryRunner(queryWithoutGrantSource, values);
+    return rows[0] || null;
+  }
+};
+
+const getActiveManualNewspaperAccessRowFromPostgres = async ({ userId, nowIso }) => {
+  try {
+    const rows = await homePostgresQuery(
+      `
+        SELECT
+          id::int AS id,
+          ends_at AS expires_at,
+          starts_at AS started_at,
+          'manual_newspaper'::text AS grant_source
+        FROM public.manual_newspaper_users
+        WHERE user_id = $1
+          AND is_active = TRUE
+          AND (ends_at IS NULL OR ends_at > $2::timestamptz)
+        ORDER BY ends_at DESC NULLS LAST, starts_at DESC NULLS LAST, id DESC
+        LIMIT 1
+      `,
+      [userId, nowIso]
+    );
+    return rows[0] || null;
+  } catch (err) {
+    const message = String(err?.message || "").toLowerCase();
+    if (String(err?.code || "") === "42P01" || message.includes("manual_newspaper_users")) {
+      return null;
+    }
+    throw err;
+  }
 };
 
 const getActiveNewspaperSubscriptionAccess = async (userId) => {
   const nowIso = new Date().toISOString();
+  try {
+    const accessEntry = await getActiveNewspaperAccessRowFromPostgres({
+      userId,
+      nowIso,
+    });
+    const manualEntry = await getActiveManualNewspaperAccessRowFromPostgres({
+      userId,
+      nowIso,
+    });
+    const preferred = pickLaterExpiryEntry(accessEntry, manualEntry);
+    if (preferred) return preferred;
+  } catch (_) {
+    // Fallback to Hasura if direct Postgres is unavailable.
+  }
+
   const data = await hasuraRequest(
     `
       query GetActiveNewspaperSubscriptionAccess(
@@ -5184,175 +5402,260 @@ const syncRevenueCatAccessByEntitlement = async ({
 
   const expiresAt = toIsoTimestampOrNull(expirationDate);
   const nowIso = new Date().toISOString();
-  const isDuplicateActiveAccessError = (err) => {
-    const message = String(err?.message || "").toLowerCase();
-    return (
-      (message.includes("duplicate key") || message.includes("uniqueness violation")) &&
-      message.includes("user_content_access_active_newspaper_subscription_uq")
-    );
+
+  if (mapping.itemType !== "newspaper_subscription" || mapping.itemId !== null) {
+    return {
+      mapped: false,
+      reason: "unsupported_access_mapping",
+      entitlementId,
+      itemType: mapping.itemType,
+    };
+  }
+
+  const updateRevenueCatAccess = async (client, userAccessId) => {
+    const queryWithGrantSource = `
+      UPDATE public.user_content_access
+      SET
+        is_active = TRUE,
+        expires_at = $2::timestamptz,
+        grant_source = $3
+      WHERE id = $1
+      RETURNING id::int AS id
+    `;
+    const queryWithoutGrantSource = `
+      UPDATE public.user_content_access
+      SET
+        is_active = TRUE,
+        expires_at = $2::timestamptz
+      WHERE id = $1
+      RETURNING id::int AS id
+    `;
+
+    if (!userContentAccessGrantSourceSupported) {
+      const rows = await homePostgresQueryWithClient(client, queryWithoutGrantSource, [
+        userAccessId,
+        expiresAt,
+      ]);
+      return rows[0] || null;
+    }
+
+    try {
+      const rows = await homePostgresQueryWithClient(client, queryWithGrantSource, [
+        userAccessId,
+        expiresAt,
+        REVENUECAT_ACCESS_SOURCE,
+      ]);
+      return rows[0] || null;
+    } catch (err) {
+      if (!isMissingUserContentAccessGrantSourceError(err)) {
+        throw err;
+      }
+      userContentAccessGrantSourceSupported = false;
+      const rows = await homePostgresQueryWithClient(client, queryWithoutGrantSource, [
+        userAccessId,
+        expiresAt,
+      ]);
+      return rows[0] || null;
+    }
+  };
+
+  const insertRevenueCatAccess = async (client) => {
+    const queryWithGrantSource = `
+      INSERT INTO public.user_content_access (
+        user_id,
+        item_type,
+        item_id,
+        is_active,
+        started_at,
+        expires_at,
+        grant_source
+      )
+      VALUES (
+        $1,
+        'newspaper_subscription'::public.access_item_type,
+        NULL,
+        TRUE,
+        $2::timestamptz,
+        $3::timestamptz,
+        $4
+      )
+      RETURNING id::int AS id
+    `;
+    const queryWithoutGrantSource = `
+      INSERT INTO public.user_content_access (
+        user_id,
+        item_type,
+        item_id,
+        is_active,
+        started_at,
+        expires_at
+      )
+      VALUES (
+        $1,
+        'newspaper_subscription'::public.access_item_type,
+        NULL,
+        TRUE,
+        $2::timestamptz,
+        $3::timestamptz
+      )
+      RETURNING id::int AS id
+    `;
+
+    if (!userContentAccessGrantSourceSupported) {
+      const rows = await homePostgresQueryWithClient(client, queryWithoutGrantSource, [
+        userId,
+        nowIso,
+        expiresAt,
+      ]);
+      return rows[0] || null;
+    }
+
+    try {
+      const rows = await homePostgresQueryWithClient(client, queryWithGrantSource, [
+        userId,
+        nowIso,
+        expiresAt,
+        REVENUECAT_ACCESS_SOURCE,
+      ]);
+      return rows[0] || null;
+    } catch (err) {
+      if (!isMissingUserContentAccessGrantSourceError(err)) {
+        throw err;
+      }
+      userContentAccessGrantSourceSupported = false;
+      const rows = await homePostgresQueryWithClient(client, queryWithoutGrantSource, [
+        userId,
+        nowIso,
+        expiresAt,
+      ]);
+      return rows[0] || null;
+    }
   };
 
   if (!isActive) {
-    const data = await hasuraRequest(
-      `
-        mutation DeactivateRevenueCatAccess(
-          $user_id: Int!
-          $item_type: access_item_type!
-          $ended_at: timestamptz!
-        ) {
-          update_user_content_access(
-            where: {
-              user_id: {_eq: $user_id}
-              item_type: {_eq: $item_type}
-              item_id: {_is_null: true}
-              is_active: {_eq: true}
-            }
-            _set: {is_active: false, expires_at: $ended_at}
-          ) {
-            affected_rows
-          }
-        }
-      `,
-      {
-        user_id: userId,
-        item_type: mapping.itemType,
-        ended_at: nowIso,
+    return withHomePostgresClient(async (client) => {
+      const current = await getActiveNewspaperAccessRowFromPostgres({
+        userId,
+        nowIso,
+        client,
+        requireCurrent: false,
+      });
+
+      if (!current) {
+        return {
+          mapped: true,
+          action: "noop_inactive",
+          affectedRows: 0,
+          itemType: mapping.itemType,
+        };
       }
-    );
 
-    return {
-      mapped: true,
-      action: "deactivated",
-      affectedRows: data?.update_user_content_access?.affected_rows ?? 0,
-      itemType: mapping.itemType,
-    };
-  }
-
-  const refreshActiveData = await hasuraRequest(
-    `
-      mutation RefreshRevenueCatAccessByFilter(
-        $user_id: Int!
-        $item_type: access_item_type!
-        $expires_at: timestamptz
-      ) {
-        update_user_content_access(
-          where: {
-            user_id: {_eq: $user_id}
-            item_type: {_eq: $item_type}
-            item_id: {_is_null: true}
-            is_active: {_eq: true}
-          }
-          _set: {is_active: true, expires_at: $expires_at}
-        ) {
-          affected_rows
-          returning {
-            id
-          }
-        }
+      if (hasManualOverrideExpiry(current, expiresAt || nowIso)) {
+        return {
+          mapped: true,
+          action: "skipped_manual_override",
+          affectedRows: 0,
+          itemType: mapping.itemType,
+          accessId: current.id ?? null,
+          expiresAt: current.expires_at || null,
+        };
       }
-    `,
-    {
-      user_id: userId,
-      item_type: mapping.itemType,
-      expires_at: expiresAt,
-    }
-  );
 
-  const refreshedRows =
-    refreshActiveData?.update_user_content_access?.affected_rows ?? 0;
-  const refreshedAccessId =
-    refreshActiveData?.update_user_content_access?.returning?.[0]?.id ?? null;
-
-  if (refreshedRows > 0) {
-    return {
-      mapped: true,
-      action: "updated",
-      itemType: mapping.itemType,
-      accessId: refreshedAccessId,
-      expiresAt,
-    };
-  }
-
-  try {
-    const inserted = await hasuraRequest(
-      `
-        mutation InsertRevenueCatAccess($object: user_content_access_insert_input!) {
-          insert_user_content_access_one(object: $object) {
-            id
-          }
-        }
-      `,
-      {
-        object: {
-          user_id: userId,
-          item_type: mapping.itemType,
-          item_id: mapping.itemId,
-          is_active: true,
-          started_at: nowIso,
-          expires_at: expiresAt,
-        },
-      },
-    );
-
-    return {
-      mapped: true,
-      action: "inserted",
-      itemType: mapping.itemType,
-      accessId: inserted?.insert_user_content_access_one?.id ?? null,
-      expiresAt,
-    };
-  } catch (err) {
-    if (!isDuplicateActiveAccessError(err)) {
-      throw err;
-    }
-
-    const recovered = await hasuraRequest(
-      `
-        mutation RecoverRevenueCatAccessAfterConflict(
-          $user_id: Int!
-          $item_type: access_item_type!
-          $expires_at: timestamptz
-        ) {
-          update_user_content_access(
-            where: {
-              user_id: {_eq: $user_id}
-              item_type: {_eq: $item_type}
-              item_id: {_is_null: true}
-              is_active: {_eq: true}
-            }
-            _set: {is_active: true, expires_at: $expires_at}
-          ) {
-            affected_rows
-            returning {
-              id
-            }
-          }
-        }
-      `,
-      {
-        user_id: userId,
-        item_type: mapping.itemType,
-        expires_at: expiresAt,
+      if (!isRevenueCatManagedAccessRow(current, expiresAt || nowIso)) {
+        return {
+          mapped: true,
+          action: "skipped_manual_override",
+          affectedRows: 0,
+          itemType: mapping.itemType,
+          accessId: current.id ?? null,
+          expiresAt: current.expires_at || null,
+        };
       }
-    );
 
-    const recoveredRows =
-      recovered?.update_user_content_access?.affected_rows ?? 0;
-    const recoveredAccessId =
-      recovered?.update_user_content_access?.returning?.[0]?.id ?? null;
+      const deletedRows = await homePostgresQueryWithClient(
+        client,
+        `
+          DELETE FROM public.user_content_access
+          WHERE id = $1
+            AND is_active = TRUE
+          RETURNING id::int AS id
+        `,
+        [current.id]
+      );
 
-    if (recoveredRows > 0) {
       return {
         mapped: true,
-        action: "updated_after_conflict",
+        action: "deleted",
+        affectedRows: deletedRows.length,
         itemType: mapping.itemType,
-        accessId: recoveredAccessId,
+        accessId: deletedRows[0]?.id ?? current.id ?? null,
+      };
+    });
+  }
+
+  return withHomePostgresClient(async (client) => {
+    const current = await getActiveNewspaperAccessRowFromPostgres({
+      userId,
+      nowIso,
+      client,
+      requireCurrent: false,
+    });
+
+    if (current?.id) {
+      if (hasManualOverrideExpiry(current, expiresAt)) {
+        return {
+          mapped: true,
+          action: "skipped_manual_override",
+          itemType: mapping.itemType,
+          accessId: current.id,
+          expiresAt: current.expires_at || null,
+        };
+      }
+
+      await updateRevenueCatAccess(client, current.id);
+      return {
+        mapped: true,
+        action: "updated",
+        itemType: mapping.itemType,
+        accessId: current.id,
         expiresAt,
       };
     }
 
-    throw err;
-  }
+    try {
+      const inserted = await insertRevenueCatAccess(client);
+      return {
+        mapped: true,
+        action: "inserted",
+        itemType: mapping.itemType,
+        accessId: inserted?.id ?? null,
+        expiresAt,
+      };
+    } catch (err) {
+      if (String(err?.code || "") !== "23505") {
+        throw err;
+      }
+
+      const recovered = await getActiveNewspaperAccessRowFromPostgres({
+        userId,
+        nowIso,
+        client,
+        requireCurrent: false,
+      });
+      if (!recovered?.id) {
+        throw err;
+      }
+
+      await updateRevenueCatAccess(client, recovered.id);
+      return {
+        mapped: true,
+        action: "updated_after_conflict",
+        itemType: mapping.itemType,
+        accessId: recovered.id,
+        expiresAt,
+      };
+    }
+  });
 };
 
 let revenueCatAuditLogEnabled = true;
@@ -5458,6 +5761,225 @@ const normalizeRevenueCatWebhookEvent = (body) => {
     expirationDate,
     inferredIsActive,
   };
+};
+
+const getRevenueCatReconcileCandidates = async ({
+  limit = REVENUECAT_RECONCILE_BATCH_SIZE,
+} = {}) => {
+  const queryWithGrantSource = `
+    SELECT
+      uca.id::int AS access_id,
+      uca.user_id::int AS user_id,
+      uca.started_at,
+      uca.expires_at,
+      uca.grant_source,
+      COALESCE(NULLIF(btrim(u."payUniqe"), ''), uca.user_id::text) AS app_user_id
+    FROM public.user_content_access uca
+    JOIN public.users u
+      ON u.id = uca.user_id
+    WHERE uca.item_type = 'newspaper_subscription'::public.access_item_type
+      AND uca.item_id IS NULL
+      AND uca.is_active = TRUE
+    ORDER BY
+      CASE WHEN uca.expires_at IS NULL THEN 1 ELSE 0 END,
+      uca.expires_at ASC NULLS LAST,
+      uca.id ASC
+    LIMIT $1
+  `;
+  const queryWithoutGrantSource = `
+    SELECT
+      uca.id::int AS access_id,
+      uca.user_id::int AS user_id,
+      uca.started_at,
+      uca.expires_at,
+      NULL::text AS grant_source,
+      COALESCE(NULLIF(btrim(u."payUniqe"), ''), uca.user_id::text) AS app_user_id
+    FROM public.user_content_access uca
+    JOIN public.users u
+      ON u.id = uca.user_id
+    WHERE uca.item_type = 'newspaper_subscription'::public.access_item_type
+      AND uca.item_id IS NULL
+      AND uca.is_active = TRUE
+    ORDER BY
+      CASE WHEN uca.expires_at IS NULL THEN 1 ELSE 0 END,
+      uca.expires_at ASC NULLS LAST,
+      uca.id ASC
+    LIMIT $1
+  `;
+
+  if (!userContentAccessGrantSourceSupported) {
+    return homePostgresQuery(queryWithoutGrantSource, [limit]);
+  }
+
+  try {
+    return await homePostgresQuery(queryWithGrantSource, [limit]);
+  } catch (err) {
+    if (!isMissingUserContentAccessGrantSourceError(err)) {
+      throw err;
+    }
+    userContentAccessGrantSourceSupported = false;
+    return homePostgresQuery(queryWithoutGrantSource, [limit]);
+  }
+};
+
+const runRevenueCatReconcileJob = async () => {
+  if (revenueCatReconcileRunning) return;
+  if (!REVENUECAT_RECONCILE_ENABLED || !REVENUECAT_SECRET_API_KEY) return;
+
+  revenueCatReconcileRunning = true;
+  const runId = crypto.randomUUID();
+  const stats = {
+    total: 0,
+    updated: 0,
+    inserted: 0,
+    deleted: 0,
+    skipped: 0,
+    errors: 0,
+  };
+
+  try {
+    const candidates = await getRevenueCatReconcileCandidates();
+    stats.total = candidates.length;
+    if (!candidates.length) {
+      console.log(`[revenuecat][reconcile] id=${runId} total=0 skipped=0 errors=0`);
+      return;
+    }
+
+    for (const candidate of candidates) {
+      const requestId = crypto.randomUUID();
+      try {
+        const appUserId = normalizeRevenueCatAppUserId(candidate.app_user_id);
+        if (!appUserId) {
+          stats.skipped += 1;
+          await writeRevenueCatAuditLog({
+            request_id: requestId,
+            endpoint: "/revenuecat/subscription/reconcile-job",
+            source: "reconcile_job",
+            success: false,
+            user_id: candidate.user_id,
+            access_action: "skipped_missing_app_user_id",
+            error: "Missing payUniqe/appUserId for reconcile candidate.",
+          });
+          continue;
+        }
+
+        const verification = await fetchRevenueCatEntitlementState({
+          appUserId,
+          entitlementId: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+        });
+
+        if (!verification.checked) {
+          stats.skipped += 1;
+          await writeRevenueCatAuditLog({
+            request_id: requestId,
+            endpoint: "/revenuecat/subscription/reconcile-job",
+            source: "reconcile_job",
+            success: false,
+            user_id: candidate.user_id,
+            app_user_id: appUserId,
+            entitlement_id: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+            access_action: "skipped_unverified",
+            verification_source: verification.source || null,
+            verification_reason: verification.reason || null,
+            error: "RevenueCat verification unavailable during reconcile.",
+          });
+          continue;
+        }
+
+        const accessSync = await syncRevenueCatAccessByEntitlement({
+          userId: candidate.user_id,
+          entitlementId: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+          isActive: verification.isActive,
+          expirationDate: verification.expirationDate,
+        });
+
+        switch (accessSync.action) {
+          case "updated":
+          case "updated_after_conflict":
+            stats.updated += 1;
+            break;
+          case "inserted":
+            stats.inserted += 1;
+            break;
+          case "deleted":
+            stats.deleted += 1;
+            break;
+          default:
+            stats.skipped += 1;
+            break;
+        }
+
+        await writeRevenueCatAuditLog({
+          request_id: requestId,
+          endpoint: "/revenuecat/subscription/reconcile-job",
+          source: "reconcile_job",
+          success: true,
+          user_id: candidate.user_id,
+          app_user_id: appUserId,
+          entitlement_id: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+          is_active: verification.isActive,
+          expiration_date: toIsoTimestampOrNull(verification.expirationDate),
+          verification_source: verification.source || null,
+          verification_reason: verification.reason || null,
+          access_action: accessSync.action || accessSync.reason || "none",
+        });
+      } catch (err) {
+        stats.errors += 1;
+        await writeRevenueCatAuditLog({
+          request_id: requestId,
+          endpoint: "/revenuecat/subscription/reconcile-job",
+          source: "reconcile_job",
+          success: false,
+          user_id: candidate.user_id,
+          app_user_id: normalizeRevenueCatAppUserId(candidate.app_user_id),
+          entitlement_id: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+          error: err.message || "Reconcile failed.",
+        });
+        console.error(
+          `[revenuecat][reconcile][error] id=${requestId} userId=${candidate.user_id} msg=${err.message}`
+        );
+      }
+    }
+
+    console.log(
+      `[revenuecat][reconcile] id=${runId} total=${stats.total} updated=${stats.updated} inserted=${stats.inserted} deleted=${stats.deleted} skipped=${stats.skipped} errors=${stats.errors}`
+    );
+  } catch (err) {
+    console.error(`[revenuecat][reconcile][fatal] id=${runId} msg=${err.message}`);
+  } finally {
+    revenueCatReconcileRunning = false;
+  }
+};
+
+const startRevenueCatReconcileJob = () => {
+  if (!REVENUECAT_RECONCILE_ENABLED) {
+    console.log("[revenuecat][reconcile] disabled");
+    return;
+  }
+  if (!REVENUECAT_SECRET_API_KEY) {
+    console.log("[revenuecat][reconcile] skipped: missing REVENUECAT_SECRET_API_KEY");
+    return;
+  }
+  if (revenueCatReconcileTimer) {
+    clearInterval(revenueCatReconcileTimer);
+    revenueCatReconcileTimer = null;
+  }
+
+  setTimeout(() => {
+    runRevenueCatReconcileJob().catch((err) => {
+      console.error(`[revenuecat][reconcile][startup-error] msg=${err.message}`);
+    });
+  }, REVENUECAT_RECONCILE_STARTUP_DELAY_MS);
+
+  revenueCatReconcileTimer = setInterval(() => {
+    runRevenueCatReconcileJob().catch((err) => {
+      console.error(`[revenuecat][reconcile][interval-error] msg=${err.message}`);
+    });
+  }, REVENUECAT_RECONCILE_INTERVAL_MINUTES * 60 * 1000);
+
+  console.log(
+    `[revenuecat][reconcile] scheduled interval=${REVENUECAT_RECONCILE_INTERVAL_MINUTES}m batch=${REVENUECAT_RECONCILE_BATCH_SIZE}`
+  );
 };
 
 app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res) => {
@@ -8084,4 +8606,5 @@ app.use(async (err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`File API listening on http://localhost:${PORT}`);
+  startRevenueCatReconcileJob();
 });

@@ -48,6 +48,12 @@ cp .env.example .env
 # HOME_POSTGRES_SSL_REJECT_UNAUTHORIZED=true
 # HOME_POSTGRES_QUERY_TIMEOUT_MS=10000
 # HOME_POSTGRES_POOL_MAX=10
+# RevenueCat gazete erişim reconcile job (opsiyonel, varsayılan açık):
+# REVENUECAT_RECONCILE_ENABLED=true
+# REVENUECAT_RECONCILE_INTERVAL_MINUTES=30
+# REVENUECAT_RECONCILE_BATCH_SIZE=50
+# REVENUECAT_RECONCILE_STARTUP_DELAY_MS=15000
+# REVENUECAT_SYNC_DELETE_EXPIRY_GRACE_MS=300000
 # Legacy e-gazete fallback (opsiyonel ama eski tarihleri açmak için gerekli):
 # LEGACY_NEWSPAPER_PDF_BASE_URL=https://www.yeniasya.com.tr/Sites/YeniAsya/Upload/files/EPub
 # Guest JWT opsiyonelleri:
@@ -90,6 +96,18 @@ npm run dev
 psql "$DATABASE_URL" -f scripts/manual_newspaper_users_migration.sql
 ```
 - Migration sonrası Hasura'da `manual_newspaper_users` tablosunu track edin.
+
+## RevenueCat Gazete Erişim Kaynağı
+- Migration dosyası:
+  `scripts/revenuecat_access_source_migration.sql`
+- Uygulama:
+```bash
+psql "$DATABASE_URL" -f scripts/revenuecat_access_source_migration.sql
+```
+- Not:
+  `user_content_access.grant_source` kolonu RevenueCat tarafından yönetilen `newspaper_subscription`
+  kayıtlarını işaretlemek için kullanılır. CDN job'ı bu bilgiyle biten RC aboneliklerini güvenli
+  şekilde temizler; manuel verilen gazete erişimleri korunur.
 
 ## Şifre Sıfırlama Token Tablosu
 - Migration dosyası:
@@ -212,7 +230,7 @@ psql "$DATABASE_URL" -f scripts/content_publication_status_migration.sql
 - `POST /newspaper/view-url`
   - Auth: `Authorization: Bearer <JWT>`
   - JSON body: `{ "date": "YYYY-MM-DD" }`
-  - Aktif e-gazete aboneliği olan kullanıcı için seçilen tarihin görüntüleme URL'ini döner.
+  - Aktif `user_content_access.newspaper_subscription` veya `manual_newspaper_users` erişimi olan kullanıcı için seçilen tarihin görüntüleme URL'ini döner.
   - Tarih `newspaper` tablosunda varsa sistemdeki `file_url` kullanılır.
   - Tarih sistemde yoksa CDN içindeki legacy PDF proxy URL'i döner.
   - Yanıt: `{ ok, date, url, isPrivate, source }`
