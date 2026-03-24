@@ -118,7 +118,7 @@ const PASSWORD_RESET_WEB_URL =
   "https://cdn.yeniasyadijital.com/sifre-sifirla";
 const EMAIL_VERIFICATION_WEB_URL =
   process.env.EMAIL_VERIFICATION_WEB_URL ||
-  "https://yeniasyadijital.com/hesap-aktivasyon";
+  "https://yeniasyadijital.com/hesap-aktivasyon/";
 const MAIL_TLS_SERVERNAME = (process.env.MAIL_TLS_SERVERNAME || "")
   .trim()
   .replace(/\.$/, "");
