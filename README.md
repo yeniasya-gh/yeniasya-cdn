@@ -137,6 +137,18 @@ psql "$DATABASE_URL" -f scripts/users_avatar_url_migration.sql
 - Not:
   `users.avatar_url` kolonu CDN üzerinde profil fotoğrafı URL'ini tutar.
 
+## E-Posta Case-Insensitive Unique
+- Migration dosyası:
+  `scripts/users_email_case_insensitive_migration.sql`
+- Uygulama:
+```bash
+psql "$DATABASE_URL" -f scripts/users_email_case_insensitive_migration.sql
+```
+- Not:
+  Kayıt ve giriş akışları e-posta adresini küçük harfe normalize eder.
+  Bu migration mevcut e-posta kayıtlarını küçük harfe çevirir ve `lower(email)` üzerinde unique index oluşturur.
+  Böylece `Pazarlama@...` ile `pazarlama@...` aynı hesap olarak değerlendirilir.
+
 ## İçerik Yayın Durumu Kolonları
 - Migration dosyası:
   `scripts/content_publication_status_migration.sql`

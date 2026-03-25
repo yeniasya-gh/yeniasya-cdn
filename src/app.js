@@ -2892,7 +2892,17 @@ const getUserByEmailForAuth = async (email) => {
   const data = await hasuraRequest(
     `
       query GetUserByEmailForAuth($email: String!) {
-        users(where: {email: {_eq: $email}}, limit: 1) {
+        users(
+          where: {
+            _or: [
+              {email: {_eq: $email}},
+              {email: {_ilike: $email}}
+            ],
+            is_active: {_eq: true}
+          },
+          order_by: [{email_verified_at: desc_nulls_last}, {id: asc}],
+          limit: 1
+        ) {
           id
           name
           email
