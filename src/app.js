@@ -348,6 +348,7 @@ const REVENUECAT_INACTIVE_EVENT_TYPES = new Set([
   "REFUND",
   "SUBSCRIPTION_PAUSED",
 ]);
+const AUTH_SESSION_CLAIM_KEY = "x-hasura-session-id";
 
 const bunnyHttp = axios.create({
   baseURL: `https://storage.bunnycdn.com/${BUNNY_SETTINGS.storageZone}`,
@@ -375,6 +376,8 @@ const hasuraHttp = axios.create({
 
 let homePostgresPool = null;
 let userContentAccessGrantSourceSupported = true;
+let userContentAccessPurchasePlatformSupported = true;
+let revenueCatOwnershipLockSupported = true;
 let revenueCatReconcileTimer = null;
 let revenueCatReconcileRunning = false;
 
@@ -507,6 +510,12 @@ const withHomePostgresClient = async (callback) => {
 const isMissingUserContentAccessGrantSourceError = (err) =>
   String(err?.code || "") === "42703" &&
   String(err?.message || "").toLowerCase().includes("grant_source");
+const isMissingUserContentAccessPurchasePlatformError = (err) =>
+  String(err?.code || "") === "42703" &&
+  String(err?.message || "").toLowerCase().includes("purchase_platform");
+const isMissingOrderPaymentProviderError = (err) =>
+  String(err?.code || "") === "42703" &&
+  String(err?.message || "").toLowerCase().includes("payment_provider");
 
 const parseTimestampOrNull = (value) => {
   const normalized = normalizeRevenueCatAppUserId(value);
@@ -2132,23 +2141,53 @@ const getUserAccessEntriesFromPostgres = async ({ userId, itemType = null }) => 
     itemTypeWhere = ` AND item_type = $${values.length}`;
   }
 
-  const rows = await homePostgresQuery(
-    `
-      SELECT
-        id::int AS id,
-        CASE WHEN item_id IS NULL THEN NULL ELSE item_id::int END AS item_id,
-        item_type,
-        started_at,
-        expires_at,
-        is_active
-      FROM public.user_content_access
-      WHERE user_id = $1
-        AND is_active = TRUE
-        ${itemTypeWhere}
-      ORDER BY started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC
-    `,
-    values
-  );
+  const rows = await (async () => {
+    try {
+      return await homePostgresQuery(
+        `
+          SELECT
+            id::int AS id,
+            CASE WHEN item_id IS NULL THEN NULL ELSE item_id::int END AS item_id,
+            item_type,
+            started_at,
+            expires_at,
+            is_active,
+            grant_source,
+            purchase_platform
+          FROM public.user_content_access
+          WHERE user_id = $1
+            AND is_active = TRUE
+            ${itemTypeWhere}
+          ORDER BY started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC
+        `,
+        values
+      );
+    } catch (err) {
+      if (
+        !isMissingUserContentAccessGrantSourceError(err) &&
+        !isMissingUserContentAccessPurchasePlatformError(err)
+      ) {
+        throw err;
+      }
+      return homePostgresQuery(
+        `
+          SELECT
+            id::int AS id,
+            CASE WHEN item_id IS NULL THEN NULL ELSE item_id::int END AS item_id,
+            item_type,
+            started_at,
+            expires_at,
+            is_active
+          FROM public.user_content_access
+          WHERE user_id = $1
+            AND is_active = TRUE
+            ${itemTypeWhere}
+          ORDER BY started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC
+        `,
+        values
+      );
+    }
+  })();
 
   const entries = rows.map((row) => ({
     ...row,
@@ -2163,23 +2202,49 @@ const getUserAccessEntriesFromPostgres = async ({ userId, itemType = null }) => 
 };
 
 const getUserOrdersFromPostgres = async ({ userId, includeItems = false }) => {
-  const orders = await homePostgresQuery(
-    `
-      SELECT
-        id::int AS id,
-        total_paid,
-        status::text AS status,
-        CASE WHEN promo_code_id IS NULL THEN NULL ELSE promo_code_id::int END AS promo_code_id,
-        promo_code,
-        promo_discount_percent,
-        promo_discount_amount,
-        created_at
-      FROM public.orders
-      WHERE user_id = $1
-      ORDER BY created_at DESC, id DESC
-    `,
-    [userId]
-  );
+  const orders = await (async () => {
+    try {
+      return await homePostgresQuery(
+        `
+          SELECT
+            id::int AS id,
+            total_paid,
+            status::text AS status,
+            payment_provider,
+            CASE WHEN promo_code_id IS NULL THEN NULL ELSE promo_code_id::int END AS promo_code_id,
+            promo_code,
+            promo_discount_percent,
+            promo_discount_amount,
+            created_at
+          FROM public.orders
+          WHERE user_id = $1
+          ORDER BY created_at DESC, id DESC
+        `,
+        [userId]
+      );
+    } catch (err) {
+      if (!isMissingOrderPaymentProviderError(err)) {
+        throw err;
+      }
+      return homePostgresQuery(
+        `
+          SELECT
+            id::int AS id,
+            total_paid,
+            status::text AS status,
+            CASE WHEN promo_code_id IS NULL THEN NULL ELSE promo_code_id::int END AS promo_code_id,
+            promo_code,
+            promo_discount_percent,
+            promo_discount_amount,
+            created_at
+          FROM public.orders
+          WHERE user_id = $1
+          ORDER BY created_at DESC, id DESC
+        `,
+        [userId]
+      );
+    }
+  })();
 
   if (!includeItems || orders.length === 0) {
     return orders.map((order) => ({ ...order }));
@@ -2224,35 +2289,73 @@ const getUserOrdersFromPostgres = async ({ userId, includeItems = false }) => {
 };
 
 const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
-  const rows = await homePostgresQuery(
-    `
-      SELECT
-        id::int AS id,
-        total_paid,
-        status::text AS status,
-        created_at,
-        CASE
-          WHEN delivery_address_id IS NULL THEN NULL
-          ELSE delivery_address_id::int
-        END AS delivery_address_id,
-        CASE
-          WHEN billing_address_id IS NULL THEN NULL
-          ELSE billing_address_id::int
-        END AS billing_address_id,
-        CASE
-          WHEN promo_code_id IS NULL THEN NULL
-          ELSE promo_code_id::int
-        END AS promo_code_id,
-        promo_code,
-        promo_discount_percent,
-        promo_discount_amount
-      FROM public.orders
-      WHERE id = $1
-        AND user_id = $2
-      LIMIT 1
-    `,
-    [orderId, userId]
-  );
+  const rows = await (async () => {
+    try {
+      return await homePostgresQuery(
+        `
+          SELECT
+            id::int AS id,
+            total_paid,
+            status::text AS status,
+            created_at,
+            payment_provider,
+            CASE
+              WHEN delivery_address_id IS NULL THEN NULL
+              ELSE delivery_address_id::int
+            END AS delivery_address_id,
+            CASE
+              WHEN billing_address_id IS NULL THEN NULL
+              ELSE billing_address_id::int
+            END AS billing_address_id,
+            CASE
+              WHEN promo_code_id IS NULL THEN NULL
+              ELSE promo_code_id::int
+            END AS promo_code_id,
+            promo_code,
+            promo_discount_percent,
+            promo_discount_amount
+          FROM public.orders
+          WHERE id = $1
+            AND user_id = $2
+          LIMIT 1
+        `,
+        [orderId, userId]
+      );
+    } catch (err) {
+      if (!isMissingOrderPaymentProviderError(err)) {
+        throw err;
+      }
+      return homePostgresQuery(
+        `
+          SELECT
+            id::int AS id,
+            total_paid,
+            status::text AS status,
+            created_at,
+            CASE
+              WHEN delivery_address_id IS NULL THEN NULL
+              ELSE delivery_address_id::int
+            END AS delivery_address_id,
+            CASE
+              WHEN billing_address_id IS NULL THEN NULL
+              ELSE billing_address_id::int
+            END AS billing_address_id,
+            CASE
+              WHEN promo_code_id IS NULL THEN NULL
+              ELSE promo_code_id::int
+            END AS promo_code_id,
+            promo_code,
+            promo_discount_percent,
+            promo_discount_amount
+          FROM public.orders
+          WHERE id = $1
+            AND user_id = $2
+          LIMIT 1
+        `,
+        [orderId, userId]
+      );
+    }
+  })();
 
   const order = rows[0];
   if (!order) return null;
@@ -2286,6 +2389,7 @@ const buildJwt = (user, options = {}) => {
   const configuredRoles = Array.isArray(options.allowedRoles)
     ? options.allowedRoles
     : JWT_ALLOWED_ROLES;
+  const sessionId = normalizeAuthSessionId(options.sessionId);
   const roles = [...new Set([defaultRole, ...configuredRoles.map((v) => String(v).trim())].filter(Boolean))];
   const payload = {
     sub: userId,
@@ -2295,7 +2399,9 @@ const buildJwt = (user, options = {}) => {
       "x-hasura-default-role": defaultRole,
       "x-hasura-allowed-roles": roles,
       "x-hasura-user-id": userId,
+      ...(sessionId ? { [AUTH_SESSION_CLAIM_KEY]: sessionId } : {}),
     },
+    ...(sessionId ? { session_id: sessionId } : {}),
   };
 
   const token = jwt.sign(payload, JWT_SECRET, {
@@ -2317,12 +2423,18 @@ const buildJwtForAppUser = (user) => {
   return buildJwt(user, {
     defaultRole: "admin",
     allowedRoles: ["admin", "user", ...JWT_ALLOWED_ROLES],
+    sessionId: user.auth_session_id || user.session_id || null,
   });
 };
 
 const BCRYPT_HASH_REGEX = /^\$2[abxy]\$\d{2}\$/;
 const SHA256_HEX_REGEX = /^[a-f0-9]{64}$/i;
 const normalizeEmail = (value) => String(value || "").trim().toLowerCase();
+const normalizeAuthSessionId = (value) => {
+  if (value === undefined || value === null) return null;
+  const normalized = String(value).trim();
+  return normalized || null;
+};
 const hashLegacyPassword = (value) =>
   crypto.createHash("sha256").update(String(value || "")).digest("hex");
 const hashPassword = (value) => bcrypt.hash(String(value || ""), BCRYPT_COST);
@@ -2347,6 +2459,32 @@ const normalizeRevenueCatAppUserId = (value) => {
   if (value === undefined || value === null) return null;
   const normalized = String(value).trim();
   return normalized || null;
+};
+const normalizePurchasePlatform = (value) => {
+  if (value === undefined || value === null) return null;
+  const normalized = String(value)
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (!normalized) return null;
+  switch (normalized) {
+    case "appstore":
+    case "app_store":
+    case "apple":
+    case "mac_app_store":
+      return "apple";
+    case "playstore":
+    case "play_store":
+    case "googleplay":
+    case "google_play":
+      return "google_play";
+    case "paratika":
+    case "sanal_pos":
+    case "virtual_pos":
+      return "paratika";
+    default:
+      return normalized;
+  }
 };
 const toPositiveIntOrNull = (value) => {
   if (value === undefined || value === null || value === "") return null;
@@ -2403,10 +2541,56 @@ const verifyJwtToken = (token) =>
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
   });
+const extractJwtSessionId = (payload) => {
+  const claims = payload?.["https://hasura.io/jwt/claims"] || {};
+  return normalizeAuthSessionId(
+    claims[AUTH_SESSION_CLAIM_KEY] ?? payload?.session_id ?? payload?.sid
+  );
+};
 const extractJwtUserId = (payload) => {
   const claims = payload?.["https://hasura.io/jwt/claims"] || {};
   const rawId = claims["x-hasura-user-id"] ?? payload?.sub;
   return toPositiveIntOrNull(rawId);
+};
+const validateJwtSession = async (payload) => {
+  const userId = extractJwtUserId(payload);
+  if (!userId) {
+    return {
+      ok: false,
+      statusCode: 401,
+      code: "INVALID_TOKEN",
+      error: "Invalid user token.",
+    };
+  }
+
+  const user = await getUserByIdForAuth(userId);
+  if (!user || user.is_active === false) {
+    return {
+      ok: false,
+      statusCode: 401,
+      code: "INVALID_TOKEN",
+      error: "Invalid token.",
+    };
+  }
+
+  const tokenSessionId = extractJwtSessionId(payload);
+  const activeSessionId = normalizeAuthSessionId(user.auth_session_id);
+  if (activeSessionId && tokenSessionId !== activeSessionId) {
+    return {
+      ok: false,
+      statusCode: 401,
+      code: "SESSION_REVOKED",
+      error: "Oturumunuz sonlandırıldı. Lütfen tekrar giriş yapın.",
+    };
+  }
+
+  return {
+    ok: true,
+    userId,
+    user,
+    tokenSessionId,
+    activeSessionId,
+  };
 };
 const isHasuraVariableTypeMismatch = (err, variableName, expectedType) => {
   const message = String(err?.message || "").toLowerCase();
@@ -2909,6 +3093,7 @@ const getUserByEmailForAuth = async (email) => {
           phone
           avatar_url
           payUniqe
+          auth_session_id
           role_id
           password
           is_active
@@ -2932,6 +3117,7 @@ const getUserByIdForAuth = async (id) => {
           phone
           avatar_url
           payUniqe
+          auth_session_id
           role_id
           email_verified_at
           is_active
@@ -2954,6 +3140,32 @@ const toSafeUser = (user) => {
     payUniqe: user.payUniqe,
     role_id: user.role_id,
   };
+};
+
+const issueUserAuthSession = async (userId) => {
+  const sessionId = crypto.randomUUID();
+  try {
+    const data = await hasuraRequest(
+      `
+        mutation IssueUserAuthSession($id: bigint!, $sessionId: String!) {
+          update_users_by_pk(
+            pk_columns: {id: $id},
+            _set: {auth_session_id: $sessionId}
+          ) {
+            id
+            auth_session_id
+          }
+        }
+      `,
+      { id: userId, sessionId }
+    );
+    return data?.update_users_by_pk || null;
+  } catch (err) {
+    console.warn(
+      `[auth][session-issue-warning] userId=${userId} msg=${err.message}`
+    );
+    return null;
+  }
 };
 
 const normalizeAvatarUrl = (value) => {
@@ -3678,7 +3890,7 @@ const sendWelcomeMailOnce = async (userId) => {
   }
 };
 
-const requireJwt = (req, res, next) => {
+const requireJwt = async (req, res, next) => {
   const raw = req.get("authorization") || "";
   const token = raw.toLowerCase().startsWith("bearer ") ? raw.slice(7) : raw;
   if (!token) {
@@ -3686,6 +3898,14 @@ const requireJwt = (req, res, next) => {
   }
   try {
     const payload = verifyJwtToken(token);
+    const validation = await validateJwtSession(payload);
+    if (!validation.ok) {
+      return res.status(validation.statusCode || 401).json({
+        ok: false,
+        code: validation.code || "SESSION_REVOKED",
+        error: validation.error || "Oturumunuz sonlandırıldı. Lütfen tekrar giriş yapın.",
+      });
+    }
     req.jwt = payload;
     req.jwtToken = token;
     req.hasuraAuthMode = "jwt";
@@ -3695,7 +3915,7 @@ const requireJwt = (req, res, next) => {
   }
 };
 
-const optionalJwt = (req, res, next) => {
+const optionalJwt = async (req, res, next) => {
   if (!HASURA_ALLOW_JWTLESS) {
     return requireJwt(req, res, next);
   }
@@ -3706,6 +3926,14 @@ const optionalJwt = (req, res, next) => {
   }
   try {
     const payload = verifyJwtToken(token);
+    const validation = await validateJwtSession(payload);
+    if (!validation.ok) {
+      return res.status(validation.statusCode || 401).json({
+        ok: false,
+        code: validation.code || "SESSION_REVOKED",
+        error: validation.error || "Oturumunuz sonlandırıldı. Lütfen tekrar giriş yapın.",
+      });
+    }
     req.jwt = payload;
     req.jwtToken = token;
     req.hasuraAuthMode = "jwt";
@@ -3715,7 +3943,7 @@ const optionalJwt = (req, res, next) => {
   }
 };
 
-const requireJwtOrServiceAuth = (req, res, next) => {
+const requireJwtOrServiceAuth = async (req, res, next) => {
   const authHeader = req.get("authorization") || "";
   const bearerToken = authHeader.toLowerCase().startsWith("bearer ")
     ? authHeader.slice(7).trim()
@@ -3723,6 +3951,14 @@ const requireJwtOrServiceAuth = (req, res, next) => {
   if (bearerToken) {
     try {
       const payload = verifyJwtToken(bearerToken);
+      const validation = await validateJwtSession(payload);
+      if (!validation.ok) {
+        return res.status(validation.statusCode || 401).json({
+          ok: false,
+          code: validation.code || "SESSION_REVOKED",
+          error: validation.error || "Oturumunuz sonlandırıldı. Lütfen tekrar giriş yapın.",
+        });
+      }
       req.jwt = payload;
       req.jwtToken = bearerToken;
       req.hasuraAuthMode = "jwt";
@@ -3744,7 +3980,7 @@ const requireJwtOrServiceAuth = (req, res, next) => {
   return res.status(401).json({ ok: false, error: "Unauthorized." });
 };
 
-const requireRevenueCatAuth = (req, res, next) => {
+const requireRevenueCatAuth = async (req, res, next) => {
   const authHeader = req.get("authorization") || "";
   const bearerToken = authHeader.toLowerCase().startsWith("bearer ")
     ? authHeader.slice(7).trim()
@@ -3753,6 +3989,14 @@ const requireRevenueCatAuth = (req, res, next) => {
   if (bearerToken) {
     try {
       const payload = verifyJwtToken(bearerToken);
+      const validation = await validateJwtSession(payload);
+      if (!validation.ok) {
+        return res.status(validation.statusCode || 401).json({
+          ok: false,
+          code: validation.code || "SESSION_REVOKED",
+          error: validation.error || "Oturumunuz sonlandırıldı. Lütfen tekrar giriş yapın.",
+        });
+      }
       req.jwt = payload;
       req.jwtToken = bearerToken;
       req.revenueCatAuthMode = "jwt";
@@ -3994,6 +4238,7 @@ app.post("/auth/login", async (req, res) => {
       });
     }
 
+    const sessionUser = (await issueUserAuthSession(user.id)) || user;
     const safeUser = {
       id: user.id,
       name: user.name,
@@ -4003,7 +4248,7 @@ app.post("/auth/login", async (req, res) => {
       payUniqe: user.payUniqe,
       role_id: user.role_id,
     };
-    const { token, expiresAt } = buildJwtForAppUser(safeUser);
+    const { token, expiresAt } = buildJwtForAppUser(sessionUser);
     console.log(
       `[auth][login][success] id=${requestId} ip=${req.ip} email=${email} userId=${safeUser.id}`
     );
@@ -4046,6 +4291,7 @@ app.post("/auth/social-login", async (req, res) => {
       user = await markUserEmailVerified(user.id, new Date().toISOString());
     }
 
+    const sessionUser = (await issueUserAuthSession(user.id)) || user;
     const safeUser = {
       id: user.id,
       name: user.name,
@@ -4056,7 +4302,7 @@ app.post("/auth/social-login", async (req, res) => {
       role_id: user.role_id,
     };
 
-    const { token, expiresAt } = buildJwtForAppUser(safeUser);
+    const { token, expiresAt } = buildJwtForAppUser(sessionUser);
     console.log(
       `[auth][social-login][success] id=${requestId} provider=${provider} email=${email} userId=${safeUser.id}`
     );
@@ -4130,7 +4376,8 @@ app.post("/auth/social-register", async (req, res) => {
       return res.status(500).json({ ok: false, error: "User creation failed." });
     }
 
-    const { token, expiresAt } = buildJwtForAppUser(user);
+    const sessionUser = (await issueUserAuthSession(user.id)) || user;
+    const { token, expiresAt } = buildJwtForAppUser(sessionUser);
     try {
       await sendWelcomeMailOnce(user.id);
     } catch (mailErr) {
@@ -5078,6 +5325,19 @@ const getEntitlementFromSubscriber = (subscriberEntitlements, entitlementId) => 
   return null;
 };
 
+const purchasePlatformFromRevenueCatStore = (store) => {
+  const normalized = String(store || "").trim().toLowerCase();
+  switch (normalized) {
+    case "appstore":
+    case "macappstore":
+      return "apple";
+    case "playstore":
+      return "google_play";
+    default:
+      return null;
+  }
+};
+
 const fetchRevenueCatEntitlementState = async ({ appUserId, entitlementId }) => {
   if (!appUserId) {
     return {
@@ -5135,6 +5395,9 @@ const fetchRevenueCatEntitlementState = async ({ appUserId, entitlementId }) => 
   const expiresRaw = entitlement.expires_date ?? entitlement.expiresDate ?? null;
   const expirationDate = toIsoTimestampOrNull(expiresRaw);
   const hasExplicitExpiry = expiresRaw !== null && expiresRaw !== undefined && expiresRaw !== "";
+  const purchasePlatform = purchasePlatformFromRevenueCatStore(
+    entitlement.store || entitlement.store_name || entitlement.storeName
+  );
 
   let isActive = true;
   if (hasExplicitExpiry && expirationDate) {
@@ -5149,6 +5412,8 @@ const fetchRevenueCatEntitlementState = async ({ appUserId, entitlementId }) => 
     reason: isActive ? "active" : "expired",
     isActive,
     expirationDate,
+    purchasePlatform,
+    store: entitlement.store || entitlement.store_name || entitlement.storeName || null,
   };
 };
 
@@ -5394,11 +5659,170 @@ const resolveEntitlementStateWithFallback = async ({
   };
 };
 
+const isMissingRevenueCatOwnershipLockError = (err) =>
+  String(err?.code || "") === "42P01" &&
+  String(err?.message || "").toLowerCase().includes("revenuecat_subscription_locks");
+
+const upsertRevenueCatOwnershipLock = async ({
+  client,
+  entitlementId,
+  userId,
+  appUserId,
+  originalAppUserId = null,
+  productIdentifier = null,
+  isActive,
+  expirationDate,
+}) => {
+  const normalizedEntitlementId = normalizeRevenueCatAppUserId(entitlementId);
+  const normalizedAppUserId = normalizeRevenueCatAppUserId(appUserId);
+  const normalizedOriginalAppUserId = normalizeRevenueCatAppUserId(originalAppUserId);
+  const normalizedProductIdentifier = normalizeRevenueCatAppUserId(productIdentifier);
+  if (!normalizedEntitlementId || !normalizedAppUserId || !userId) {
+    return { mapped: false, reason: "missing_lock_identity" };
+  }
+
+  const expiresAt = toIsoTimestampOrNull(expirationDate);
+  const nowIso = new Date().toISOString();
+  const query = `
+    INSERT INTO public.revenuecat_subscription_locks (
+      entitlement_id,
+      owner_user_id,
+      owner_app_user_id,
+      owner_original_app_user_id,
+      product_identifier,
+      is_active,
+      expires_at,
+      locked_at,
+      updated_at,
+      last_seen_at
+    )
+    VALUES (
+      $1,
+      $2,
+      $3,
+      $4,
+      $5,
+      $6,
+      $7::timestamptz,
+      COALESCE($8::timestamptz, now()),
+      now(),
+      now()
+    )
+    ON CONFLICT (entitlement_id) DO UPDATE SET
+      owner_user_id = EXCLUDED.owner_user_id,
+      owner_app_user_id = EXCLUDED.owner_app_user_id,
+      owner_original_app_user_id = COALESCE(
+        EXCLUDED.owner_original_app_user_id,
+        public.revenuecat_subscription_locks.owner_original_app_user_id
+      ),
+      product_identifier = COALESCE(
+        EXCLUDED.product_identifier,
+        public.revenuecat_subscription_locks.product_identifier
+      ),
+      is_active = EXCLUDED.is_active,
+      expires_at = EXCLUDED.expires_at,
+      updated_at = now(),
+      last_seen_at = now()
+    WHERE
+      public.revenuecat_subscription_locks.owner_user_id = EXCLUDED.owner_user_id
+      OR public.revenuecat_subscription_locks.is_active = FALSE
+      OR COALESCE(public.revenuecat_subscription_locks.expires_at, 'epoch'::timestamptz) <= now()
+    RETURNING
+      id::int AS id,
+      entitlement_id,
+      owner_user_id::int AS owner_user_id,
+      owner_app_user_id,
+      owner_original_app_user_id,
+      product_identifier,
+      is_active,
+      expires_at,
+      locked_at,
+      updated_at,
+      last_seen_at
+  `;
+
+  const rows = await homePostgresQueryWithClient(client, query, [
+    normalizedEntitlementId,
+    userId,
+    normalizedAppUserId,
+    normalizedOriginalAppUserId,
+    normalizedProductIdentifier,
+    isActive === true,
+    expiresAt,
+    nowIso,
+  ]);
+
+  if (rows[0]) {
+    return { mapped: true, action: "upserted", lock: rows[0] };
+  }
+
+  const existingRows = await homePostgresQueryWithClient(
+    client,
+    `
+      SELECT
+        id::int AS id,
+        entitlement_id,
+        owner_user_id::int AS owner_user_id,
+        owner_app_user_id,
+        owner_original_app_user_id,
+        product_identifier,
+        is_active,
+        expires_at,
+        locked_at,
+        updated_at,
+        last_seen_at
+      FROM public.revenuecat_subscription_locks
+      WHERE entitlement_id = $1
+      LIMIT 1
+    `,
+    [normalizedEntitlementId]
+  );
+
+  const existing = existingRows[0] || null;
+  const activeRowExpiry = parseTimestampOrNull(existing?.expires_at);
+  const activeRowIsCurrent =
+    !!existing &&
+    existing.is_active === true &&
+    (!activeRowExpiry || activeRowExpiry.getTime() > Date.now());
+
+  if (isActive && activeRowIsCurrent && Number(existing.owner_user_id) !== Number(userId)) {
+    const err = new Error("Bu abonelik başka bir hesapta aktif.");
+    err.statusCode = 409;
+    err.code = "REVENUECAT_ENTITLEMENT_LOCKED";
+    err.details = {
+      entitlementId: normalizedEntitlementId,
+      lockedUserId: Number(existing.owner_user_id),
+      lockedAppUserId: existing.owner_app_user_id || null,
+      lockedAt: existing.locked_at || null,
+      expiresAt: existing.expires_at || null,
+    };
+    throw err;
+  }
+
+  if (isActive) {
+    return {
+      mapped: false,
+      reason: activeRowIsCurrent ? "locked_to_other_user" : "lock_missing",
+      entitlementId: normalizedEntitlementId,
+    };
+  }
+
+  return {
+    mapped: true,
+    action: existing ? "noop_inactive" : "noop_missing",
+    entitlementId: normalizedEntitlementId,
+  };
+};
+
 const syncRevenueCatAccessByEntitlement = async ({
   userId,
   entitlementId,
   isActive,
   expirationDate,
+  appUserId = null,
+  originalAppUserId = null,
+  productIdentifier = null,
+  purchasePlatform = null,
 }) => {
   const entitlementKey = String(entitlementId || "").trim().toLowerCase();
   const mapping = REVENUECAT_ENTITLEMENT_ACCESS[entitlementKey];
@@ -5412,6 +5836,7 @@ const syncRevenueCatAccessByEntitlement = async ({
 
   const expiresAt = toIsoTimestampOrNull(expirationDate);
   const nowIso = new Date().toISOString();
+  const normalizedPurchasePlatform = normalizePurchasePlatform(purchasePlatform);
 
   if (mapping.itemType !== "newspaper_subscription" || mapping.itemId !== null) {
     return {
@@ -5422,8 +5847,69 @@ const syncRevenueCatAccessByEntitlement = async ({
     };
   }
 
+  if (revenueCatOwnershipLockSupported) {
+    try {
+      const lockResult = await withHomePostgresClient((client) =>
+        upsertRevenueCatOwnershipLock({
+          client,
+          entitlementId: mapping.itemType === "newspaper_subscription" ? entitlementKey : entitlementId,
+          userId,
+          appUserId: appUserId || String(userId),
+          originalAppUserId,
+          productIdentifier,
+          isActive,
+          expirationDate,
+        })
+      );
+
+      if (!lockResult.mapped && lockResult.reason === "locked_to_other_user") {
+        const current = await getActiveNewspaperAccessRowFromPostgres({
+          userId,
+          nowIso,
+          client,
+          requireCurrent: false,
+        });
+        if (current?.id && isRevenueCatManagedAccessRow(current, expiresAt || nowIso)) {
+          await homePostgresQueryWithClient(
+            client,
+            `
+              UPDATE public.user_content_access
+              SET
+                is_active = FALSE,
+                expires_at = COALESCE(expires_at, now())
+              WHERE id = $1
+                AND is_active = TRUE
+            `,
+            [current.id]
+          );
+        }
+        return {
+          mapped: false,
+          reason: "locked_to_other_user",
+          entitlementId,
+        };
+      }
+    } catch (err) {
+      if (isMissingRevenueCatOwnershipLockError(err)) {
+        revenueCatOwnershipLockSupported = false;
+      } else {
+        throw err;
+      }
+    }
+  }
+
   const updateRevenueCatAccess = async (client, userAccessId) => {
-    const queryWithGrantSource = `
+    const queryWithBoth = `
+      UPDATE public.user_content_access
+      SET
+        is_active = TRUE,
+        expires_at = $2::timestamptz,
+        grant_source = $3,
+        purchase_platform = $4
+      WHERE id = $1
+      RETURNING id::int AS id
+    `;
+    const queryWithGrantSourceOnly = `
       UPDATE public.user_content_access
       SET
         is_active = TRUE,
@@ -5432,7 +5918,16 @@ const syncRevenueCatAccessByEntitlement = async ({
       WHERE id = $1
       RETURNING id::int AS id
     `;
-    const queryWithoutGrantSource = `
+    const queryWithPurchasePlatformOnly = `
+      UPDATE public.user_content_access
+      SET
+        is_active = TRUE,
+        expires_at = $2::timestamptz,
+        purchase_platform = $3
+      WHERE id = $1
+      RETURNING id::int AS id
+    `;
+    const queryWithoutMetadata = `
       UPDATE public.user_content_access
       SET
         is_active = TRUE,
@@ -5441,36 +5936,77 @@ const syncRevenueCatAccessByEntitlement = async ({
       RETURNING id::int AS id
     `;
 
-    if (!userContentAccessGrantSourceSupported) {
-      const rows = await homePostgresQueryWithClient(client, queryWithoutGrantSource, [
-        userAccessId,
-        expiresAt,
-      ]);
-      return rows[0] || null;
+    const variants = [];
+    if (userContentAccessGrantSourceSupported && userContentAccessPurchasePlatformSupported) {
+      variants.push({
+        text: queryWithBoth,
+        values: [userAccessId, expiresAt, REVENUECAT_ACCESS_SOURCE, normalizedPurchasePlatform],
+      });
+    }
+    if (userContentAccessGrantSourceSupported) {
+      variants.push({
+        text: queryWithGrantSourceOnly,
+        values: [userAccessId, expiresAt, REVENUECAT_ACCESS_SOURCE],
+      });
+    }
+    if (userContentAccessPurchasePlatformSupported) {
+      variants.push({
+        text: queryWithPurchasePlatformOnly,
+        values: [userAccessId, expiresAt, normalizedPurchasePlatform],
+      });
+    }
+    variants.push({
+      text: queryWithoutMetadata,
+      values: [userAccessId, expiresAt],
+    });
+
+    for (const variant of variants) {
+      try {
+        const rows = await homePostgresQueryWithClient(client, variant.text, variant.values);
+        return rows[0] || null;
+      } catch (err) {
+        const missingGrantSource = isMissingUserContentAccessGrantSourceError(err);
+        const missingPurchasePlatform = isMissingUserContentAccessPurchasePlatformError(err);
+        if (!missingGrantSource && !missingPurchasePlatform) {
+          throw err;
+        }
+        if (missingGrantSource) {
+          userContentAccessGrantSourceSupported = false;
+        }
+        if (missingPurchasePlatform) {
+          userContentAccessPurchasePlatformSupported = false;
+        }
+      }
     }
 
-    try {
-      const rows = await homePostgresQueryWithClient(client, queryWithGrantSource, [
-        userAccessId,
-        expiresAt,
-        REVENUECAT_ACCESS_SOURCE,
-      ]);
-      return rows[0] || null;
-    } catch (err) {
-      if (!isMissingUserContentAccessGrantSourceError(err)) {
-        throw err;
-      }
-      userContentAccessGrantSourceSupported = false;
-      const rows = await homePostgresQueryWithClient(client, queryWithoutGrantSource, [
-        userAccessId,
-        expiresAt,
-      ]);
-      return rows[0] || null;
-    }
+    return null;
   };
 
   const insertRevenueCatAccess = async (client) => {
-    const queryWithGrantSource = `
+    const queryWithBoth = `
+      INSERT INTO public.user_content_access (
+        user_id,
+        item_type,
+        item_id,
+        is_active,
+        started_at,
+        expires_at,
+        grant_source,
+        purchase_platform
+      )
+      VALUES (
+        $1,
+        'newspaper_subscription'::public.access_item_type,
+        NULL,
+        TRUE,
+        $2::timestamptz,
+        $3::timestamptz,
+        $4,
+        $5
+      )
+      RETURNING id::int AS id
+    `;
+    const queryWithGrantSourceOnly = `
       INSERT INTO public.user_content_access (
         user_id,
         item_type,
@@ -5491,7 +6027,28 @@ const syncRevenueCatAccessByEntitlement = async ({
       )
       RETURNING id::int AS id
     `;
-    const queryWithoutGrantSource = `
+    const queryWithPurchasePlatformOnly = `
+      INSERT INTO public.user_content_access (
+        user_id,
+        item_type,
+        item_id,
+        is_active,
+        started_at,
+        expires_at,
+        purchase_platform
+      )
+      VALUES (
+        $1,
+        'newspaper_subscription'::public.access_item_type,
+        NULL,
+        TRUE,
+        $2::timestamptz,
+        $3::timestamptz,
+        $4
+      )
+      RETURNING id::int AS id
+    `;
+    const queryWithoutMetadata = `
       INSERT INTO public.user_content_access (
         user_id,
         item_type,
@@ -5511,35 +6068,50 @@ const syncRevenueCatAccessByEntitlement = async ({
       RETURNING id::int AS id
     `;
 
-    if (!userContentAccessGrantSourceSupported) {
-      const rows = await homePostgresQueryWithClient(client, queryWithoutGrantSource, [
-        userId,
-        nowIso,
-        expiresAt,
-      ]);
-      return rows[0] || null;
+    const variants = [];
+    if (userContentAccessGrantSourceSupported && userContentAccessPurchasePlatformSupported) {
+      variants.push({
+        text: queryWithBoth,
+        values: [userId, nowIso, expiresAt, REVENUECAT_ACCESS_SOURCE, normalizedPurchasePlatform],
+      });
+    }
+    if (userContentAccessGrantSourceSupported) {
+      variants.push({
+        text: queryWithGrantSourceOnly,
+        values: [userId, nowIso, expiresAt, REVENUECAT_ACCESS_SOURCE],
+      });
+    }
+    if (userContentAccessPurchasePlatformSupported) {
+      variants.push({
+        text: queryWithPurchasePlatformOnly,
+        values: [userId, nowIso, expiresAt, normalizedPurchasePlatform],
+      });
+    }
+    variants.push({
+      text: queryWithoutMetadata,
+      values: [userId, nowIso, expiresAt],
+    });
+
+    for (const variant of variants) {
+      try {
+        const rows = await homePostgresQueryWithClient(client, variant.text, variant.values);
+        return rows[0] || null;
+      } catch (err) {
+        const missingGrantSource = isMissingUserContentAccessGrantSourceError(err);
+        const missingPurchasePlatform = isMissingUserContentAccessPurchasePlatformError(err);
+        if (!missingGrantSource && !missingPurchasePlatform) {
+          throw err;
+        }
+        if (missingGrantSource) {
+          userContentAccessGrantSourceSupported = false;
+        }
+        if (missingPurchasePlatform) {
+          userContentAccessPurchasePlatformSupported = false;
+        }
+      }
     }
 
-    try {
-      const rows = await homePostgresQueryWithClient(client, queryWithGrantSource, [
-        userId,
-        nowIso,
-        expiresAt,
-        REVENUECAT_ACCESS_SOURCE,
-      ]);
-      return rows[0] || null;
-    } catch (err) {
-      if (!isMissingUserContentAccessGrantSourceError(err)) {
-        throw err;
-      }
-      userContentAccessGrantSourceSupported = false;
-      const rows = await homePostgresQueryWithClient(client, queryWithoutGrantSource, [
-        userId,
-        nowIso,
-        expiresAt,
-      ]);
-      return rows[0] || null;
-    }
+    return null;
   };
 
   if (!isActive) {
@@ -5901,6 +6473,8 @@ const runRevenueCatReconcileJob = async () => {
           entitlementId: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
           isActive: verification.isActive,
           expirationDate: verification.expirationDate,
+          appUserId,
+          purchasePlatform: verification.purchasePlatform,
         });
 
         switch (accessSync.action) {
@@ -6006,6 +6580,23 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
     const appUserId = normalizeRevenueCatAppUserId(body.appUserId);
     const expectedAppUserId = normalizeRevenueCatAppUserId(body.expectedAppUserId);
     const payloadIdentityMatched = toNullableBool(body.identityMatched);
+    const customerInfo =
+      body.customerInfo && typeof body.customerInfo === "object"
+        ? body.customerInfo
+        : body.customerInfoRaw && typeof body.customerInfoRaw === "object"
+          ? body.customerInfoRaw
+          : null;
+    const productIdentifier = normalizeRevenueCatAppUserId(
+      body.productIdentifier ||
+        customerInfo?.entitlement?.productIdentifier ||
+        customerInfo?.entitlement?.product_identifier
+    );
+    const originalAppUserId = normalizeRevenueCatAppUserId(
+      customerInfo?.originalAppUserId ||
+        customerInfo?.original_app_user_id ||
+        body.originalAppUserId ||
+        body.original_app_user_id
+    );
     const bodyUserId = toPositiveIntOrNull(body.userId);
     const jwtUserId = extractJwtUserId(req.jwt);
     const hasJwtBodyMismatch =
@@ -6069,6 +6660,12 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       entitlementId,
       isActive,
       expirationDate: effectiveExpirationDate,
+      appUserId: resolved.appUserId,
+      originalAppUserId,
+      productIdentifier,
+      purchasePlatform:
+        verification.purchasePlatform ||
+        normalizePurchasePlatform(body.purchasePlatform || body.platform),
     });
 
     await writeRevenueCatAuditLog({
@@ -6198,6 +6795,12 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
           entitlementId,
           isActive: syncedIsActive,
           expirationDate: syncedExpirationDate,
+          appUserId: resolved.appUserId,
+          originalAppUserId: null,
+          productIdentifier: body.productIdentifier || null,
+          purchasePlatform:
+            verification.purchasePlatform ||
+            normalizePurchasePlatform(body.purchasePlatform || body.platform),
         });
       } else {
         accessSync = {
@@ -6334,6 +6937,12 @@ app.post("/revenuecat/subscription/refresh", requireRevenueCatAuth, async (req, 
       entitlementId,
       isActive: state.isActive,
       expirationDate: state.expirationDate,
+      appUserId: resolved.appUserId,
+      originalAppUserId: null,
+      productIdentifier: body.productIdentifier || null,
+      purchasePlatform:
+        state.verification.purchasePlatform ||
+        normalizePurchasePlatform(body.purchasePlatform || body.platform),
     });
 
     await writeRevenueCatAuditLog({
@@ -6487,6 +7096,12 @@ app.post("/revenuecat/subscription/grant", requireRevenueCatAuth, async (req, re
       entitlementId,
       isActive: state.isActive,
       expirationDate: state.expirationDate,
+      appUserId: resolved.appUserId,
+      originalAppUserId: null,
+      productIdentifier: body.productIdentifier || null,
+      purchasePlatform:
+        state.verification.purchasePlatform ||
+        normalizePurchasePlatform(body.purchasePlatform || body.platform),
     });
 
     await writeRevenueCatAuditLog({
@@ -6623,6 +7238,9 @@ app.post("/revenuecat/subscription/revoke", requireRevenueCatAuth, async (req, r
       entitlementId,
       isActive: state.isActive,
       expirationDate: state.expirationDate,
+      appUserId: resolved.appUserId,
+      originalAppUserId: null,
+      productIdentifier: body.productIdentifier || null,
     });
 
     await writeRevenueCatAuditLog({
@@ -6726,6 +7344,14 @@ app.post("/revenuecat/webhook", requireRevenueCatWebhookAuth, async (req, res) =
       entitlementId: normalized.entitlementId,
       isActive,
       expirationDate: effectiveExpirationDate,
+      appUserId: resolved.appUserId,
+      originalAppUserId: normalized.event?.originalAppUserId || null,
+      productIdentifier:
+        normalized.event?.product_id ||
+        normalized.event?.productId ||
+        normalized.event?.product_identifier ||
+        null,
+      purchasePlatform: verification.purchasePlatform,
     });
 
     await writeRevenueCatAuditLog({

@@ -109,6 +109,40 @@ psql "$DATABASE_URL" -f scripts/revenuecat_access_source_migration.sql
   kayıtlarını işaretlemek için kullanılır. CDN job'ı bu bilgiyle biten RC aboneliklerini güvenli
   şekilde temizler; manuel verilen gazete erişimleri korunur.
 
+## Satın Alma Kanalı
+- Migration dosyası:
+  `scripts/subscription_purchase_channel_migration.sql`
+- Uygulama:
+```bash
+psql "$DATABASE_URL" -f scripts/subscription_purchase_channel_migration.sql
+```
+- Not:
+  `user_content_access.purchase_platform` alanı aboneliğin hangi kanal üzerinden geldiğini tutar
+  (`google_play`, `apple`, `paratika`).
+  `orders.payment_provider` alanı da sanal POS siparişlerinde ödeme kanalını saklar.
+
+## RevenueCat Tek Sahip Kilidi
+- Migration dosyası:
+  `scripts/revenuecat_subscription_locks_migration.sql`
+- Uygulama:
+```bash
+psql "$DATABASE_URL" -f scripts/revenuecat_subscription_locks_migration.sql
+```
+- Not:
+  `revenuecat_subscription_locks` tablosu aynı RevenueCat entitlement'ının tek bir uygulama hesabına
+  bağlı kalmasını sağlar. Eski aktif kopyalar da ilk hak sahibinin dışında pasife çekilir.
+
+## Oturum Tekilleştirme
+- Migration dosyası:
+  `scripts/auth_session_id_migration.sql`
+- Uygulama:
+```bash
+psql "$DATABASE_URL" -f scripts/auth_session_id_migration.sql
+```
+- Not:
+  `users.auth_session_id` her login'de yenilenir; eski JWT'ler oturum doğrulaması sırasında
+  geçersizleşir ve ikinci cihazda aynı hesap açık kalmaz.
+
 ## Şifre Sıfırlama Token Tablosu
 - Migration dosyası:
   `scripts/password_reset_tokens_migration.sql`
