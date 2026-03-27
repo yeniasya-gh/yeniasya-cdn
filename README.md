@@ -36,6 +36,10 @@ cp .env.example .env
 # JWT_AUDIENCE=yeniasya-app
 # JWT_DEFAULT_ROLE=user
 # JWT_ALLOWED_ROLES=user
+# Hasura production console:
+# HASURA_GRAPHQL_ENABLE_CONSOLE=false
+# HASURA_GRAPHQL_DEV_MODE=false
+# HASURA_GRAPHQL_CORS_DOMAIN=https://yeniasyadijital.com,https://cdn.yeniasyadijital.com
 # Anasayfa Postgres (Hasura yerine direkt DB erişimi):
 # HOME_POSTGRES_URL=postgres://user:pass@host:5432/dbname
 # veya ayrı alanlarla:
@@ -301,7 +305,7 @@ psql "$DATABASE_URL" -f scripts/users_deactivated_at_migration.sql
   - Form-data alanları: `file` (foto/pdf), `type` (kitap|gazete|dergi|ek|slider|profil).  
   - Dosya yolları: `storage/<type>/public/`.
   - Auth: `Authorization: Bearer <JWT>`.
-- `POST /upload/private`  
+- `POST /upload/private`
   - Form-data: `file` ve `type` (kitap|gazete|dergi|ek).  
   - Dosya yolu: `storage/<type>/private/`.  
   - Yanıt `url` değeri: `/private/<type>/<filename>`.
@@ -326,6 +330,14 @@ psql "$DATABASE_URL" -f scripts/users_deactivated_at_migration.sql
   - Auth: `Authorization: Bearer <JWT>` veya `x-api-key: <AUTH_TOKEN>`.
   - Base64 viewer (varsayılan kapalı).  
   - Aktif etmek için `ENABLE_BASE64_VIEWER=true` ve opsiyonel `MAX_BASE64_VIEW_BYTES`.
+- `POST /graphql`
+  - JWT ile çalışan genel GraphQL proxy. JWTless mod varsayılan olarak kapalıdır.
+- `POST /hasura`
+  - Auth: sadece `Authorization: Bearer <JWT>`.
+  - Uygulama/web istemcileri için kullanılan güvenli proxy yoludur.
+- `POST /internal/hasura`
+  - Auth: `Authorization: Bearer <JWT>` veya `x-api-key: <AUTH_TOKEN>`.
+  - Sadece sunucu içi / job / webhook kullanımına ayrılmalıdır.
 - `POST /admin/notifications/send`
   - Auth: `Authorization: Bearer <JWT>` (admin rol) veya `x-api-key: <AUTH_TOKEN>`.
   - JSON body:

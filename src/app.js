@@ -1510,6 +1510,35 @@ const hasuraRequest = async (query, variables = {}, options = {}) => {
   return response.data?.data;
 };
 
+const proxyHasuraRequest = async (req, res) => {
+  try {
+    const { query, variables, operationName } = req.body || {};
+    if (!query) {
+      return res.status(400).json({ ok: false, error: "query is required." });
+    }
+
+    const response = await hasuraHttp.post(
+      HASURA_ENDPOINT,
+      { query, variables, operationName },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          ...buildHasuraAuthHeaders(req),
+        },
+        validateStatus: () => true,
+      }
+    );
+
+    res.status(response.status);
+    if (response.headers?.["content-type"]) {
+      res.set("Content-Type", response.headers["content-type"]);
+    }
+    return res.send(response.data);
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: "Hasura proxy failed." });
+  }
+};
+
 const HOME_ERROR_HINTS = {
   HOME_DB_CONFIG_MISSING:
     "HOME_POSTGRES_URL veya HOME_POSTGRES_HOST/PORT/DATABASE/USER/PASSWORD env değerlerini kontrol edin.",
@@ -5149,63 +5178,9 @@ app.get("/newspaper/legacy-file", requireJwt, async (req, res) => {
   }
 });
 
-app.post("/graphql", optionalJwt, async (req, res) => {
-  try {
-    const { query, variables, operationName } = req.body || {};
-    if (!query) {
-      return res.status(400).json({ ok: false, error: "query is required." });
-    }
-
-    const response = await hasuraHttp.post(
-      HASURA_ENDPOINT,
-      { query, variables, operationName },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          ...buildHasuraAuthHeaders(req),
-        },
-        validateStatus: () => true,
-      }
-    );
-
-    res.status(response.status);
-    if (response.headers?.["content-type"]) {
-      res.set("Content-Type", response.headers["content-type"]);
-    }
-    return res.send(response.data);
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: "Hasura proxy failed." });
-  }
-});
-
-app.post("/hasura", requireJwtOrServiceAuth, async (req, res) => {
-  try {
-    const { query, variables, operationName } = req.body || {};
-    if (!query) {
-      return res.status(400).json({ ok: false, error: "query is required." });
-    }
-
-    const response = await hasuraHttp.post(
-      HASURA_ENDPOINT,
-      { query, variables, operationName },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          ...buildHasuraAuthHeaders(req),
-        },
-        validateStatus: () => true,
-      }
-    );
-
-    res.status(response.status);
-    if (response.headers?.["content-type"]) {
-      res.set("Content-Type", response.headers["content-type"]);
-    }
-    return res.send(response.data);
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: "Hasura proxy failed." });
-  }
-});
+app.post("/graphql", optionalJwt, proxyHasuraRequest);
+app.post("/hasura", requireJwt, proxyHasuraRequest);
+app.post("/internal/hasura", requireJwtOrServiceAuth, proxyHasuraRequest);
 
 const findUserById = async (userId) => {
   const data = await hasuraRequest(
