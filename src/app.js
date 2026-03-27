@@ -3129,6 +3129,30 @@ const getUserByIdForAuth = async (id) => {
   return data?.users_by_pk || null;
 };
 
+const getUserByIdForPasswordChange = async (id) => {
+  const data = await hasuraRequest(
+    `
+      query GetUserByIdForPasswordChange($id: bigint!) {
+        users_by_pk(id: $id) {
+          id
+          name
+          email
+          phone
+          avatar_url
+          payUniqe
+          role_id
+          password
+          auth_session_id
+          is_active
+          email_verified_at
+        }
+      }
+    `,
+    { id }
+  );
+  return data?.users_by_pk || null;
+};
+
 const toSafeUser = (user) => {
   if (!user) return null;
   return {
@@ -4533,6 +4557,73 @@ app.delete("/auth/me/avatar", requireJwt, async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: "Avatar remove failed.",
+      requestId,
+    });
+  }
+});
+
+app.post("/auth/me/password", requireJwt, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const userId = extractJwtUserId(req.jwt);
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: "Invalid user token." });
+  }
+
+  try {
+    const currentPassword = String(req.body?.currentPassword || "");
+    const newPassword = String(req.body?.newPassword || "");
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        ok: false,
+        error: "currentPassword and newPassword are required.",
+        code: "INVALID_PASSWORD_INPUT",
+      });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        ok: false,
+        error: "Yeni şifre en az 6 karakter olmalı.",
+        code: "WEAK_PASSWORD",
+      });
+    }
+
+    const currentUser = await getUserByIdForPasswordChange(userId);
+    if (!currentUser || currentUser.is_active === false) {
+      return res.status(404).json({ ok: false, error: "User not found." });
+    }
+
+    const passwordCheck = await verifyPasswordHash(
+      currentPassword,
+      currentUser.password
+    );
+    if (!passwordCheck.ok) {
+      return res.status(401).json({
+        ok: false,
+        code: "INVALID_CURRENT_PASSWORD",
+        error: "Mevcut şifre hatalı.",
+      });
+    }
+
+    const newPasswordHash = await hashPassword(newPassword);
+    await setUserPasswordHash(currentUser.id, newPasswordHash);
+    const sessionUser = (await issueUserAuthSession(currentUser.id)) || currentUser;
+    const { token, expiresAt } = buildJwtForAppUser(sessionUser);
+
+    return res.json({
+      ok: true,
+      user: toSafeUser(sessionUser),
+      token,
+      expiresAt,
+      requestId,
+    });
+  } catch (err) {
+    console.error(
+      `[auth][me][password][error] id=${requestId} userId=${userId} msg=${err.message}`
+    );
+    return res.status(500).json({
+      ok: false,
+      error: "Password change failed.",
       requestId,
     });
   }

@@ -193,6 +193,16 @@ psql "$DATABASE_URL" -f scripts/content_publication_status_migration.sql
 - Not:
   `books.is_published` ve `magazine_issue.is_published` alanları public listelerde görünürlüğü kontrol eder; satın alınmış içerik kütüphane tarafında erişilebilir kalır.
 
+## Pasif Kullanıcı Tarihi
+- Migration dosyası:
+  `scripts/users_deactivated_at_migration.sql`
+- Uygulama:
+```bash
+psql "$DATABASE_URL" -f scripts/users_deactivated_at_migration.sql
+```
+- Not:
+  `users.deactivated_at` alanı kullanıcı pasife alındığında tarih bilgisini saklar. Admin panelde pasif kullanıcılar bu alanla listelenir.
+
 ## Endpoint'ler
 - `POST /auth/register`
   - JSON body: `{ "name": "...", "email": "...", "password": "...", "phone": "..." }`
