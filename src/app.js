@@ -2362,6 +2362,8 @@ const getUserOrdersFromPostgres = async ({ userId, includeItems = false }) => {
       SELECT
         id::int AS id,
         order_id::int AS order_id,
+        product_id::int AS product_id,
+        ek_id::int AS ek_id,
         title,
         quantity::int AS quantity,
         unit_price,
@@ -2471,6 +2473,8 @@ const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
         unit_price,
         line_total,
         product_type,
+        product_id::int AS product_id,
+        ek_id::int AS ek_id,
         metadata
       FROM public.order_items
       WHERE order_id = $1
