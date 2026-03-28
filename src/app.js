@@ -23,10 +23,24 @@ const STORAGE_ROOT = path.resolve(
   process.env.STORAGE_ROOT || path.join(__dirname, "..", "storage")
 );
 const TMP_DIR = path.join(STORAGE_ROOT, "_tmp");
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
-  .split(",")
-  .map((v) => v.trim())
-  .filter(Boolean);
+const ALLOWED_ORIGINS = (() => {
+  const origins = (process.env.ALLOWED_ORIGINS || "*")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+  const normalized = new Set(origins);
+  const domainAliases = [
+    ["https://yeniasyadijital.com", "https://www.yeniasyadijital.com"],
+    ["https://yeniasya.com.tr", "https://www.yeniasya.com.tr"],
+  ];
+
+  for (const [bare, www] of domainAliases) {
+    if (normalized.has(bare)) normalized.add(www);
+    if (normalized.has(www)) normalized.add(bare);
+  }
+
+  return Array.from(normalized);
+})();
 const ALLOWED_HEADERS =
   process.env.ALLOWED_HEADERS || "content-type, x-api-key, authorization, x-mail-token";
 const ALLOWED_METHODS = "GET, POST, OPTIONS";
@@ -37,25 +51,30 @@ const RATE_LIMIT_WINDOW_MS =
   Number.isFinite(RATE_LIMIT_WINDOW_MS_RAW) && RATE_LIMIT_WINDOW_MS_RAW > 0
     ? RATE_LIMIT_WINDOW_MS_RAW
     : 900000;
-const RATE_LIMIT_MAX_RAW = Number(process.env.RATE_LIMIT_MAX || "1200");
+const RATE_LIMIT_MAX_RAW = Number(process.env.RATE_LIMIT_MAX || "6000");
 const RATE_LIMIT_MAX =
   Number.isFinite(RATE_LIMIT_MAX_RAW) && RATE_LIMIT_MAX_RAW > 0
     ? RATE_LIMIT_MAX_RAW
     : 1200;
-const AUTH_RATE_LIMIT_MAX_RAW = Number(process.env.AUTH_RATE_LIMIT_MAX || "20");
+const AUTH_RATE_LIMIT_MAX_RAW = Number(process.env.AUTH_RATE_LIMIT_MAX || "120");
 const AUTH_RATE_LIMIT_MAX =
   Number.isFinite(AUTH_RATE_LIMIT_MAX_RAW) && AUTH_RATE_LIMIT_MAX_RAW > 0
     ? AUTH_RATE_LIMIT_MAX_RAW
     : 20;
+const LOGIN_RATE_LIMIT_MAX_RAW = Number(process.env.LOGIN_RATE_LIMIT_MAX || "240");
+const LOGIN_RATE_LIMIT_MAX =
+  Number.isFinite(LOGIN_RATE_LIMIT_MAX_RAW) && LOGIN_RATE_LIMIT_MAX_RAW > 0
+    ? LOGIN_RATE_LIMIT_MAX_RAW
+    : 60;
 const GUEST_TOKEN_RATE_LIMIT_MAX_RAW = Number(
-  process.env.GUEST_TOKEN_RATE_LIMIT_MAX || "120"
+  process.env.GUEST_TOKEN_RATE_LIMIT_MAX || "300"
 );
 const GUEST_TOKEN_RATE_LIMIT_MAX =
   Number.isFinite(GUEST_TOKEN_RATE_LIMIT_MAX_RAW) && GUEST_TOKEN_RATE_LIMIT_MAX_RAW > 0
     ? GUEST_TOKEN_RATE_LIMIT_MAX_RAW
     : 120;
 const PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX_RAW = Number(
-  process.env.PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX || "8"
+  process.env.PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX || "30"
 );
 const PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX =
   Number.isFinite(PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX_RAW) &&
@@ -63,7 +82,7 @@ const PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX =
     ? PASSWORD_RESET_REQUEST_RATE_LIMIT_MAX_RAW
     : 8;
 const PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX_RAW = Number(
-  process.env.PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX || "10"
+  process.env.PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX || "30"
 );
 const PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX =
   Number.isFinite(PASSWORD_RESET_CONFIRM_RATE_LIMIT_MAX_RAW) &&
@@ -86,7 +105,7 @@ const EMAIL_VERIFICATION_TOKEN_TTL_MINUTES =
   EMAIL_VERIFICATION_TOKEN_TTL_MINUTES_RAW > 0
     ? EMAIL_VERIFICATION_TOKEN_TTL_MINUTES_RAW
     : 60;
-const UPLOAD_RATE_LIMIT_MAX_RAW = Number(process.env.UPLOAD_RATE_LIMIT_MAX || "60");
+const UPLOAD_RATE_LIMIT_MAX_RAW = Number(process.env.UPLOAD_RATE_LIMIT_MAX || "120");
 const UPLOAD_RATE_LIMIT_MAX =
   Number.isFinite(UPLOAD_RATE_LIMIT_MAX_RAW) && UPLOAD_RATE_LIMIT_MAX_RAW > 0
     ? UPLOAD_RATE_LIMIT_MAX_RAW
@@ -844,6 +863,55 @@ const buildRateLimiter = ({ windowMs, max, message, skip }) =>
     skip,
   });
 
+const isStaticAssetRequest = (req) => {
+  const method = String(req.method || "").trim().toUpperCase();
+  if (method !== "GET" && method !== "HEAD") {
+    return false;
+  }
+
+  const pathname = String(req.path || "").trim();
+  if (!pathname) return false;
+  if (pathname === "/health") return true;
+  if (pathname === "/" || pathname === "/favicon.ico" || pathname === "/manifest.json") {
+    return true;
+  }
+
+  if (
+    pathname.startsWith("/assets/") ||
+    pathname.startsWith("/icons/") ||
+    pathname.startsWith("/images/") ||
+    pathname.startsWith("/fonts/") ||
+    pathname.startsWith("/packages/")
+  ) {
+    return true;
+  }
+
+  return (
+    pathname.endsWith(".js") ||
+    pathname.endsWith(".css") ||
+    pathname.endsWith(".map") ||
+    pathname.endsWith(".png") ||
+    pathname.endsWith(".jpg") ||
+    pathname.endsWith(".jpeg") ||
+    pathname.endsWith(".gif") ||
+    pathname.endsWith(".webp") ||
+    pathname.endsWith(".svg") ||
+    pathname.endsWith(".ico") ||
+    pathname.endsWith(".woff") ||
+    pathname.endsWith(".woff2") ||
+    pathname.endsWith(".ttf") ||
+    pathname.endsWith(".eot") ||
+    pathname.endsWith(".wasm")
+  );
+};
+
+const shouldSkipGlobalRateLimit = (req) => {
+  if (req.path === "/health") {
+    return true;
+  }
+  return isStaticAssetRequest(req);
+};
+
 const hasAdminRoleInBearerToken = (token) => {
   if (!token) return false;
   try {
@@ -881,12 +949,17 @@ const globalRateLimiter = buildRateLimiter({
   windowMs: RATE_LIMIT_WINDOW_MS,
   max: RATE_LIMIT_MAX,
   message: "Too many requests.",
-  skip: (req) => req.path === "/health",
+  skip: shouldSkipGlobalRateLimit,
 });
 const authRateLimiter = buildRateLimiter({
   windowMs: RATE_LIMIT_WINDOW_MS,
   max: AUTH_RATE_LIMIT_MAX,
   message: "Too many authentication attempts.",
+});
+const loginRateLimiter = buildRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: LOGIN_RATE_LIMIT_MAX,
+  message: "Too many login attempts.",
 });
 const guestTokenRateLimiter = buildRateLimiter({
   windowMs: RATE_LIMIT_WINDOW_MS,
@@ -4129,9 +4202,10 @@ const setUserPasswordHash = async (userId, passwordHash) => {
 };
 
 app.use(
-  ["/auth/register", "/auth/login", "/auth/social-login"],
+  ["/auth/register", "/auth/social-login"],
   authRateLimiter
 );
+app.use("/auth/login", loginRateLimiter);
 app.use("/auth/social-register", authRateLimiter);
 app.use("/auth/guest-token", guestTokenRateLimiter);
 app.use("/auth/email-verification/request", passwordResetRequestRateLimiter);
