@@ -4105,6 +4105,10 @@ const buildHasuraAuthHeaders = (req) => {
   }
 
   if (req?.hasuraAuthMode === "jwt" && req?.jwtToken) {
+    if (hasAdminRoleInBearerToken(req.jwtToken)) {
+      headers["x-hasura-admin-secret"] = HASURA_ADMIN_SECRET;
+      return headers;
+    }
     headers.Authorization = `Bearer ${req.jwtToken}`;
   }
 
