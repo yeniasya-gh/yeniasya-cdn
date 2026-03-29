@@ -535,6 +535,15 @@ const isMissingUserContentAccessPurchasePlatformError = (err) =>
 const isMissingOrderPaymentProviderError = (err) =>
   String(err?.code || "") === "42703" &&
   String(err?.message || "").toLowerCase().includes("payment_provider");
+const isMissingOrderPaymentMetadataError = (err) => {
+  if (String(err?.code || "") !== "42703") return false;
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    message.includes("payment_provider") ||
+    message.includes("merchant_payment_id") ||
+    message.includes("payment_session_token")
+  );
+};
 
 const parseTimestampOrNull = (value) => {
   const normalized = normalizeRevenueCatAppUserId(value);
@@ -2207,6 +2216,7 @@ const getManualNewspaperAccessRows = async ({ userId }) => {
           starts_at,
           ends_at,
           is_active,
+          COALESCE(status, 'new') AS status,
           note
         FROM public.manual_newspaper_users
         WHERE user_id = $1
@@ -2224,6 +2234,7 @@ const getManualNewspaperAccessRows = async ({ userId }) => {
       expires_at: row.ends_at,
       is_active: row.is_active === true,
       source: "manual_newspaper",
+      status: row.status,
       note: row.note || null,
     }));
   } catch (err) {
@@ -2313,6 +2324,8 @@ const getUserOrdersFromPostgres = async ({ userId, includeItems = false }) => {
             total_paid,
             status::text AS status,
             payment_provider,
+            merchant_payment_id,
+            payment_session_token,
             CASE WHEN promo_code_id IS NULL THEN NULL ELSE promo_code_id::int END AS promo_code_id,
             promo_code,
             promo_discount_percent,
@@ -2325,7 +2338,7 @@ const getUserOrdersFromPostgres = async ({ userId, includeItems = false }) => {
         [userId]
       );
     } catch (err) {
-      if (!isMissingOrderPaymentProviderError(err)) {
+      if (!isMissingOrderPaymentMetadataError(err)) {
         throw err;
       }
       return homePostgresQuery(
@@ -2334,6 +2347,8 @@ const getUserOrdersFromPostgres = async ({ userId, includeItems = false }) => {
             id::int AS id,
             total_paid,
             status::text AS status,
+            merchant_payment_id,
+            payment_session_token,
             CASE WHEN promo_code_id IS NULL THEN NULL ELSE promo_code_id::int END AS promo_code_id,
             promo_code,
             promo_discount_percent,
@@ -2403,6 +2418,8 @@ const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
             status::text AS status,
             created_at,
             payment_provider,
+            merchant_payment_id,
+            payment_session_token,
             CASE
               WHEN delivery_address_id IS NULL THEN NULL
               ELSE delivery_address_id::int
@@ -2426,7 +2443,7 @@ const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
         [orderId, userId]
       );
     } catch (err) {
-      if (!isMissingOrderPaymentProviderError(err)) {
+      if (!isMissingOrderPaymentMetadataError(err)) {
         throw err;
       }
       return homePostgresQuery(
@@ -2436,6 +2453,8 @@ const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
             total_paid,
             status::text AS status,
             created_at,
+            merchant_payment_id,
+            payment_session_token,
             CASE
               WHEN delivery_address_id IS NULL THEN NULL
               ELSE delivery_address_id::int
@@ -3178,6 +3197,41 @@ const getUserMailProfile = async (userId) => {
   return data?.users_by_pk || null;
 };
 
+const getOldManualNewspaperAccessByEmail = async (email) => {
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) return null;
+
+  try {
+    const rows = await homePostgresQuery(
+      `
+        SELECT
+          m.id::int AS id,
+          m.user_id::int AS user_id,
+          u.email
+        FROM public.manual_newspaper_users m
+        INNER JOIN public.users u ON u.id = m.user_id
+        WHERE lower(u.email) = lower($1)
+          AND m.is_active = TRUE
+          AND COALESCE(m.status, 'new') = 'old'
+        ORDER BY m.ends_at DESC NULLS LAST, m.starts_at DESC NULLS LAST, m.id DESC
+        LIMIT 1
+      `,
+      [normalizedEmail]
+    );
+    return rows[0] || null;
+  } catch (err) {
+    const message = String(err?.message || "").toLowerCase();
+    if (
+      String(err?.code || "") === "42P01" ||
+      String(err?.code || "") === "42703" ||
+      message.includes("manual_newspaper_users")
+    ) {
+      return null;
+    }
+    throw err;
+  }
+};
+
 const getUserByEmailForAuth = async (email) => {
   const data = await hasuraRequest(
     `
@@ -3808,6 +3862,7 @@ const getActiveManualNewspaperAccessRowFromPostgres = async ({ userId, nowIso })
           id::int AS id,
           ends_at AS expires_at,
           starts_at AS started_at,
+          COALESCE(status, 'new') AS status,
           'manual_newspaper'::text AS grant_source
         FROM public.manual_newspaper_users
         WHERE user_id = $1
@@ -4243,6 +4298,20 @@ app.post("/auth/register", async (req, res) => {
         `[auth][register][weak-password] id=${requestId} ip=${req.ip} email=${email}`
       );
       return res.status(400).json({ ok: false, error: "Password is too short." });
+    }
+
+    const oldManualAccess = await getOldManualNewspaperAccessByEmail(email);
+    if (oldManualAccess) {
+      console.warn(
+        `[auth][register][old-manual-newspaper] id=${requestId} ip=${req.ip} email=${email} userId=${oldManualAccess.user_id}`
+      );
+      return res.status(409).json({
+        ok: false,
+        code: "OLD_MANUAL_NEWSPAPER_ACCOUNT",
+        redirectToPasswordReset: true,
+        error:
+          "Bu e-posta eski e-gazete aboneliğine ait. Lütfen şifrenizi sıfırlayın.",
+      });
     }
 
     const existing = await getUserByEmailForAuth(email);
