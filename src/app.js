@@ -4291,13 +4291,19 @@ app.post("/auth/register", async (req, res) => {
       );
       return res
         .status(400)
-        .json({ ok: false, error: "name, email, password are required." });
+        .json({
+          ok: false,
+          error: "Ad, e-posta ve şifre zorunludur.",
+        });
     }
     if (password.length < 8) {
       console.warn(
         `[auth][register][weak-password] id=${requestId} ip=${req.ip} email=${email}`
       );
-      return res.status(400).json({ ok: false, error: "Password is too short." });
+      return res.status(400).json({
+        ok: false,
+        error: "Şifre en az 8 karakter olmalıdır.",
+      });
     }
 
     const oldManualAccess = await getOldManualNewspaperAccessByEmail(email);
@@ -5094,13 +5100,13 @@ app.post("/auth/password-reset/confirm", async (req, res) => {
     if (!token || !password) {
       return res.status(400).json({
         ok: false,
-        error: "token and password are required.",
+        error: "Token ve şifre zorunludur.",
       });
     }
     if (password.length < 8) {
       return res.status(400).json({
         ok: false,
-        error: "Password is too short.",
+        error: "Şifre en az 8 karakter olmalıdır.",
       });
     }
 
