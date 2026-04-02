@@ -1462,6 +1462,9 @@ app.get("/home/showcase/books", async (req, res) =>
 app.get("/home/showcase/magazines", async (req, res) =>
   sendHomeSectionResponse(req, res, "homeMagazineEntries")
 );
+app.get("/home/showcase/attachments", async (req, res) =>
+  sendHomeSectionResponse(req, res, "homeEkEntries")
+);
 
 app.get("/app/feature-flags", async (req, res) => {
   const requestId = crypto.randomUUID();
@@ -1971,6 +1974,7 @@ const HOME_SECTION_KEYS = [
   "attachments",
   "homeBookEntries",
   "homeMagazineEntries",
+  "homeEkEntries",
 ];
 
 const createHomeSectionCacheEntry = () => ({
@@ -2097,6 +2101,7 @@ const homeSectionLoaders = {
   attachments: async () => homePostgresQuery(homeAttachmentsSql),
   homeBookEntries: async () => homePostgresQuery(homeShowcaseSql, ["book"]),
   homeMagazineEntries: async () => homePostgresQuery(homeShowcaseSql, ["magazine"]),
+  homeEkEntries: async () => homePostgresQuery(homeShowcaseSql, ["ek"]),
 };
 
 const cloneHomeSectionValue = (value) =>
@@ -2167,6 +2172,7 @@ const getCachedHomeBootstrap = async () => {
     attachments: sections[4].data,
     homeBookEntries: sections[5].data,
     homeMagazineEntries: sections[6].data,
+    homeEkEntries: sections[7].data,
     fetchedAt: new Date().toISOString(),
   };
   return {
@@ -3266,6 +3272,34 @@ const getUserByEmailForAuth = async (email) => {
   return data?.users?.[0] || null;
 };
 
+const getUserByPhoneForAuth = async (phone) => {
+  const data = await hasuraRequest(
+    `
+      query GetUserByPhoneForAuth($phone: String!) {
+        users(
+          where: { phone: { _eq: $phone } }
+          order_by: [{email_verified_at: desc_nulls_last}, {id: asc}]
+          limit: 1
+        ) {
+          id
+          name
+          email
+          phone
+          avatar_url
+          payUniqe
+          auth_session_id
+          role_id
+          password
+          is_active
+          email_verified_at
+        }
+      }
+    `,
+    { phone }
+  );
+  return data?.users?.[0] || null;
+};
+
 const getUserByIdForAuth = async (id) => {
   const data = await hasuraRequest(
     `
@@ -4315,9 +4349,23 @@ app.post("/auth/register", async (req, res) => {
         ok: false,
         code: "OLD_MANUAL_NEWSPAPER_ACCOUNT",
         redirectToPasswordReset: true,
-        error:
+          error:
           "Bu e-posta eski e-gazete aboneliğine ait. Lütfen şifrenizi sıfırlayın.",
       });
+    }
+
+    if (phone) {
+      const existingPhone = await getUserByPhoneForAuth(phone);
+      if (existingPhone?.id) {
+        console.warn(
+          `[auth][register][phone-exists] id=${requestId} ip=${req.ip} email=${email} phone=${phone} userId=${existingPhone.id}`
+        );
+        return res.status(409).json({
+          ok: false,
+          code: "USER_PHONE_ALREADY_EXISTS",
+          error: "Bu telefon numarası zaten kayıtlı.",
+        });
+      }
     }
 
     const existing = await getUserByEmailForAuth(email);
