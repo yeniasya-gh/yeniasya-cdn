@@ -4424,6 +4424,20 @@ const setUserPasswordHash = async (userId, passwordHash) => {
   );
 };
 
+const isRegisterDuplicateConstraintError = (error) => {
+  const message = String(error?.message || "").toLowerCase();
+  if (!message.includes("duplicate key value violates unique constraint")) {
+    return false;
+  }
+  return (
+    message.includes("users_email_key") ||
+    message.includes("users_phone_key") ||
+    message.includes("users_email_active_unique_idx") ||
+    message.includes("users_phone_active_unique_idx") ||
+    message.includes("users_email_lower_unique_idx")
+  );
+};
+
 app.use(
   ["/auth/register", "/auth/social-login"],
   authRateLimiter
@@ -4564,47 +4578,100 @@ app.post("/auth/register", async (req, res) => {
 
     const passwordHash = await hashPassword(password);
     const payUniqe = crypto.randomUUID();
-    const created = await hasuraRequest(
-      `
-        mutation CreateUser($object: users_insert_input!) {
-          insert_users_one(object: $object) {
-            id
-            name
-            email
-            phone
-            avatar_url
-            payUniqe
-            role_id
-          }
-        }
-      `,
-      {
-        object: {
-          name,
-          email,
-          phone,
-          password: passwordHash,
-          payUniqe,
-        },
-      }
-    );
-
-    const user = created?.insert_users_one;
-    if (!user) {
-      return res.status(500).json({ ok: false, error: "User creation failed." });
-    }
-
-    await sendEmailVerificationMail({ user, req });
-    console.log(
-      `[auth][register][success] id=${requestId} ip=${req.ip} email=${email} userId=${user.id}`
-    );
-    return res.json({
-      ok: true,
-      requiresEmailVerification: true,
+    const createPayload = {
+      name,
       email,
-      message:
-        "Üye kaydı başarılı. E-posta adresinize gönderilen bağlantı ile hesabınızı aktifleştirin.",
-    });
+      phone,
+      password: passwordHash,
+      payUniqe,
+    };
+
+    try {
+      const created = await hasuraRequest(
+        `
+          mutation CreateUser($object: users_insert_input!) {
+            insert_users_one(object: $object) {
+              id
+              name
+              email
+              phone
+              avatar_url
+              payUniqe
+              role_id
+            }
+          }
+        `,
+        {
+          object: createPayload,
+        }
+      );
+
+      const user = created?.insert_users_one;
+      if (!user) {
+        return res.status(500).json({ ok: false, error: "User creation failed." });
+      }
+
+      await sendEmailVerificationMail({ user, req });
+      console.log(
+        `[auth][register][success] id=${requestId} ip=${req.ip} email=${email} userId=${user.id}`
+      );
+      return res.json({
+        ok: true,
+        requiresEmailVerification: true,
+        email,
+        message:
+          "Üye kaydı başarılı. E-posta adresinize gönderilen bağlantı ile hesabınızı aktifleştirin.",
+      });
+    } catch (createErr) {
+      if (!isRegisterDuplicateConstraintError(createErr)) {
+        throw createErr;
+      }
+
+      const fallbackInactiveByEmail = await getInactiveUserByEmailForAuth(email);
+      const fallbackInactiveByPhone = fallbackInactiveByEmail
+        ? null
+        : phone
+          ? await getInactiveUserByPhoneForAuth(phone)
+          : null;
+      const fallbackInactiveMatch = fallbackInactiveByEmail || fallbackInactiveByPhone;
+
+      if (!fallbackInactiveMatch?.id) {
+        throw createErr;
+      }
+
+      const reactivated = await reactivateUserForRegister({
+        user: fallbackInactiveMatch,
+        name,
+        email,
+        phone,
+        passwordHash,
+        emailVerifiedAt: fallbackInactiveMatch.email_verified_at || null,
+      });
+      if (!reactivated) {
+        throw new Error("Inactive user reactivation failed.");
+      }
+
+      if (!reactivated.email_verified_at) {
+        try {
+          await sendEmailVerificationMail({ user: reactivated, req });
+        } catch (mailErr) {
+          console.warn(
+            `[auth][register][reactivated-mail-failed] id=${requestId} email=${email} userId=${reactivated.id} msg=${mailErr.message}`
+          );
+        }
+      }
+
+      console.log(
+        `[auth][register][reactivated-fallback] id=${requestId} ip=${req.ip} email=${email} userId=${reactivated.id}`
+      );
+      return res.json({
+        ok: true,
+        requiresEmailVerification: !reactivated.email_verified_at,
+        email,
+        message:
+          "Üye kaydı başarılı. E-posta adresinize gönderilen bağlantı ile hesabınızı aktifleştirin.",
+      });
+    }
   } catch (err) {
     console.error(
       `[auth][register][error] id=${requestId} ip=${req.ip} email=${emailForLog} msg=${err.message}`
