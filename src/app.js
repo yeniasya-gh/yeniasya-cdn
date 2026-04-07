@@ -3373,24 +3373,33 @@ const getInactiveUserByPhoneForAuth = async (phone) => {
 const getInactiveUsersByIdentityForAuth = async ({ email, phone }) => {
   const normalizedEmail = normalizeEmail(email);
   const normalizedPhone = String(phone || "").trim();
-  const clauses = [];
-  const values = [];
-
   if (normalizedEmail) {
-    values.push(normalizedEmail);
-    clauses.push(`LOWER(email) = LOWER($${values.length})`);
+    const emailRows = await homePostgresQuery(
+      `
+        SELECT
+          id::bigint AS id,
+          name,
+          email,
+          phone,
+          email_verified_at,
+          deactivated_at
+        FROM public.users
+        WHERE is_active = FALSE
+          AND LOWER(email) = LOWER($1)
+        ORDER BY email_verified_at DESC NULLS LAST, id ASC
+      `,
+      [normalizedEmail]
+    );
+    if (emailRows.length) {
+      return emailRows;
+    }
   }
 
-  if (normalizedPhone) {
-    values.push(normalizedPhone);
-    clauses.push(`phone = $${values.length}`);
-  }
-
-  if (!clauses.length) {
+  if (!normalizedPhone) {
     return [];
   }
 
-  const rows = await homePostgresQuery(
+  return homePostgresQuery(
     `
       SELECT
         id::bigint AS id,
@@ -3401,12 +3410,11 @@ const getInactiveUsersByIdentityForAuth = async ({ email, phone }) => {
         deactivated_at
       FROM public.users
       WHERE is_active = FALSE
-        AND (${clauses.join(" OR ")})
+        AND phone = $1
       ORDER BY email_verified_at DESC NULLS LAST, id ASC
     `,
-    values
+    [normalizedPhone]
   );
-  return rows;
 };
 
 const purgeInactiveUsersForAuthIdentity = async ({ email, phone }) => {
