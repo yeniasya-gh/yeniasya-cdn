@@ -1102,7 +1102,7 @@ const requireAuth = (req, res, next) => {
         message: "Unauthorized request.",
       });
     }
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
+    return res.status(401).json({ ok: false, error: "Yetkisiz erişim." });
   }
 
   next();
@@ -1114,7 +1114,7 @@ const requireMailAuth = (req, res, next) => {
     ? raw.slice(7)
     : raw;
   if (!MAIL_SETTINGS.token || !token || !safeTokenCompare(token, MAIL_SETTINGS.token)) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
+    return res.status(401).json({ ok: false, error: "Yetkisiz erişim." });
   }
   next();
 };
@@ -3370,6 +3370,333 @@ const getInactiveUserByPhoneForAuth = async (phone) => {
   return data?.users?.[0] || null;
 };
 
+const getInactiveUsersByIdentityForAuth = async ({ email, phone }) => {
+  const normalizedEmail = normalizeEmail(email);
+  const normalizedPhone = String(phone || "").trim();
+  const clauses = [];
+  const values = [];
+
+  if (normalizedEmail) {
+    values.push(normalizedEmail);
+    clauses.push(`LOWER(email) = LOWER($${values.length})`);
+  }
+
+  if (normalizedPhone) {
+    values.push(normalizedPhone);
+    clauses.push(`phone = $${values.length}`);
+  }
+
+  if (!clauses.length) {
+    return [];
+  }
+
+  const rows = await homePostgresQuery(
+    `
+      SELECT
+        id::bigint AS id,
+        name,
+        email,
+        phone,
+        email_verified_at,
+        deactivated_at
+      FROM public.users
+      WHERE is_active = FALSE
+        AND (${clauses.join(" OR ")})
+      ORDER BY email_verified_at DESC NULLS LAST, id ASC
+    `,
+    values
+  );
+  return rows;
+};
+
+const purgeInactiveUsersForAuthIdentity = async ({ email, phone }) => {
+  const inactiveUsers = await getInactiveUsersByIdentityForAuth({ email, phone });
+  if (!inactiveUsers.length) {
+    return {
+      deletedUserIds: [],
+      deletedCount: 0,
+      deletedCounts: {},
+    };
+  }
+
+  return purgeUsersByIdsFromPostgres(inactiveUsers.map((user) => user.id));
+};
+
+const homePostgresTableExists = async (client, tableName) => {
+  const rows = await homePostgresQueryWithClient(
+    client,
+    `
+      SELECT to_regclass($1) IS NOT NULL AS exists
+    `,
+    [tableName]
+  );
+  return rows[0]?.exists === true;
+};
+
+const homePostgresColumnExists = async (client, tableName, columnName) => {
+  const rows = await homePostgresQueryWithClient(
+    client,
+    `
+      SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = $1
+          AND column_name = $2
+      ) AS exists
+    `,
+    [tableName, columnName]
+  );
+  return rows[0]?.exists === true;
+};
+
+const deleteHomePostgresRowsIfTableExists = async (
+  client,
+  tableName,
+  query,
+  values = []
+) => {
+  const exists = await homePostgresTableExists(client, tableName);
+  if (!exists) return 0;
+  const rows = await homePostgresQueryWithClient(client, query, values);
+  return rows.length;
+};
+
+const purgeUsersByIdsFromPostgres = async (userIds) => {
+  const ids = Array.from(
+    new Set(
+      (Array.isArray(userIds) ? userIds : [userIds])
+        .map((value) => Number.parseInt(value, 10))
+        .filter((value) => Number.isInteger(value) && value > 0)
+    )
+  );
+
+  if (!ids.length) {
+    return { deletedUserIds: [], deletedCount: 0 };
+  }
+
+  return withHomePostgresClient(async (client) => {
+    await client.query("BEGIN");
+    try {
+      const deletedCounts = {};
+      const deleteMany = async (key, tableName, query, values) => {
+        deletedCounts[key] = await deleteHomePostgresRowsIfTableExists(
+          client,
+          tableName,
+          query,
+          values
+        );
+      };
+
+      await deleteMany(
+        "order_items",
+        "order_items",
+        `
+          DELETE FROM public.order_items
+          WHERE order_id IN (
+            SELECT id FROM public.orders WHERE user_id = ANY($1::bigint[])
+          )
+          RETURNING id
+        `,
+        [ids]
+      );
+
+      await deleteMany(
+        "orders",
+        "orders",
+        `
+          DELETE FROM public.orders
+          WHERE user_id = ANY($1::bigint[])
+          RETURNING id
+        `,
+        [ids]
+      );
+
+      await deleteMany(
+        "manual_newspaper_users",
+        "manual_newspaper_users",
+        `
+          DELETE FROM public.manual_newspaper_users
+          WHERE user_id = ANY($1::bigint[])
+          RETURNING id
+        `,
+        [ids]
+      );
+
+      await deleteMany(
+        "user_content_access",
+        "user_content_access",
+        `
+          DELETE FROM public.user_content_access
+          WHERE user_id = ANY($1::bigint[])
+          RETURNING id
+        `,
+        [ids]
+      );
+
+      await deleteMany(
+        "notifications",
+        "notifications",
+        `
+          DELETE FROM public.notifications
+          WHERE user_id = ANY($1::bigint[])
+          RETURNING id
+        `,
+        [ids]
+      );
+
+      await deleteMany(
+        "contact_messages",
+        "contact_messages",
+        `
+          DELETE FROM public.contact_messages
+          WHERE user_id = ANY($1::bigint[])
+          RETURNING id
+        `,
+        [ids]
+      );
+
+      await deleteMany(
+        "product_reviews",
+        "product_reviews",
+        `
+          DELETE FROM public.product_reviews
+          WHERE user_id = ANY($1::bigint[])
+          RETURNING id
+        `,
+        [ids]
+      );
+
+      await deleteMany(
+        "user_addresses",
+        "user_addresses",
+        `
+          DELETE FROM public.user_addresses
+          WHERE user_id = ANY($1::bigint[])
+          RETURNING id
+        `,
+        [ids]
+      );
+
+      await deleteMany(
+        "password_reset_tokens",
+        "password_reset_tokens",
+        `
+          DELETE FROM public.password_reset_tokens
+          WHERE user_id = ANY($1::bigint[])
+          RETURNING id
+        `,
+        [ids]
+      );
+
+      await deleteMany(
+        "email_verification_tokens",
+        "email_verification_tokens",
+        `
+          DELETE FROM public.email_verification_tokens
+          WHERE user_id = ANY($1::bigint[])
+          RETURNING id
+        `,
+        [ids]
+      );
+
+      if (
+        (await homePostgresTableExists(client, "user_access_audit_log")) &&
+        (await homePostgresColumnExists(client, "user_access_audit_log", "user_id")) &&
+        (await homePostgresColumnExists(
+          client,
+          "user_access_audit_log",
+          "actor_user_id"
+        ))
+      ) {
+        deletedCounts.user_access_audit_log = (
+          await homePostgresQueryWithClient(
+            client,
+            `
+              DELETE FROM public.user_access_audit_log
+              WHERE user_id = ANY($1::bigint[])
+                 OR actor_user_id = ANY($1::bigint[])
+              RETURNING id
+            `,
+            [ids]
+          )
+        ).length;
+      }
+
+      await deleteMany(
+        "revenuecat_subscription_locks",
+        "revenuecat_subscription_locks",
+        `
+          DELETE FROM public.revenuecat_subscription_locks
+          WHERE owner_user_id = ANY($1::bigint[])
+          RETURNING id
+        `,
+        [ids]
+      );
+
+      if (
+        (await homePostgresTableExists(client, "revenuecat_sync_logs")) &&
+        (await homePostgresColumnExists(client, "revenuecat_sync_logs", "user_id"))
+      ) {
+        deletedCounts.revenuecat_sync_logs = (
+          await homePostgresQueryWithClient(
+            client,
+            `
+              DELETE FROM public.revenuecat_sync_logs
+              WHERE user_id = ANY($1::bigint[])
+              RETURNING id
+            `,
+            [ids]
+          )
+        ).length;
+      }
+
+      deletedCounts.users = (
+        await homePostgresQueryWithClient(
+          client,
+          `
+            DELETE FROM public.users
+            WHERE id = ANY($1::bigint[])
+            RETURNING id
+          `,
+          [ids]
+        )
+      ).length;
+
+      await client.query("COMMIT");
+      return {
+        deletedUserIds: ids,
+        deletedCount: Object.values(deletedCounts).reduce(
+          (total, count) => total + Number(count || 0),
+          0
+        ),
+        deletedCounts,
+      };
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    }
+  });
+};
+
+const getInactiveUserIdentityById = async (userId) => {
+  const rows = await homePostgresQuery(
+    `
+      SELECT
+        id::bigint AS id,
+        name,
+        email,
+        phone,
+        is_active
+      FROM public.users
+      WHERE id = $1
+      LIMIT 1
+    `,
+    [userId]
+  );
+  return rows[0] || null;
+};
+
 const getUserByIdForAuth = async (id) => {
   const data = await hasuraRequest(
     `
@@ -3391,66 +3718,6 @@ const getUserByIdForAuth = async (id) => {
     { id }
   );
   return data?.users_by_pk || null;
-};
-
-const reactivateUserForRegister = async ({
-  user,
-  name,
-  email,
-  phone,
-  passwordHash,
-  emailVerifiedAt,
-}) => {
-  const normalizedEmail = normalizeEmail(email);
-  const nextPhone = phone ?? (user?.phone ? String(user.phone).trim() : null);
-  const verifiedAt =
-    emailVerifiedAt === undefined ? user?.email_verified_at || null : emailVerifiedAt;
-  const data = await hasuraRequest(
-    `
-      mutation ReactivateUserForRegister(
-        $id: bigint!,
-        $name: String!,
-        $email: String!,
-        $phone: String,
-        $password: String!,
-        $emailVerifiedAt: timestamptz
-      ) {
-        update_users_by_pk(
-          pk_columns: {id: $id},
-          _set: {
-            name: $name,
-            email: $email,
-            phone: $phone,
-            password: $password,
-            is_active: true,
-            deactivated_at: null,
-            auth_session_id: null,
-            firebase_token: null,
-            email_verified_at: $emailVerifiedAt
-          }
-        ) {
-          id
-          name
-          email
-          phone
-          avatar_url
-          payUniqe
-          role_id
-          email_verified_at
-          is_active
-        }
-      }
-    `,
-    {
-      id: user.id,
-      name,
-      email: normalizedEmail,
-      phone: nextPhone,
-      password: passwordHash,
-      emailVerifiedAt: verifiedAt,
-    }
-  );
-  return data?.update_users_by_pk || null;
 };
 
 const getUserByIdForPasswordChange = async (id) => {
@@ -4243,7 +4510,7 @@ const requireJwt = async (req, res, next) => {
   const raw = req.get("authorization") || "";
   const token = raw.toLowerCase().startsWith("bearer ") ? raw.slice(7) : raw;
   if (!token) {
-    return res.status(401).json({ ok: false, error: "Missing token." });
+    return res.status(401).json({ ok: false, error: "Token eksik." });
   }
   try {
     const payload = verifyJwtToken(token);
@@ -4260,7 +4527,7 @@ const requireJwt = async (req, res, next) => {
     req.hasuraAuthMode = "jwt";
     return next();
   } catch (err) {
-    return res.status(401).json({ ok: false, error: "Invalid token." });
+    return res.status(401).json({ ok: false, error: "Geçersiz token." });
   }
 };
 
@@ -4288,7 +4555,7 @@ const optionalJwt = async (req, res, next) => {
     req.hasuraAuthMode = "jwt";
     return next();
   } catch (err) {
-    return res.status(401).json({ ok: false, error: "Invalid token." });
+    return res.status(401).json({ ok: false, error: "Geçersiz token." });
   }
 };
 
@@ -4326,7 +4593,7 @@ const requireJwtOrServiceAuth = async (req, res, next) => {
     return next();
   }
 
-  return res.status(401).json({ ok: false, error: "Unauthorized." });
+  return res.status(401).json({ ok: false, error: "Yetkisiz erişim." });
 };
 
 const requireRevenueCatAuth = async (req, res, next) => {
@@ -4365,7 +4632,7 @@ const requireRevenueCatAuth = async (req, res, next) => {
     return next();
   }
 
-  return res.status(401).json({ ok: false, error: "Unauthorized." });
+  return res.status(401).json({ ok: false, error: "Yetkisiz erişim." });
 };
 
 const requireRevenueCatWebhookAuth = (req, res, next) => {
@@ -4385,7 +4652,9 @@ const requireRevenueCatWebhookAuth = (req, res, next) => {
   const token = bearerToken || headerToken;
 
   if (!token || !safeTokenCompare(token, REVENUECAT_WEBHOOK_AUTH_TOKEN)) {
-    return res.status(401).json({ ok: false, error: "Unauthorized webhook request." });
+    return res
+      .status(401)
+      .json({ ok: false, error: "Yetkisiz webhook isteği." });
   }
 
   req.revenueCatAuthMode = "webhook";
@@ -4517,7 +4786,10 @@ app.post("/auth/register", async (req, res) => {
       console.warn(
         `[auth][register][exists] id=${requestId} ip=${req.ip} email=${email}`
       );
-      return res.status(409).json({ ok: false, error: "Email already in use." });
+      return res.status(409).json({
+        ok: false,
+        error: "Bu e-posta adresi zaten kayıtlı.",
+      });
     }
     if (existing?.id && !existing.email_verified_at) {
       await sendEmailVerificationMail({ user: existing, req });
@@ -4527,49 +4799,6 @@ app.post("/auth/register", async (req, res) => {
       return res.json({
         ok: true,
         requiresEmailVerification: true,
-        email,
-        message:
-          "Üye kaydı başarılı. E-posta adresinize gönderilen bağlantı ile hesabınızı aktifleştirin.",
-      });
-    }
-
-    const inactiveByEmail = await getInactiveUserByEmailForAuth(email);
-    const inactiveByPhone = inactiveByEmail
-      ? null
-      : phone
-        ? await getInactiveUserByPhoneForAuth(phone)
-        : null;
-    const inactiveMatch = inactiveByEmail || inactiveByPhone;
-    if (inactiveMatch?.id) {
-      const passwordHash = await hashPassword(password);
-      const reactivated = await reactivateUserForRegister({
-        user: inactiveMatch,
-        name,
-        email,
-        phone,
-        passwordHash,
-        emailVerifiedAt: inactiveMatch.email_verified_at || null,
-      });
-      if (!reactivated) {
-        throw new Error("Inactive user reactivation failed.");
-      }
-
-      if (!reactivated.email_verified_at) {
-        try {
-          await sendEmailVerificationMail({ user: reactivated, req });
-        } catch (mailErr) {
-          console.warn(
-            `[auth][register][reactivated-mail-failed] id=${requestId} email=${email} userId=${reactivated.id} msg=${mailErr.message}`
-          );
-        }
-      }
-
-      console.log(
-        `[auth][register][reactivated] id=${requestId} ip=${req.ip} email=${email} userId=${reactivated.id}`
-      );
-      return res.json({
-        ok: true,
-        requiresEmailVerification: !reactivated.email_verified_at,
         email,
         message:
           "Üye kaydı başarılı. E-posta adresinize gönderilen bağlantı ile hesabınızı aktifleştirin.",
@@ -4586,8 +4815,18 @@ app.post("/auth/register", async (req, res) => {
       payUniqe,
     };
 
-    try {
-      const created = await hasuraRequest(
+    const initialPurge = await purgeInactiveUsersForAuthIdentity({
+      email,
+      phone,
+    });
+    if (initialPurge.deletedUserIds.length > 0) {
+      console.log(
+        `[auth][register][purged-inactive] id=${requestId} ip=${req.ip} email=${email} deletedUserIds=${initialPurge.deletedUserIds.join(",")}`
+      );
+    }
+
+    const createUser = async () =>
+      hasuraRequest(
         `
           mutation CreateUser($object: users_insert_input!) {
             insert_users_one(object: $object) {
@@ -4606,6 +4845,8 @@ app.post("/auth/register", async (req, res) => {
         }
       );
 
+    try {
+      const created = await createUser();
       const user = created?.insert_users_one;
       if (!user) {
         return res.status(500).json({ ok: false, error: "User creation failed." });
@@ -4627,46 +4868,31 @@ app.post("/auth/register", async (req, res) => {
         throw createErr;
       }
 
-      const fallbackInactiveByEmail = await getInactiveUserByEmailForAuth(email);
-      const fallbackInactiveByPhone = fallbackInactiveByEmail
-        ? null
-        : phone
-          ? await getInactiveUserByPhoneForAuth(phone)
-          : null;
-      const fallbackInactiveMatch = fallbackInactiveByEmail || fallbackInactiveByPhone;
-
-      if (!fallbackInactiveMatch?.id) {
+      const purgedFallback = await purgeInactiveUsersForAuthIdentity({
+        email,
+        phone,
+      });
+      if (!purgedFallback.deletedUserIds.length) {
         throw createErr;
       }
 
-      const reactivated = await reactivateUserForRegister({
-        user: fallbackInactiveMatch,
-        name,
-        email,
-        phone,
-        passwordHash,
-        emailVerifiedAt: fallbackInactiveMatch.email_verified_at || null,
-      });
-      if (!reactivated) {
-        throw new Error("Inactive user reactivation failed.");
-      }
-
-      if (!reactivated.email_verified_at) {
-        try {
-          await sendEmailVerificationMail({ user: reactivated, req });
-        } catch (mailErr) {
-          console.warn(
-            `[auth][register][reactivated-mail-failed] id=${requestId} email=${email} userId=${reactivated.id} msg=${mailErr.message}`
-          );
-        }
-      }
-
       console.log(
-        `[auth][register][reactivated-fallback] id=${requestId} ip=${req.ip} email=${email} userId=${reactivated.id}`
+        `[auth][register][purged-fallback] id=${requestId} ip=${req.ip} email=${email} deletedUserIds=${purgedFallback.deletedUserIds.join(",")}`
+      );
+
+      const created = await createUser();
+      const user = created?.insert_users_one;
+      if (!user) {
+        return res.status(500).json({ ok: false, error: "User creation failed." });
+      }
+
+      await sendEmailVerificationMail({ user, req });
+      console.log(
+        `[auth][register][success-after-purge] id=${requestId} ip=${req.ip} email=${email} userId=${user.id}`
       );
       return res.json({
         ok: true,
-        requiresEmailVerification: !reactivated.email_verified_at,
+        requiresEmailVerification: true,
         email,
         message:
           "Üye kaydı başarılı. E-posta adresinize gönderilen bağlantı ile hesabınızı aktifleştirin.",
@@ -4676,7 +4902,10 @@ app.post("/auth/register", async (req, res) => {
     console.error(
       `[auth][register][error] id=${requestId} ip=${req.ip} email=${emailForLog} msg=${err.message}`
     );
-    return res.status(500).json({ ok: false, error: err.message || "Register failed." });
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Kayıt işlemi tamamlanamadı.",
+    });
   }
 });
 
@@ -4693,7 +4922,9 @@ app.post("/auth/login", async (req, res) => {
       console.warn(
         `[auth][login][bad-request] id=${requestId} ip=${req.ip} email=${email}`
       );
-      return res.status(400).json({ ok: false, error: "email and password are required." });
+      return res
+        .status(400)
+        .json({ ok: false, error: "E-posta ve şifre zorunludur." });
     }
 
     const user = await getUserByEmailForAuth(email);
@@ -4701,7 +4932,9 @@ app.post("/auth/login", async (req, res) => {
       console.warn(
         `[auth][login][invalid] id=${requestId} ip=${req.ip} email=${email}`
       );
-      return res.status(401).json({ ok: false, error: "Invalid credentials." });
+      return res
+        .status(401)
+        .json({ ok: false, error: "E-posta veya şifre hatalı." });
     }
 
     const passwordCheck = await verifyPasswordHash(password, user.password);
@@ -4709,7 +4942,9 @@ app.post("/auth/login", async (req, res) => {
       console.warn(
         `[auth][login][invalid] id=${requestId} ip=${req.ip} email=${email}`
       );
-      return res.status(401).json({ ok: false, error: "Invalid credentials." });
+      return res
+        .status(401)
+        .json({ ok: false, error: "E-posta veya şifre hatalı." });
     }
 
     if (passwordCheck.needsUpgrade) {
@@ -4732,7 +4967,7 @@ app.post("/auth/login", async (req, res) => {
       return res.status(403).json({
         ok: false,
         code: "EMAIL_NOT_VERIFIED",
-        error: "Please verify your email address first.",
+        error: "Önce e-posta adresinizi doğrulayın.",
       });
     }
 
@@ -4755,7 +4990,10 @@ app.post("/auth/login", async (req, res) => {
     console.error(
       `[auth][login][error] id=${requestId} ip=${req.ip} email=${emailForLog} msg=${err.message}`
     );
-    return res.status(500).json({ ok: false, error: err.message || "Login failed." });
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Giriş işlemi tamamlanamadı.",
+    });
   }
 });
 
@@ -4773,7 +5011,7 @@ app.post("/auth/social-login", async (req, res) => {
     if (!email || !provider || !allowedProviders.has(provider)) {
       return res.status(400).json({
         ok: false,
-        error: "email and provider (google|apple) are required.",
+        error: "E-posta ve sağlayıcı (google|apple) zorunludur.",
       });
     }
 
@@ -4782,7 +5020,11 @@ app.post("/auth/social-login", async (req, res) => {
       console.log(
         `[auth][social-login][not-found] id=${requestId} provider=${provider} email=${email}`
       );
-      return res.status(404).json({ ok: false, error: "USER_NOT_FOUND" });
+      return res.status(404).json({
+        ok: false,
+        code: "USER_NOT_FOUND",
+        error: "Kullanıcı bulunamadı.",
+      });
     }
 
     if (!user.email_verified_at) {
@@ -4809,7 +5051,10 @@ app.post("/auth/social-login", async (req, res) => {
     console.error(
       `[auth][social-login][error] id=${requestId} provider=${provider || "-"} email=${emailForLog} msg=${err.message}`
     );
-    return res.status(500).json({ ok: false, error: err.message || "Social login failed." });
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "Sosyal giriş işlemi tamamlanamadı.",
+    });
   }
 });
 
@@ -4830,88 +5075,114 @@ app.post("/auth/social-register", async (req, res) => {
     if (!name || !email || !allowedProviders.has(provider)) {
       return res.status(400).json({
         ok: false,
-        error: "name, email and provider (google|apple) are required.",
+        error: "Ad, e-posta ve sağlayıcı (google|apple) zorunludur.",
       });
     }
 
     const existing = await getUserByEmailForAuth(email);
     if (existing?.id) {
-      return res.status(409).json({ ok: false, error: "Email already in use." });
+      return res.status(409).json({
+        ok: false,
+        error: "Bu e-posta adresi zaten kayıtlı.",
+      });
     }
 
-    const inactiveExisting = await getInactiveUserByEmailForAuth(email);
-    if (inactiveExisting?.id) {
-      const passwordHash = await hashPassword(
-        crypto.randomBytes(24).toString("base64url")
+    const inactiveExisting = await getInactiveUsersByIdentityForAuth({
+      email,
+      phone,
+    });
+    if (inactiveExisting.length > 0) {
+      const purged = await purgeUsersByIdsFromPostgres(
+        inactiveExisting.map((user) => user.id)
       );
-      const reactivated = await reactivateUserForRegister({
-        user: inactiveExisting,
-        name,
-        email,
-        phone,
-        passwordHash,
-        emailVerifiedAt: new Date().toISOString(),
-      });
-      if (!reactivated) {
+      console.log(
+        `[auth][social-register][purged-inactive] id=${requestId} ip=${req.ip} provider=${provider} email=${email} deletedUserIds=${purged.deletedUserIds.join(",")}`
+      );
+    }
+
+    const passwordHash = await hashPassword(
+      crypto.randomBytes(24).toString("base64url")
+    );
+    const payUniqe = crypto.randomUUID();
+    const verifiedAt = new Date().toISOString();
+    const createSocialUser = async () =>
+      hasuraRequest(
+        `
+          mutation CreateSocialUser($object: users_insert_input!) {
+            insert_users_one(object: $object) {
+              id
+              name
+              email
+              phone
+              avatar_url
+              payUniqe
+              role_id
+              email_verified_at
+            }
+          }
+        `,
+        {
+          object: {
+            name,
+            email,
+            phone,
+            password: passwordHash,
+            payUniqe,
+            email_verified_at: verifiedAt,
+          },
+        }
+      );
+
+    try {
+      const created = await createSocialUser();
+      const user = created?.insert_users_one;
+      if (!user) {
         return res.status(500).json({ ok: false, error: "User creation failed." });
       }
 
-      const sessionUser = (await issueUserAuthSession(reactivated.id)) || reactivated;
+      const sessionUser = (await issueUserAuthSession(user.id)) || user;
       const { token, expiresAt } = buildJwtForAppUser(sessionUser);
       console.log(
-        `[auth][social-register][reactivated] id=${requestId} ip=${req.ip} provider=${provider} email=${email} userId=${reactivated.id}`
+        `[auth][social-register][success] id=${requestId} ip=${req.ip} provider=${provider} email=${email} userId=${user.id}`
       );
-      return res.json({ ok: true, user: reactivated, token, expiresAt });
-    }
-
-    const passwordHash = await hashPassword(crypto.randomBytes(24).toString("base64url"));
-    const payUniqe = crypto.randomUUID();
-    const verifiedAt = new Date().toISOString();
-    const created = await hasuraRequest(
-      `
-        mutation CreateSocialUser($object: users_insert_input!) {
-          insert_users_one(object: $object) {
-            id
-            name
-            email
-            phone
-            avatar_url
-            payUniqe
-            role_id
-            email_verified_at
-          }
-        }
-      `,
-      {
-        object: {
-          name,
-          email,
-          phone,
-          password: passwordHash,
-          payUniqe,
-          email_verified_at: verifiedAt,
-        },
+      return res.json({ ok: true, user, token, expiresAt });
+    } catch (createErr) {
+      if (!isRegisterDuplicateConstraintError(createErr)) {
+        throw createErr;
       }
-    );
 
-    const user = created?.insert_users_one;
-    if (!user) {
-      return res.status(500).json({ ok: false, error: "User creation failed." });
+      const purgedFallback = await purgeInactiveUsersForAuthIdentity({
+        email,
+        phone,
+      });
+      if (!purgedFallback.deletedUserIds.length) {
+        throw createErr;
+      }
+
+      console.log(
+        `[auth][social-register][purged-fallback] id=${requestId} ip=${req.ip} provider=${provider} email=${email} deletedUserIds=${purgedFallback.deletedUserIds.join(",")}`
+      );
+
+      const created = await createSocialUser();
+      const user = created?.insert_users_one;
+      if (!user) {
+        return res.status(500).json({ ok: false, error: "User creation failed." });
+      }
+
+      const sessionUser = (await issueUserAuthSession(user.id)) || user;
+      const { token, expiresAt } = buildJwtForAppUser(sessionUser);
+      console.log(
+        `[auth][social-register][success-after-purge] id=${requestId} ip=${req.ip} provider=${provider} email=${email} userId=${user.id}`
+      );
+      return res.json({ ok: true, user, token, expiresAt });
     }
-
-    const sessionUser = (await issueUserAuthSession(user.id)) || user;
-    const { token, expiresAt } = buildJwtForAppUser(sessionUser);
-    console.log(
-      `[auth][social-register][success] id=${requestId} ip=${req.ip} provider=${provider} email=${email} userId=${user.id}`
-    );
-    return res.json({ ok: true, user, token, expiresAt });
   } catch (err) {
     console.error(
       `[auth][social-register][error] id=${requestId} ip=${req.ip} provider=${provider || "-"} email=${emailForLog} msg=${err.message}`
     );
     return res.status(500).json({
       ok: false,
-      error: err.message || "Social register failed.",
+      error: err.message || "Sosyal kayıt işlemi tamamlanamadı.",
     });
   }
 });
@@ -9429,6 +9700,76 @@ app.post("/payment/test-session", requireJwt, async (req, res, next) => {
     });
   } catch (err) {
     next(err);
+  }
+});
+
+app.post("/admin/users/purge", requireJwtOrServiceAuth, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  try {
+    if (req.hasuraAuthMode === "jwt") {
+      await ensureAdminJwtActor(req);
+    }
+
+    const userId = toPositiveIntOrNull(req.body?.userId);
+    const email = normalizeEmail(req.body?.email);
+    const phone = req.body?.phone ? String(req.body.phone).trim() : null;
+
+    if (userId && (email || phone)) {
+      return res.status(400).json({
+        ok: false,
+        error: "userId ile email/phone aynı anda gönderilemez.",
+      });
+    }
+    if (!userId && !email && !phone) {
+      return res.status(400).json({
+        ok: false,
+        error: "userId veya email/phone zorunludur.",
+      });
+    }
+
+    let purgeResult;
+    if (userId) {
+      const user = await getInactiveUserIdentityById(userId);
+      if (!user) {
+        return res.status(404).json({
+          ok: false,
+          error: "Kullanıcı bulunamadı.",
+        });
+      }
+      if (user.is_active === true) {
+        return res.status(409).json({
+          ok: false,
+          error: "Kalıcı silme yalnızca pasif kullanıcılar için kullanılabilir.",
+        });
+      }
+      const hasIdentity =
+        Boolean(normalizeEmail(user.email)) ||
+        Boolean(String(user.phone || "").trim());
+      purgeResult = hasIdentity
+        ? await purgeInactiveUsersForAuthIdentity({
+            email: user.email,
+            phone: user.phone,
+          })
+        : await purgeUsersByIdsFromPostgres([userId]);
+    } else {
+      purgeResult = await purgeInactiveUsersForAuthIdentity({ email, phone });
+    }
+
+    console.log(
+      `[admin][users][purge][success] id=${requestId} mode=${userId ? "userId" : "identity"} userId=${userId || "-"} email=${email || "-"} phone=${phone || "-"} deletedUserIds=${purgeResult.deletedUserIds.join(",")}`
+    );
+    return res.json({
+      ok: true,
+      ...purgeResult,
+    });
+  } catch (err) {
+    console.error(
+      `[admin][users][purge][error] id=${requestId} msg=${err.message}`
+    );
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: err.message || "Kullanıcı silinemedi.",
+    });
   }
 });
 
