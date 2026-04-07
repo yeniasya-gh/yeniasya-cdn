@@ -3272,12 +3272,50 @@ const getUserByEmailForAuth = async (email) => {
   return data?.users?.[0] || null;
 };
 
+const getInactiveUserByEmailForAuth = async (email) => {
+  const data = await hasuraRequest(
+    `
+      query GetInactiveUserByEmailForAuth($email: String!) {
+        users(
+          where: {
+            _or: [
+              {email: {_eq: $email}},
+              {email: {_ilike: $email}}
+            ],
+            is_active: {_eq: false}
+          },
+          order_by: [{email_verified_at: desc_nulls_last}, {id: asc}],
+          limit: 1
+        ) {
+          id
+          name
+          email
+          phone
+          avatar_url
+          payUniqe
+          auth_session_id
+          role_id
+          password
+          is_active
+          email_verified_at
+          deactivated_at
+        }
+      }
+    `,
+    { email }
+  );
+  return data?.users?.[0] || null;
+};
+
 const getUserByPhoneForAuth = async (phone) => {
   const data = await hasuraRequest(
     `
       query GetUserByPhoneForAuth($phone: String!) {
         users(
-          where: { phone: { _eq: $phone } }
+          where: {
+            phone: { _eq: $phone },
+            is_active: { _eq: true }
+          }
           order_by: [{email_verified_at: desc_nulls_last}, {id: asc}]
           limit: 1
         ) {
@@ -3292,6 +3330,38 @@ const getUserByPhoneForAuth = async (phone) => {
           password
           is_active
           email_verified_at
+        }
+      }
+    `,
+    { phone }
+  );
+  return data?.users?.[0] || null;
+};
+
+const getInactiveUserByPhoneForAuth = async (phone) => {
+  const data = await hasuraRequest(
+    `
+      query GetInactiveUserByPhoneForAuth($phone: String!) {
+        users(
+          where: {
+            phone: { _eq: $phone },
+            is_active: { _eq: false }
+          }
+          order_by: [{email_verified_at: desc_nulls_last}, {id: asc}]
+          limit: 1
+        ) {
+          id
+          name
+          email
+          phone
+          avatar_url
+          payUniqe
+          auth_session_id
+          role_id
+          password
+          is_active
+          email_verified_at
+          deactivated_at
         }
       }
     `,
@@ -3321,6 +3391,66 @@ const getUserByIdForAuth = async (id) => {
     { id }
   );
   return data?.users_by_pk || null;
+};
+
+const reactivateUserForRegister = async ({
+  user,
+  name,
+  email,
+  phone,
+  passwordHash,
+  emailVerifiedAt,
+}) => {
+  const normalizedEmail = normalizeEmail(email);
+  const nextPhone = phone ?? (user?.phone ? String(user.phone).trim() : null);
+  const verifiedAt =
+    emailVerifiedAt === undefined ? user?.email_verified_at || null : emailVerifiedAt;
+  const data = await hasuraRequest(
+    `
+      mutation ReactivateUserForRegister(
+        $id: bigint!,
+        $name: String!,
+        $email: String!,
+        $phone: String,
+        $password: String!,
+        $emailVerifiedAt: timestamptz
+      ) {
+        update_users_by_pk(
+          pk_columns: {id: $id},
+          _set: {
+            name: $name,
+            email: $email,
+            phone: $phone,
+            password: $password,
+            is_active: true,
+            deactivated_at: null,
+            auth_session_id: null,
+            firebase_token: null,
+            email_verified_at: $emailVerifiedAt
+          }
+        ) {
+          id
+          name
+          email
+          phone
+          avatar_url
+          payUniqe
+          role_id
+          email_verified_at
+          is_active
+        }
+      }
+    `,
+    {
+      id: user.id,
+      name,
+      email: normalizedEmail,
+      phone: nextPhone,
+      password: passwordHash,
+      emailVerifiedAt: verifiedAt,
+    }
+  );
+  return data?.update_users_by_pk || null;
 };
 
 const getUserByIdForPasswordChange = async (id) => {
@@ -4389,6 +4519,49 @@ app.post("/auth/register", async (req, res) => {
       });
     }
 
+    const inactiveByEmail = await getInactiveUserByEmailForAuth(email);
+    const inactiveByPhone = inactiveByEmail
+      ? null
+      : phone
+        ? await getInactiveUserByPhoneForAuth(phone)
+        : null;
+    const inactiveMatch = inactiveByEmail || inactiveByPhone;
+    if (inactiveMatch?.id) {
+      const passwordHash = await hashPassword(password);
+      const reactivated = await reactivateUserForRegister({
+        user: inactiveMatch,
+        name,
+        email,
+        phone,
+        passwordHash,
+        emailVerifiedAt: inactiveMatch.email_verified_at || null,
+      });
+      if (!reactivated) {
+        throw new Error("Inactive user reactivation failed.");
+      }
+
+      if (!reactivated.email_verified_at) {
+        try {
+          await sendEmailVerificationMail({ user: reactivated, req });
+        } catch (mailErr) {
+          console.warn(
+            `[auth][register][reactivated-mail-failed] id=${requestId} email=${email} userId=${reactivated.id} msg=${mailErr.message}`
+          );
+        }
+      }
+
+      console.log(
+        `[auth][register][reactivated] id=${requestId} ip=${req.ip} email=${email} userId=${reactivated.id}`
+      );
+      return res.json({
+        ok: true,
+        requiresEmailVerification: !reactivated.email_verified_at,
+        email,
+        message:
+          "Üye kaydı başarılı. E-posta adresinize gönderilen bağlantı ile hesabınızı aktifleştirin.",
+      });
+    }
+
     const passwordHash = await hashPassword(password);
     const payUniqe = crypto.randomUUID();
     const created = await hasuraRequest(
@@ -4599,6 +4772,31 @@ app.post("/auth/social-register", async (req, res) => {
       return res.status(409).json({ ok: false, error: "Email already in use." });
     }
 
+    const inactiveExisting = await getInactiveUserByEmailForAuth(email);
+    if (inactiveExisting?.id) {
+      const passwordHash = await hashPassword(
+        crypto.randomBytes(24).toString("base64url")
+      );
+      const reactivated = await reactivateUserForRegister({
+        user: inactiveExisting,
+        name,
+        email,
+        phone,
+        passwordHash,
+        emailVerifiedAt: new Date().toISOString(),
+      });
+      if (!reactivated) {
+        return res.status(500).json({ ok: false, error: "User creation failed." });
+      }
+
+      const sessionUser = (await issueUserAuthSession(reactivated.id)) || reactivated;
+      const { token, expiresAt } = buildJwtForAppUser(sessionUser);
+      console.log(
+        `[auth][social-register][reactivated] id=${requestId} ip=${req.ip} provider=${provider} email=${email} userId=${reactivated.id}`
+      );
+      return res.json({ ok: true, user: reactivated, token, expiresAt });
+    }
+
     const passwordHash = await hashPassword(crypto.randomBytes(24).toString("base64url"));
     const payUniqe = crypto.randomUUID();
     const verifiedAt = new Date().toISOString();
@@ -4636,13 +4834,6 @@ app.post("/auth/social-register", async (req, res) => {
 
     const sessionUser = (await issueUserAuthSession(user.id)) || user;
     const { token, expiresAt } = buildJwtForAppUser(sessionUser);
-    try {
-      await sendWelcomeMailOnce(user.id);
-    } catch (mailErr) {
-      console.warn(
-        `[auth][social-register][welcome-mail-failed] id=${requestId} userId=${user.id} msg=${mailErr.message}`
-      );
-    }
     console.log(
       `[auth][social-register][success] id=${requestId} ip=${req.ip} provider=${provider} email=${email} userId=${user.id}`
     );
