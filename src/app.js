@@ -1988,6 +1988,7 @@ const homeSectionCaches = Object.fromEntries(
 );
 
 const HOME_MAGAZINE_DESCRIPTION_PREVIEW_LENGTH = 220;
+const HOME_BOOK_DESCRIPTION_PREVIEW_LENGTH = 500;
 const HOME_ATTACHMENT_DESCRIPTION_PREVIEW_LENGTH = 180;
 
 const buildHomePreviewSql = (columnRef, maxLength) => `
@@ -2003,6 +2004,11 @@ const homeMagazineDescriptionPreviewSql = buildHomePreviewSql(
   HOME_MAGAZINE_DESCRIPTION_PREVIEW_LENGTH
 );
 
+const homeBookDescriptionPreviewSql = buildHomePreviewSql(
+  "b.description",
+  HOME_BOOK_DESCRIPTION_PREVIEW_LENGTH
+);
+
 const homeAttachmentDescriptionPreviewSql = buildHomePreviewSql(
   "e.aciklama",
   HOME_ATTACHMENT_DESCRIPTION_PREVIEW_LENGTH
@@ -2015,6 +2021,7 @@ const homeBooksSql = `
     b.cover_url,
     b.price,
     b.discount_price,
+    ${homeBookDescriptionPreviewSql} AS description,
     b.min_description,
     CASE
       WHEN c.id IS NULL THEN NULL
