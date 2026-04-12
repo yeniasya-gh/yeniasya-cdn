@@ -5016,6 +5016,8 @@ app.post("/auth/social-login", async (req, res) => {
   const requestId = crypto.randomUUID();
   const emailForLog = normalizeEmail(req.body?.email);
   const provider = String(req.body?.provider || "").trim().toLowerCase();
+  const phone = req.body?.phone ? String(req.body.phone).trim() : null;
+  const requestedName = String(req.body?.name || "").trim();
   console.log(
     `[auth][social-login][start] id=${requestId} ip=${req.ip} provider=${provider || "-"} email=${emailForLog}`
   );
@@ -5032,14 +5034,58 @@ app.post("/auth/social-login", async (req, res) => {
 
     let user = await getUserByEmailForAuth(email);
     if (!user) {
-      console.log(
-        `[auth][social-login][not-found] id=${requestId} provider=${provider} email=${email}`
-      );
-      return res.status(404).json({
-        ok: false,
-        code: "USER_NOT_FOUND",
-        error: "Kullanıcı bulunamadı.",
+      const socialName = requestedName || email.split("@")[0] || "Kullanıcı";
+      const inactiveExisting = await getInactiveUsersByIdentityForAuth({
+        email,
+        phone,
       });
+      if (inactiveExisting.length > 0) {
+        const purged = await purgeUsersByIdsFromPostgres(
+          inactiveExisting.map((inactiveUser) => inactiveUser.id)
+        );
+        console.log(
+          `[auth][social-login][purged-inactive] id=${requestId} provider=${provider} email=${email} deletedUserIds=${purged.deletedUserIds.join(",")}`
+        );
+      }
+
+      const passwordHash = await hashPassword(
+        crypto.randomBytes(24).toString("base64url")
+      );
+      const payUniqe = crypto.randomUUID();
+      const verifiedAt = new Date().toISOString();
+      const created = await hasuraRequest(
+        `
+          mutation CreateSocialLoginUser($object: users_insert_input!) {
+            insert_users_one(object: $object) {
+              id
+              name
+              email
+              phone
+              avatar_url
+              payUniqe
+              role_id
+              email_verified_at
+            }
+          }
+        `,
+        {
+          object: {
+            name: socialName,
+            email,
+            phone,
+            password: passwordHash,
+            payUniqe,
+            email_verified_at: verifiedAt,
+          },
+        }
+      );
+      user = created?.insert_users_one;
+      if (!user) {
+        throw new Error("Social login user creation failed.");
+      }
+      console.log(
+        `[auth][social-login][created-new] id=${requestId} provider=${provider} email=${email} userId=${user.id}`
+      );
     }
 
     if (!user.email_verified_at) {
