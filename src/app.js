@@ -2093,7 +2093,6 @@ const homeSectionCaches = Object.fromEntries(
 );
 
 const HOME_MAGAZINE_DESCRIPTION_PREVIEW_LENGTH = 220;
-const HOME_BOOK_DESCRIPTION_PREVIEW_LENGTH = 500;
 const HOME_ATTACHMENT_DESCRIPTION_PREVIEW_LENGTH = 180;
 
 const buildHomePreviewSql = (columnRef, maxLength) => `
@@ -2109,10 +2108,7 @@ const homeMagazineDescriptionPreviewSql = buildHomePreviewSql(
   HOME_MAGAZINE_DESCRIPTION_PREVIEW_LENGTH
 );
 
-const homeBookDescriptionPreviewSql = buildHomePreviewSql(
-  "b.description",
-  HOME_BOOK_DESCRIPTION_PREVIEW_LENGTH
-);
+const homeBookDescriptionPreviewSql = "trim(b.description)";
 
 const homeAttachmentDescriptionPreviewSql = buildHomePreviewSql(
   "e.aciklama",
