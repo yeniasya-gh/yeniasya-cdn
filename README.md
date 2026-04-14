@@ -248,6 +248,12 @@ psql "$DATABASE_URL" -f scripts/users_deactivated_at_migration.sql
   - `id=1` Android, `id=2` iOS için kullanılır.
   - Yanıt: `{ ok, cache, data: { id, version, hide_magazines, hide_newspapers } | null }`
   - Hata durumunda `503` ve `{ ok, error, code, requestId, details }` döner; sunucu ayrıca `app_error_logs` tablosuna kayıt düşmeye çalışır.
+- `GET /app/version?platform=android|ios`
+  - Mobil uygulama için force update eşik sürümünü doğrudan Postgres'teki `app_version` tablosundan döner.
+  - `platform=android` ve `platform=ios` satırları sırasıyla Android ve iOS için kullanılır.
+  - Yanıt: `{ ok, cache, data: { key, value } | null }`
+  - `value` alanı minimum desteklenen sürüm olarak yorumlanır. Uygulamanın mevcut sürümü bu değerin altındaysa force update ekranı gösterilir.
+  - Hata durumunda `503` ve `{ ok, error, code, requestId, details }` döner; sunucu ayrıca `app_error_logs` tablosuna kayıt düşmeye çalışır.
 - `GET /auth/me`
   - Auth: `Authorization: Bearer <JWT>`
   - Oturumdaki kullanıcının güvenli profil özetini döner.

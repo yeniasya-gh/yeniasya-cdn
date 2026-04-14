@@ -1510,6 +1510,50 @@ app.get("/app/feature-flags", async (req, res) => {
   }
 });
 
+app.get("/app/version", async (req, res) => {
+  const requestId = crypto.randomUUID();
+  const platform = String(req.query.platform || "").trim().toLowerCase();
+  if (!["android", "ios"].includes(platform)) {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid platform key.",
+      code: "APP_VERSION_INVALID_PLATFORM",
+    });
+  }
+
+  try {
+    const { data, cache } = await getCachedAppVersion(platform);
+    const maxAgeSeconds = Math.max(
+      1,
+      Math.floor(APP_VERSION_CACHE_TTL_MS / 1000)
+    );
+    res.set(
+      "Cache-Control",
+      `public, max-age=${maxAgeSeconds}, stale-while-revalidate=300`
+    );
+    return res.json({ ok: true, cache, data });
+  } catch (err) {
+    const payload = await logHomeServerError({
+      req,
+      requestId,
+      section: "appVersion",
+      err,
+      serviceLabel: "CDN/AppVersion",
+    });
+    return res.status(503).json({
+      ok: false,
+      error: "App version unavailable.",
+      code: payload.code,
+      requestId,
+      details: {
+        message: payload.message,
+        hint: payload.hint,
+        driverCode: payload.driverCode,
+      },
+    });
+  }
+});
+
 app.get("/magazines/:id/issues/public", async (req, res) => {
   const requestId = crypto.randomUUID();
   const magazineId = Number.parseInt(req.params.id, 10);
@@ -1782,6 +1826,14 @@ const APP_FEATURE_FLAGS_CACHE_TTL_MS =
   APP_FEATURE_FLAGS_CACHE_TTL_MS_RAW > 0
     ? APP_FEATURE_FLAGS_CACHE_TTL_MS_RAW
     : 60000;
+const APP_VERSION_CACHE_TTL_MS_RAW = Number(
+  process.env.APP_VERSION_CACHE_TTL_MS || "60000"
+);
+const APP_VERSION_CACHE_TTL_MS =
+  Number.isFinite(APP_VERSION_CACHE_TTL_MS_RAW) &&
+  APP_VERSION_CACHE_TTL_MS_RAW > 0
+    ? APP_VERSION_CACHE_TTL_MS_RAW
+    : 60000;
 const MAGAZINE_PUBLIC_ISSUES_CACHE_TTL_MS_RAW = Number(
   process.env.MAGAZINE_PUBLIC_ISSUES_CACHE_TTL_MS ||
     process.env.HOME_BOOTSTRAP_CACHE_TTL_MS ||
@@ -1794,6 +1846,7 @@ const MAGAZINE_PUBLIC_ISSUES_CACHE_TTL_MS =
     : 60000;
 
 const appFeatureFlagsCache = new Map();
+const appVersionCache = new Map();
 const magazinePublicIssuesCache = new Map();
 
 const appFeatureFlagsSql = `
@@ -1804,6 +1857,15 @@ const appFeatureFlagsSql = `
     hide_newspapers
   FROM public.app_feature_flags
   WHERE id = $1
+  LIMIT 1
+`;
+
+const appVersionSql = `
+  SELECT
+    "key"::text AS key,
+    value
+  FROM public.app_version
+  WHERE "key" = $1
   LIMIT 1
 `;
 
@@ -1844,6 +1906,49 @@ const getCachedAppFeatureFlags = async (id) => {
         const row = rows[0] ? clonePlainObject(rows[0]) : null;
         existing.value = row;
         existing.expiresAt = Date.now() + APP_FEATURE_FLAGS_CACHE_TTL_MS;
+        return row;
+      })
+      .finally(() => {
+        existing.inflight = null;
+      });
+  }
+
+  try {
+    const data = await existing.inflight;
+    return { data: clonePlainObject(data), cache: "miss" };
+  } catch (err) {
+    if (existing.value) {
+      return { data: clonePlainObject(existing.value), cache: "stale" };
+    }
+    throw err;
+  }
+};
+
+const getCachedAppVersion = async (platformKey) => {
+  const key = String(platformKey || "").trim().toLowerCase();
+  if (!key) {
+    throw new Error("Invalid app version key.");
+  }
+
+  const existing =
+    appVersionCache.get(key) || {
+      value: null,
+      expiresAt: 0,
+      inflight: null,
+    };
+  appVersionCache.set(key, existing);
+
+  const now = Date.now();
+  if (existing.value && existing.expiresAt > now) {
+    return { data: clonePlainObject(existing.value), cache: "hit" };
+  }
+
+  if (!existing.inflight) {
+    existing.inflight = homePostgresQuery(appVersionSql, [key])
+      .then((rows) => {
+        const row = rows[0] ? clonePlainObject(rows[0]) : null;
+        existing.value = row;
+        existing.expiresAt = Date.now() + APP_VERSION_CACHE_TTL_MS;
         return row;
       })
       .finally(() => {
