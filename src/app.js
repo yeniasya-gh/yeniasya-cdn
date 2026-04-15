@@ -6589,13 +6589,15 @@ const resolveEntitlementStateWithFallback = async ({
   const fallbackProvided = fallbackIsActive !== undefined && fallbackIsActive !== null;
   const fallbackActive = toBool(fallbackIsActive);
   const fallbackExpiry = toIsoTimestampOrNull(fallbackExpirationDate);
+  const fallbackEligible =
+    fallbackProvided &&
+    (allowFallbackOverride ||
+      verification.reason === "subscriber_not_found" ||
+      verification.reason === "entitlement_not_found");
 
   if (
     verification.checked &&
-    !(
-      fallbackProvided &&
-      (allowFallbackOverride || verification.reason === "subscriber_not_found")
-    )
+    !fallbackEligible
   ) {
     return {
       verification,
@@ -7695,21 +7697,23 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       );
     }
 
-    const verification = await fetchRevenueCatEntitlementState({
+    const state = await resolveEntitlementStateWithFallback({
       appUserId: resolved.appUserId,
       entitlementId,
+      fallbackIsActive: body.isActive,
+      fallbackExpirationDate:
+        body.expirationDate || customerInfo?.entitlement?.expirationDate || null,
+      allowFallbackOverride: false,
     });
-    if (!verification.checked && body.isActive === undefined) {
+    if (!state.verification.checked && body.isActive === undefined) {
       return res.status(400).json({
         ok: false,
         error: "isActive is required when RevenueCat verification is unavailable.",
       });
     }
 
-    const isActive = verification.checked ? verification.isActive : toBool(body.isActive);
-    const effectiveExpirationDate = verification.checked
-      ? verification.expirationDate
-      : body.expirationDate;
+    const isActive = state.isActive;
+    const effectiveExpirationDate = state.expirationDate;
     const accessSync = await syncRevenueCatAccessByEntitlement({
       userId: resolved.userId,
       entitlementId,
@@ -7719,13 +7723,13 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       originalAppUserId,
       productIdentifier,
       purchasePlatform:
-        verification.purchasePlatform ||
+        state.verification.purchasePlatform ||
         normalizePurchasePlatform(body.purchasePlatform || body.platform),
     });
 
     await writeRevenueCatAuditLog({
       ...baseAudit,
-      source: verification.source,
+      source: state.verification.source,
       user_id: resolved.userId,
       app_user_id: resolved.appUserId,
       expected_app_user_id: identity.expectedAppUserId,
@@ -7735,15 +7739,15 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       entitlement_id: entitlementId,
       is_active: isActive,
       expiration_date: toIsoTimestampOrNull(effectiveExpirationDate),
-      verification_source: verification.source,
-      verification_reason: verification.reason || null,
+      verification_source: state.verification.source,
+      verification_reason: state.verification.reason || null,
       access_action: accessSync.action || accessSync.reason || "skipped",
       success: true,
       payload: body,
     });
 
     console.log(
-      `[revenuecat][sync] id=${requestId} source=${verification.source} userId=${resolved.userId} appUserId=${resolved.appUserId} expected=${identity.expectedAppUserId || "-"} payloadMatched=${boolForLog(identity.payloadIdentityMatched)} serverMatched=${boolForLog(identity.serverIdentityMatched)} entitlement=${entitlementId} active=${isActive} action=${accessSync.action || "skipped"}`
+      `[revenuecat][sync] id=${requestId} source=${state.verification.source} userId=${resolved.userId} appUserId=${resolved.appUserId} expected=${identity.expectedAppUserId || "-"} payloadMatched=${boolForLog(identity.payloadIdentityMatched)} serverMatched=${boolForLog(identity.serverIdentityMatched)} entitlement=${entitlementId} active=${isActive} action=${accessSync.action || "skipped"}`
     );
 
     return res.json({
@@ -7758,7 +7762,7 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       entitlementId,
       isActive,
       expirationDate: effectiveExpirationDate || null,
-      verification,
+      verification: state.verification,
       accessSync,
     });
   } catch (err) {
@@ -7836,15 +7840,19 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
     let syncedIsActive = null;
     let syncedExpirationDate = null;
     if (resolved && entitlementId) {
-      verification = await fetchRevenueCatEntitlementState({
+      const state = await resolveEntitlementStateWithFallback({
         appUserId: resolved.appUserId,
         entitlementId,
+        fallbackIsActive: body.isActive,
+        fallbackExpirationDate: body.expirationDate,
+        allowFallbackOverride: false,
       });
+      verification = state.verification;
 
       const canSyncFromPayload = body.isActive !== undefined;
-      if (verification.checked || canSyncFromPayload) {
-        syncedIsActive = verification.checked ? verification.isActive : toBool(body.isActive);
-        syncedExpirationDate = verification.checked ? verification.expirationDate : body.expirationDate;
+      if (state.verification.checked || canSyncFromPayload) {
+        syncedIsActive = state.isActive;
+        syncedExpirationDate = state.expirationDate;
         accessSync = await syncRevenueCatAccessByEntitlement({
           userId: resolved.userId,
           entitlementId,
@@ -7854,7 +7862,7 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
           originalAppUserId: null,
           productIdentifier: body.productIdentifier || null,
           purchasePlatform:
-            verification.purchasePlatform ||
+            state.verification.purchasePlatform ||
             normalizePurchasePlatform(body.purchasePlatform || body.platform),
         });
       } else {
