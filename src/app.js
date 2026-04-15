@@ -7085,6 +7085,12 @@ const syncRevenueCatAccessByEntitlement = async ({
   const nowIso = new Date().toISOString();
   const normalizedPurchasePlatform = normalizePurchasePlatform(purchasePlatform);
 
+  const logSyncStage = (stage, details = "") => {
+    console.log(
+      `[revenuecat][sync-access][stage] userId=${userId} entitlement=${entitlementId} active=${boolForLog(isActive)} stage=${stage}${details ? ` ${details}` : ""}`
+    );
+  };
+
   if (mapping.itemType !== "newspaper_subscription" || mapping.itemId !== null) {
     return {
       mapped: false,
@@ -7096,6 +7102,7 @@ const syncRevenueCatAccessByEntitlement = async ({
 
   if (revenueCatOwnershipLockSupported) {
     try {
+      logSyncStage("lock-upsert:start");
       const lockResult = await withHomePostgresClient((client) =>
         upsertRevenueCatOwnershipLock({
           client,
@@ -7108,8 +7115,10 @@ const syncRevenueCatAccessByEntitlement = async ({
           expirationDate,
         })
       );
+      logSyncStage("lock-upsert:done", `mapped=${boolForLog(lockResult.mapped)} reason=${lockResult.reason || "-"}`);
 
       if (!lockResult.mapped && lockResult.reason === "locked_to_other_user") {
+        logSyncStage("locked-to-other-user");
         const current = await getActiveNewspaperAccessRowFromPostgres({
           userId,
           nowIso,
@@ -7117,6 +7126,7 @@ const syncRevenueCatAccessByEntitlement = async ({
           requireCurrent: false,
         });
         if (current?.id && isRevenueCatManagedAccessRow(current, expiresAt || nowIso)) {
+          logSyncStage("locked-to-other-user:deactivate-current", `accessId=${current.id}`);
           await homePostgresQueryWithClient(
             client,
             `
@@ -7364,6 +7374,7 @@ const syncRevenueCatAccessByEntitlement = async ({
 
   if (!isActive) {
     return withHomePostgresClient(async (client) => {
+      logSyncStage("inactive:lookup-current");
       const current = await getActiveNewspaperAccessRowFromPostgres({
         userId,
         nowIso,
@@ -7413,6 +7424,7 @@ const syncRevenueCatAccessByEntitlement = async ({
         [current.id]
       );
 
+      logSyncStage("inactive:deleted-current", `accessId=${deletedRows[0]?.id ?? current.id ?? "-"}`);
       return {
         mapped: true,
         action: "deleted",
@@ -7424,6 +7436,7 @@ const syncRevenueCatAccessByEntitlement = async ({
   }
 
   return withHomePostgresClient(async (client) => {
+    logSyncStage("active:lookup-current");
     const current = await getActiveNewspaperAccessRowFromPostgres({
       userId,
       nowIso,
@@ -7433,6 +7446,7 @@ const syncRevenueCatAccessByEntitlement = async ({
 
     if (current?.id) {
       if (hasManualOverrideExpiry(current, expiresAt)) {
+        logSyncStage("active:skip-manual-override", `accessId=${current.id}`);
         return {
           mapped: true,
           action: "skipped_manual_override",
@@ -7442,7 +7456,9 @@ const syncRevenueCatAccessByEntitlement = async ({
         };
       }
 
+      logSyncStage("active:update-current", `accessId=${current.id}`);
       await updateRevenueCatAccess(client, current.id);
+      logSyncStage("active:update-current:done", `accessId=${current.id}`);
       return {
         mapped: true,
         action: "updated",
@@ -7453,7 +7469,9 @@ const syncRevenueCatAccessByEntitlement = async ({
     }
 
     try {
+      logSyncStage("active:insert-current");
       const inserted = await insertRevenueCatAccess(client);
+      logSyncStage("active:insert-current:done", `accessId=${inserted?.id ?? "-"}`);
       return {
         mapped: true,
         action: "inserted",
@@ -7476,7 +7494,9 @@ const syncRevenueCatAccessByEntitlement = async ({
         throw err;
       }
 
+      logSyncStage("active:recovered-after-conflict", `accessId=${recovered.id}`);
       await updateRevenueCatAccess(client, recovered.id);
+      logSyncStage("active:recovered-after-conflict:done", `accessId=${recovered.id}`);
       return {
         mapped: true,
         action: "updated_after_conflict",
