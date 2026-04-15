@@ -6134,7 +6134,10 @@ const ensureNotificationAdminActor = async (req) => {
 };
 
 const findUserByPayUniqe = async (payUniqe) => {
-  const runLookup = async (value, gqlType) => {
+  const normalizedValue = normalizeRevenueCatAppUserId(payUniqe);
+  if (!normalizedValue) return null;
+
+  const runLookupByPayUniqe = async (value, gqlType) => {
     const data = await hasuraRequest(
       `
         query GetUserByPayUniqe($payUniqe: ${gqlType}) {
@@ -6159,16 +6162,28 @@ const findUserByPayUniqe = async (payUniqe) => {
     return users[0] || null;
   };
 
-  try {
-    return await runLookup(payUniqe, "String!");
-  } catch (err) {
-    if (!isHasuraVariableTypeMismatch(err, "payUniqe", "bigint")) {
-      throw err;
-    }
-    const asBigint = toPositiveIntOrNull(payUniqe);
-    if (!asBigint) return null;
-    return runLookup(asBigint, "bigint!");
-  }
+  const byPayUniqe = await runLookupByPayUniqe(normalizedValue, "String!");
+  if (byPayUniqe) return byPayUniqe;
+
+  const asBigint = toPositiveIntOrNull(normalizedValue);
+  if (!asBigint) return null;
+
+  const byId = await hasuraRequest(
+    `
+      query GetUserById($id: bigint!) {
+        users_by_pk(id: $id) {
+          id
+          name
+          email
+          phone
+          role_id
+          payUniqe
+        }
+      }
+    `,
+    { id: asBigint }
+  );
+  return byId?.users_by_pk || null;
 };
 
 const setUserPayUniqe = async (userId, payUniqe) => {
@@ -6239,26 +6254,12 @@ const resolveRevenueCatUser = async ({
   }
 
   const currentPayUniqe = normalizeRevenueCatAppUserId(user.payUniqe);
+  const resolvedAppUserId = normalizedAppUserId || currentPayUniqe || String(user.id);
   if (normalizedAppUserId && currentPayUniqe && normalizedAppUserId !== currentPayUniqe) {
     if (!allowPayUniqeRelink) {
       const err = new Error("appUserId does not match user's payUniqe.");
       err.statusCode = 409;
       throw err;
-    }
-  }
-
-  const resolvedAppUserId = normalizedAppUserId || currentPayUniqe || String(user.id);
-  if (!currentPayUniqe || currentPayUniqe !== resolvedAppUserId) {
-    try {
-      const updated = await setUserPayUniqe(user.id, resolvedAppUserId);
-      if (updated?.payUniqe) {
-        user.payUniqe = updated.payUniqe;
-      }
-    } catch (err) {
-      // Do not fail entitlement sync if identity persistence is incompatible with schema.
-      console.warn(
-        `[revenuecat][link-warning] userId=${user.id} appUserId=${resolvedAppUserId} msg=${err.message}`
-      );
     }
   }
 
