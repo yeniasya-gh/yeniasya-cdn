@@ -6848,6 +6848,7 @@ const upsertRevenueCatOwnershipLock = async ({
         `
           UPDATE public.revenuecat_subscription_locks
           SET
+            entitlement_id = $2::text,
             owner_app_user_id = $3::text,
             owner_original_app_user_id = COALESCE($4::text, owner_original_app_user_id),
             product_identifier = COALESCE($5::text, product_identifier),
