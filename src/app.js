@@ -7903,6 +7903,9 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
     const entitlementId = normalizeRevenueCatAppUserId(body.entitlementId);
     const appUserId = normalizeRevenueCatAppUserId(body.appUserId);
     const expectedAppUserId = normalizeRevenueCatAppUserId(body.expectedAppUserId);
+    const originalAppUserId = normalizeRevenueCatAppUserId(
+      body.originalAppUserId || body.original_app_user_id
+    );
     const payloadIdentityMatched = toNullableBool(body.identityMatched);
     const bodyUserId = toPositiveIntOrNull(body.userId);
     const jwtUserId = extractJwtUserId(req.jwt);
