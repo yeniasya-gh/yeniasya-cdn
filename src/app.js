@@ -6270,6 +6270,51 @@ const resolveRevenueCatUser = async ({
   };
 };
 
+const getRevenueCatLockFallbackAppUserId = async (
+  userId,
+  entitlementId = REVENUECAT_DEFAULT_ENTITLEMENT_ID
+) => {
+  const normalizedUserId = toPositiveIntOrNull(userId);
+  const normalizedEntitlementId = normalizeRevenueCatAppUserId(entitlementId);
+  if (!normalizedUserId || !normalizedEntitlementId) {
+    return null;
+  }
+
+  const rows = await homePostgresQuery(
+    `
+      SELECT
+        owner_app_user_id,
+        owner_original_app_user_id
+      FROM public.revenuecat_subscription_locks
+      WHERE owner_user_id = $1::bigint
+        AND entitlement_id = $2::text
+        AND is_active = TRUE
+        AND (expires_at IS NULL OR expires_at > now())
+      ORDER BY last_seen_at DESC NULLS LAST, updated_at DESC NULLS LAST, locked_at DESC NULLS LAST, id DESC
+      LIMIT 1
+    `,
+    [normalizedUserId, normalizedEntitlementId]
+  );
+
+  const lock = rows[0] || null;
+  if (!lock) {
+    return null;
+  }
+
+  const currentUserId = normalizedUserId.toString();
+  const candidates = [
+    normalizeRevenueCatAppUserId(lock.owner_original_app_user_id),
+    normalizeRevenueCatAppUserId(lock.owner_app_user_id),
+  ];
+  for (const candidate of candidates) {
+    if (candidate && candidate !== currentUserId) {
+      return candidate;
+    }
+  }
+
+  return null;
+};
+
 const getEntitlementFromSubscriber = (subscriberEntitlements, entitlementId) => {
   const targetKey = String(entitlementId || "").trim().toLowerCase();
   if (!targetKey || !subscriberEntitlements || typeof subscriberEntitlements !== "object") {
@@ -7819,9 +7864,14 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       );
     }
 
+    const lockFallbackAppUserId = await getRevenueCatLockFallbackAppUserId(
+      resolved.userId,
+      entitlementId
+    );
     const state = await resolveEntitlementStateWithFallback({
       appUserId: resolved.appUserId,
-      legacyAppUserId: originalAppUserId || resolved.user.payUniqe || null,
+      legacyAppUserId:
+        originalAppUserId || lockFallbackAppUserId || resolved.user.payUniqe || null,
       entitlementId,
       fallbackIsActive: body.isActive,
       fallbackExpirationDate:
@@ -7963,9 +8013,17 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
     let syncedIsActive = null;
     let syncedExpirationDate = null;
     if (resolved && entitlementId) {
+      const lockFallbackAppUserId = await getRevenueCatLockFallbackAppUserId(
+        resolved.userId,
+        entitlementId
+      );
       const state = await resolveEntitlementStateWithFallback({
         appUserId: resolved.appUserId,
-        legacyAppUserId: resolved.user?.payUniqe || null,
+        legacyAppUserId:
+          originalAppUserId ||
+          lockFallbackAppUserId ||
+          resolved.user?.payUniqe ||
+          null,
         entitlementId,
         fallbackIsActive: body.isActive,
         fallbackExpirationDate: body.expirationDate,
@@ -8113,9 +8171,14 @@ app.post("/revenuecat/subscription/refresh", requireRevenueCatAuth, async (req, 
       );
     }
 
+    const lockFallbackAppUserId = await getRevenueCatLockFallbackAppUserId(
+      resolved.userId,
+      entitlementId
+    );
     const state = await resolveEntitlementStateWithFallback({
       appUserId: resolved.appUserId,
-      legacyAppUserId: originalAppUserId || resolved.user?.payUniqe || null,
+      legacyAppUserId:
+        originalAppUserId || lockFallbackAppUserId || resolved.user?.payUniqe || null,
       entitlementId,
       fallbackIsActive: body.isActive,
       fallbackExpirationDate: body.expirationDate,
@@ -8512,10 +8575,20 @@ app.post("/revenuecat/webhook", requireRevenueCatWebhookAuth, async (req, res) =
       allowPayUniqeRelink: false,
     });
 
-    const verification = await fetchRevenueCatEntitlementState({
+    const lockFallbackAppUserId = await getRevenueCatLockFallbackAppUserId(
+      resolved.userId,
+      normalized.entitlementId
+    );
+    const state = await resolveEntitlementStateWithFallback({
       appUserId: resolved.appUserId,
+      legacyAppUserId:
+        normalized.event?.originalAppUserId || lockFallbackAppUserId || null,
       entitlementId: normalized.entitlementId,
+      fallbackIsActive: normalized.inferredIsActive,
+      fallbackExpirationDate: normalized.expirationDate,
+      allowFallbackOverride: false,
     });
+    const verification = state.verification;
 
     if (!verification.checked && normalized.inferredIsActive === null) {
       return res.status(400).json({
@@ -8524,10 +8597,8 @@ app.post("/revenuecat/webhook", requireRevenueCatWebhookAuth, async (req, res) =
       });
     }
 
-    const isActive = verification.checked ? verification.isActive : normalized.inferredIsActive;
-    const effectiveExpirationDate = verification.checked
-      ? verification.expirationDate
-      : normalized.expirationDate;
+    const isActive = state.isActive;
+    const effectiveExpirationDate = state.expirationDate;
     const accessSync = await syncRevenueCatAccessByEntitlement({
       userId: resolved.userId,
       entitlementId: normalized.entitlementId,
