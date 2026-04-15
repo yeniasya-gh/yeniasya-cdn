@@ -126,15 +126,20 @@ psql "$DATABASE_URL" -f scripts/subscription_purchase_channel_migration.sql
   `orders.payment_provider` alanı da sanal POS siparişlerinde ödeme kanalını saklar.
 
 ## RevenueCat Tek Sahip Kilidi
-- Migration dosyası:
+- Migration dosyaları:
   `scripts/revenuecat_subscription_locks_migration.sql`
+  `scripts/revenuecat_subscription_locks_owner_key_migration.sql`
+  `scripts/revenuecat_subscription_locks_owner_constraint_migration.sql`
 - Uygulama:
 ```bash
 psql "$DATABASE_URL" -f scripts/revenuecat_subscription_locks_migration.sql
+psql "$DATABASE_URL" -f scripts/revenuecat_subscription_locks_owner_key_migration.sql
+psql "$DATABASE_URL" -f scripts/revenuecat_subscription_locks_owner_constraint_migration.sql
 ```
 - Not:
-  `revenuecat_subscription_locks` tablosu aynı RevenueCat entitlement'ının tek bir uygulama hesabına
-  bağlı kalmasını sağlar. Eski aktif kopyalar da ilk hak sahibinin dışında pasife çekilir.
+  `revenuecat_subscription_locks` tablosu aynı RevenueCat entitlement'ını satın alma zinciri
+  bazında tek bir hesaba bağlı tutar. `owner_original_app_user_id` anahtar olarak kullanılır; böylece
+  bağımsız abonelikler çakışmaz, aynı abonelik başka hesaba taşınırsa yine bloklanır.
 
 ## Oturum Tekilleştirme
 - Migration dosyası:

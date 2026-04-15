@@ -6640,8 +6640,9 @@ const upsertRevenueCatOwnershipLock = async ({
   const normalizedEntitlementId = normalizeRevenueCatAppUserId(entitlementId);
   const normalizedAppUserId = normalizeRevenueCatAppUserId(appUserId);
   const normalizedOriginalAppUserId = normalizeRevenueCatAppUserId(originalAppUserId);
+  const ownershipKey = normalizedOriginalAppUserId || normalizedAppUserId;
   const normalizedProductIdentifier = normalizeRevenueCatAppUserId(productIdentifier);
-  if (!normalizedEntitlementId || !normalizedAppUserId || !userId) {
+  if (!normalizedEntitlementId || !normalizedAppUserId || !ownershipKey || !userId) {
     return { mapped: false, reason: "missing_lock_identity" };
   }
 
@@ -6672,7 +6673,7 @@ const upsertRevenueCatOwnershipLock = async ({
       now(),
       now()
     )
-    ON CONFLICT (entitlement_id) DO UPDATE SET
+    ON CONFLICT ON CONSTRAINT revenuecat_subscription_locks_entitlement_owner_key_uniq DO UPDATE SET
       owner_user_id = EXCLUDED.owner_user_id,
       owner_app_user_id = EXCLUDED.owner_app_user_id,
       owner_original_app_user_id = COALESCE(
@@ -6709,7 +6710,7 @@ const upsertRevenueCatOwnershipLock = async ({
     normalizedEntitlementId,
     userId,
     normalizedAppUserId,
-    normalizedOriginalAppUserId,
+    ownershipKey,
     normalizedProductIdentifier,
     isActive === true,
     expiresAt,
