@@ -6811,6 +6811,9 @@ const upsertRevenueCatOwnershipLock = async ({
   `;
 
   if (isActive) {
+    console.log(
+      `[revenuecat][lock-upsert][stage] userId=${userId} entitlement=${normalizedEntitlementId} stage=same-owner-lookup`
+    );
     const sameOwnerRows = await homePostgresQueryWithClient(
       client,
         `
@@ -6837,6 +6840,9 @@ const upsertRevenueCatOwnershipLock = async ({
 
     const sameOwner = sameOwnerRows[0] || null;
     if (sameOwner) {
+      console.log(
+        `[revenuecat][lock-upsert][stage] userId=${userId} entitlement=${normalizedEntitlementId} stage=same-owner-update lockId=${sameOwner.id}`
+      );
       const updatedSameOwnerRows = await homePostgresQueryWithClient(
         client,
         `
@@ -6875,6 +6881,9 @@ const upsertRevenueCatOwnershipLock = async ({
       );
 
       if (updatedSameOwnerRows[0]) {
+        console.log(
+          `[revenuecat][lock-upsert][stage] userId=${userId} entitlement=${normalizedEntitlementId} stage=same-owner-update:done lockId=${updatedSameOwnerRows[0].id}`
+        );
         await homePostgresQueryWithClient(
           client,
           `
@@ -6907,9 +6916,15 @@ const upsertRevenueCatOwnershipLock = async ({
   ]);
 
   if (rows[0]) {
+    console.log(
+      `[revenuecat][lock-upsert][stage] userId=${userId} entitlement=${normalizedEntitlementId} stage=insert-or-update:done lockId=${rows[0].id}`
+    );
     return { mapped: true, action: "upserted", lock: rows[0] };
   }
 
+  console.log(
+    `[revenuecat][lock-upsert][stage] userId=${userId} entitlement=${normalizedEntitlementId} stage=existing-lookup`
+  );
   const existingRows = await homePostgresQueryWithClient(
     client,
     `
@@ -6951,6 +6966,9 @@ const upsertRevenueCatOwnershipLock = async ({
       ownerState.has_active_revenuecat_access !== true;
 
     if (ownerCanTransfer) {
+      console.log(
+        `[revenuecat][lock-upsert][stage] userId=${userId} entitlement=${normalizedEntitlementId} stage=transfer-update fromOwner=${existing.owner_user_id}`
+      );
       const transferredRows = await homePostgresQueryWithClient(
         client,
         `
@@ -6990,6 +7008,9 @@ const upsertRevenueCatOwnershipLock = async ({
       );
 
       if (transferredRows[0]) {
+        console.log(
+          `[revenuecat][lock-upsert][stage] userId=${userId} entitlement=${normalizedEntitlementId} stage=transfer-update:done lockId=${transferredRows[0].id}`
+        );
         console.log(
           `[revenuecat][lock-transfer] entitlement=${normalizedEntitlementId} fromUserId=${existing.owner_user_id} toUserId=${userId} reason=${
             ownerState?.is_active === true ? "owner_without_active_access" : "owner_inactive"
