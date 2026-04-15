@@ -6578,15 +6578,49 @@ const revokeRevenueCatPromotionalEntitlement = async ({
 
 const resolveEntitlementStateWithFallback = async ({
   appUserId,
+  legacyAppUserId = null,
   entitlementId,
   fallbackIsActive,
   fallbackExpirationDate,
   allowFallbackOverride = false,
 }) => {
-  const verification = await fetchRevenueCatEntitlementState({
+  const primaryVerification = await fetchRevenueCatEntitlementState({
     appUserId,
     entitlementId,
   });
+  let verification = primaryVerification;
+  const normalizedLegacyAppUserId = normalizeRevenueCatAppUserId(legacyAppUserId);
+  const shouldTryLegacyLookup =
+    normalizedLegacyAppUserId &&
+    normalizedLegacyAppUserId !== appUserId &&
+    (!primaryVerification.checked ||
+      primaryVerification.reason === "subscriber_not_found" ||
+      primaryVerification.reason === "entitlement_not_found" ||
+      primaryVerification.isActive !== true);
+
+  if (shouldTryLegacyLookup) {
+    const legacyVerification = await fetchRevenueCatEntitlementState({
+      appUserId: normalizedLegacyAppUserId,
+      entitlementId,
+    });
+    const primaryMissing =
+      !primaryVerification.checked ||
+      primaryVerification.reason === "subscriber_not_found" ||
+      primaryVerification.reason === "entitlement_not_found";
+    if (
+      legacyVerification.checked &&
+      (legacyVerification.isActive === true ||
+        (primaryMissing && legacyVerification.isActive !== false))
+    ) {
+      verification = {
+        ...legacyVerification,
+        matchedAppUserId: normalizedLegacyAppUserId,
+        primaryAppUserId: appUserId,
+        legacyLookupUsed: true,
+        legacyLookupReason: primaryVerification.reason || null,
+      };
+    }
+  }
   const fallbackProvided = fallbackIsActive !== undefined && fallbackIsActive !== null;
   const fallbackActive = toBool(fallbackIsActive);
   const fallbackExpiry = toIsoTimestampOrNull(fallbackExpirationDate);
@@ -7787,6 +7821,7 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
 
     const state = await resolveEntitlementStateWithFallback({
       appUserId: resolved.appUserId,
+      legacyAppUserId: originalAppUserId || resolved.user.payUniqe || null,
       entitlementId,
       fallbackIsActive: body.isActive,
       fallbackExpirationDate:
@@ -7808,7 +7843,7 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       isActive,
       expirationDate: effectiveExpirationDate,
       appUserId: resolved.appUserId,
-      originalAppUserId,
+      originalAppUserId: originalAppUserId || resolved.user.payUniqe || null,
       productIdentifier,
       purchasePlatform:
         state.verification.purchasePlatform ||
@@ -7930,6 +7965,7 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
     if (resolved && entitlementId) {
       const state = await resolveEntitlementStateWithFallback({
         appUserId: resolved.appUserId,
+        legacyAppUserId: resolved.user?.payUniqe || null,
         entitlementId,
         fallbackIsActive: body.isActive,
         fallbackExpirationDate: body.expirationDate,
@@ -7947,7 +7983,7 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
           isActive: syncedIsActive,
           expirationDate: syncedExpirationDate,
           appUserId: resolved.appUserId,
-          originalAppUserId: null,
+          originalAppUserId: resolved.user?.payUniqe || null,
           productIdentifier: body.productIdentifier || null,
           purchasePlatform:
             state.verification.purchasePlatform ||
@@ -8031,6 +8067,7 @@ app.post("/revenuecat/subscription/refresh", requireRevenueCatAuth, async (req, 
       normalizeRevenueCatAppUserId(body.entitlementId) ||
       normalizeRevenueCatAppUserId(REVENUECAT_DEFAULT_ENTITLEMENT_ID);
     const appUserId = normalizeRevenueCatAppUserId(body.appUserId);
+    const originalAppUserId = normalizeRevenueCatAppUserId(body.originalAppUserId);
     const expectedAppUserId = normalizeRevenueCatAppUserId(body.expectedAppUserId);
     const payloadIdentityMatched = toNullableBool(body.identityMatched);
     const bodyUserId = toPositiveIntOrNull(body.userId);
@@ -8078,6 +8115,7 @@ app.post("/revenuecat/subscription/refresh", requireRevenueCatAuth, async (req, 
 
     const state = await resolveEntitlementStateWithFallback({
       appUserId: resolved.appUserId,
+      legacyAppUserId: originalAppUserId || resolved.user?.payUniqe || null,
       entitlementId,
       fallbackIsActive: body.isActive,
       fallbackExpirationDate: body.expirationDate,
@@ -8089,7 +8127,7 @@ app.post("/revenuecat/subscription/refresh", requireRevenueCatAuth, async (req, 
       isActive: state.isActive,
       expirationDate: state.expirationDate,
       appUserId: resolved.appUserId,
-      originalAppUserId: null,
+      originalAppUserId: originalAppUserId || resolved.user?.payUniqe || null,
       productIdentifier: body.productIdentifier || null,
       purchasePlatform:
         state.verification.purchasePlatform ||
