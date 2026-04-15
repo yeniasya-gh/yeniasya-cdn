@@ -1,5 +1,8 @@
 BEGIN;
 
+ALTER TABLE public.revenuecat_subscription_locks
+  DROP CONSTRAINT IF EXISTS revenuecat_subscription_locks_entitlement_owner_key_uniq;
+
 DROP INDEX IF EXISTS public.revenuecat_subscription_locks_entitlement_owner_key_idx;
 
 ALTER TABLE public.revenuecat_subscription_locks
