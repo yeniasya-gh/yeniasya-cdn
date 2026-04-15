@@ -6942,72 +6942,6 @@ const upsertRevenueCatOwnershipLock = async ({
     (!activeRowExpiry || activeRowExpiry.getTime() > Date.now());
 
   if (isActive && activeRowIsCurrent && Number(existing.owner_user_id) !== Number(userId)) {
-    const ownerState = await getRevenueCatLockOwnerTransferState(
-      client,
-      existing.owner_user_id
-    );
-    const ownerCanTransfer =
-      !ownerState ||
-      ownerState.is_active !== true ||
-      ownerState.has_active_revenuecat_access !== true;
-
-    if (ownerCanTransfer) {
-      const transferredRows = await homePostgresQueryWithClient(
-        client,
-        `
-          UPDATE public.revenuecat_subscription_locks
-          SET
-            owner_user_id = $2::bigint,
-            owner_app_user_id = $3::text,
-            owner_original_app_user_id = COALESCE($4::text, owner_original_app_user_id),
-            product_identifier = COALESCE($5::text, product_identifier),
-            is_active = TRUE,
-            expires_at = $6::timestamptz,
-            locked_at = now(),
-            updated_at = now(),
-            last_seen_at = now()
-          WHERE entitlement_id = $1::text
-          RETURNING
-            id::int AS id,
-            entitlement_id,
-            owner_user_id::int AS owner_user_id,
-            owner_app_user_id,
-            owner_original_app_user_id,
-            product_identifier,
-            is_active,
-            expires_at,
-            locked_at,
-            updated_at,
-            last_seen_at
-        `,
-        [
-          normalizedEntitlementId,
-          Number(userId),
-          normalizedAppUserId,
-          normalizedOriginalAppUserId,
-          normalizedProductIdentifier,
-          expiresAt,
-        ]
-      );
-
-      if (transferredRows[0]) {
-        console.log(
-          `[revenuecat][lock-transfer] entitlement=${normalizedEntitlementId} fromUserId=${existing.owner_user_id} toUserId=${userId} reason=${
-            ownerState?.is_active === true ? "owner_without_active_access" : "owner_inactive"
-          }`
-        );
-        return {
-          mapped: true,
-          action: "transferred",
-          reason:
-            ownerState?.is_active === true
-              ? "owner_without_active_access"
-              : "owner_inactive",
-          lock: transferredRows[0],
-        };
-      }
-    }
-
     const err = new Error("Bu abonelik başka bir hesapta aktif.");
     err.statusCode = 409;
     err.code = "REVENUECAT_ENTITLEMENT_LOCKED";
@@ -7034,32 +6968,6 @@ const upsertRevenueCatOwnershipLock = async ({
     action: existing ? "noop_inactive" : "noop_missing",
     entitlementId: normalizedEntitlementId,
   };
-};
-
-const getRevenueCatLockOwnerTransferState = async (client, ownerUserId) => {
-  const rows = await homePostgresQueryWithClient(
-    client,
-    `
-      SELECT
-        u.id::int AS user_id,
-        u.is_active AS is_active,
-        EXISTS(
-          SELECT 1
-          FROM public.user_content_access uca
-          WHERE uca.user_id = u.id
-            AND uca.item_type = 'newspaper_subscription'::public.access_item_type
-            AND uca.item_id IS NULL
-            AND uca.is_active = TRUE
-            AND COALESCE(uca.expires_at, 'epoch'::timestamptz) > now()
-            AND COALESCE(NULLIF(btrim(uca.grant_source), ''), 'revenuecat') = 'revenuecat'
-        ) AS has_active_revenuecat_access
-      FROM public.users u
-      WHERE u.id = $1::bigint
-      LIMIT 1
-    `,
-    [ownerUserId]
-  );
-  return rows[0] || null;
 };
 
 const syncRevenueCatAccessByEntitlement = async ({
