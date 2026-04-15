@@ -6662,12 +6662,12 @@ const upsertRevenueCatOwnershipLock = async ({
       last_seen_at
     )
     VALUES (
-      $1,
-      $2,
-      $3,
-      $4,
-      $5,
-      $6,
+      $1::text,
+      $2::bigint,
+      $3::text,
+      $4::text,
+      $5::text,
+      $6::boolean,
       $7::timestamptz,
       COALESCE($8::timestamptz, now()),
       now(),
@@ -6709,8 +6709,8 @@ const upsertRevenueCatOwnershipLock = async ({
   if (isActive) {
     const sameOwnerRows = await homePostgresQueryWithClient(
       client,
-      `
-        SELECT
+        `
+          SELECT
           id::int AS id,
           entitlement_id,
           owner_user_id::int AS owner_user_id,
@@ -6723,8 +6723,8 @@ const upsertRevenueCatOwnershipLock = async ({
           updated_at,
           last_seen_at
         FROM public.revenuecat_subscription_locks
-        WHERE entitlement_id = $1
-          AND owner_user_id = $2
+        WHERE entitlement_id = $1::text
+          AND owner_user_id = $2::bigint
         ORDER BY updated_at DESC NULLS LAST, id DESC
         LIMIT 1
       `,
@@ -6738,15 +6738,15 @@ const upsertRevenueCatOwnershipLock = async ({
         `
           UPDATE public.revenuecat_subscription_locks
           SET
-            owner_app_user_id = $3,
-            owner_original_app_user_id = COALESCE($4, owner_original_app_user_id),
-            product_identifier = COALESCE($5, product_identifier),
+            owner_app_user_id = $3::text,
+            owner_original_app_user_id = COALESCE($4::text, owner_original_app_user_id),
+            product_identifier = COALESCE($5::text, product_identifier),
             is_active = TRUE,
             expires_at = $6::timestamptz,
             locked_at = now(),
             updated_at = now(),
             last_seen_at = now()
-          WHERE id = $1
+          WHERE id = $1::bigint
           RETURNING
             id::int AS id,
             entitlement_id,
@@ -6774,10 +6774,10 @@ const upsertRevenueCatOwnershipLock = async ({
         await homePostgresQueryWithClient(
           client,
           `
-            DELETE FROM public.revenuecat_subscription_locks
-            WHERE entitlement_id = $1
-              AND owner_user_id = $2
-              AND id <> $3
+          DELETE FROM public.revenuecat_subscription_locks
+          WHERE entitlement_id = $1::text
+            AND owner_user_id = $2::bigint
+            AND id <> $3::bigint
           `,
           [normalizedEntitlementId, Number(userId), sameOwner.id]
         );
@@ -6822,7 +6822,7 @@ const upsertRevenueCatOwnershipLock = async ({
         updated_at,
         last_seen_at
       FROM public.revenuecat_subscription_locks
-      WHERE entitlement_id = $1
+      WHERE entitlement_id = $1::text
       ORDER BY updated_at DESC NULLS LAST, id DESC
       LIMIT 1
     `,
@@ -6852,16 +6852,16 @@ const upsertRevenueCatOwnershipLock = async ({
         `
           UPDATE public.revenuecat_subscription_locks
           SET
-            owner_user_id = $2,
-            owner_app_user_id = $3,
-            owner_original_app_user_id = COALESCE($4, owner_original_app_user_id),
-            product_identifier = COALESCE($5, product_identifier),
+            owner_user_id = $2::bigint,
+            owner_app_user_id = $3::text,
+            owner_original_app_user_id = COALESCE($4::text, owner_original_app_user_id),
+            product_identifier = COALESCE($5::text, product_identifier),
             is_active = TRUE,
             expires_at = $6::timestamptz,
             locked_at = now(),
             updated_at = now(),
             last_seen_at = now()
-          WHERE entitlement_id = $1
+          WHERE entitlement_id = $1::text
           RETURNING
             id::int AS id,
             entitlement_id,
@@ -6949,7 +6949,7 @@ const getRevenueCatLockOwnerTransferState = async (client, ownerUserId) => {
             AND COALESCE(NULLIF(btrim(uca.grant_source), ''), 'revenuecat') = 'revenuecat'
         ) AS has_active_revenuecat_access
       FROM public.users u
-      WHERE u.id = $1
+      WHERE u.id = $1::bigint
       LIMIT 1
     `,
     [ownerUserId]
