@@ -6706,6 +6706,91 @@ const upsertRevenueCatOwnershipLock = async ({
       last_seen_at
   `;
 
+  if (isActive) {
+    const sameOwnerRows = await homePostgresQueryWithClient(
+      client,
+      `
+        SELECT
+          id::int AS id,
+          entitlement_id,
+          owner_user_id::int AS owner_user_id,
+          owner_app_user_id,
+          owner_original_app_user_id,
+          product_identifier,
+          is_active,
+          expires_at,
+          locked_at,
+          updated_at,
+          last_seen_at
+        FROM public.revenuecat_subscription_locks
+        WHERE entitlement_id = $1
+          AND owner_user_id = $2
+        ORDER BY updated_at DESC NULLS LAST, id DESC
+        LIMIT 1
+      `,
+      [normalizedEntitlementId, Number(userId)]
+    );
+
+    const sameOwner = sameOwnerRows[0] || null;
+    if (sameOwner) {
+      const updatedSameOwnerRows = await homePostgresQueryWithClient(
+        client,
+        `
+          UPDATE public.revenuecat_subscription_locks
+          SET
+            owner_app_user_id = $3,
+            owner_original_app_user_id = COALESCE($4, owner_original_app_user_id),
+            product_identifier = COALESCE($5, product_identifier),
+            is_active = TRUE,
+            expires_at = $6::timestamptz,
+            locked_at = now(),
+            updated_at = now(),
+            last_seen_at = now()
+          WHERE id = $1
+          RETURNING
+            id::int AS id,
+            entitlement_id,
+            owner_user_id::int AS owner_user_id,
+            owner_app_user_id,
+            owner_original_app_user_id,
+            product_identifier,
+            is_active,
+            expires_at,
+            locked_at,
+            updated_at,
+            last_seen_at
+        `,
+        [
+          sameOwner.id,
+          normalizedEntitlementId,
+          normalizedAppUserId,
+          normalizedOriginalAppUserId,
+          normalizedProductIdentifier,
+          expiresAt,
+        ]
+      );
+
+      if (updatedSameOwnerRows[0]) {
+        await homePostgresQueryWithClient(
+          client,
+          `
+            DELETE FROM public.revenuecat_subscription_locks
+            WHERE entitlement_id = $1
+              AND owner_user_id = $2
+              AND id <> $3
+          `,
+          [normalizedEntitlementId, Number(userId), sameOwner.id]
+        );
+
+        return {
+          mapped: true,
+          action: sameOwner.is_active === true ? "updated_same_owner" : "reactivated_same_owner",
+          lock: updatedSameOwnerRows[0],
+        };
+      }
+    }
+  }
+
   const rows = await homePostgresQueryWithClient(client, query, [
     normalizedEntitlementId,
     userId,
@@ -6738,6 +6823,7 @@ const upsertRevenueCatOwnershipLock = async ({
         last_seen_at
       FROM public.revenuecat_subscription_locks
       WHERE entitlement_id = $1
+      ORDER BY updated_at DESC NULLS LAST, id DESC
       LIMIT 1
     `,
     [normalizedEntitlementId]
