@@ -2550,8 +2550,8 @@ const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
             promo_discount_percent,
             promo_discount_amount
           FROM public.orders
-          WHERE id = $1
-            AND user_id = $2
+          WHERE id = $1::bigint
+            AND user_id = $2::bigint
           LIMIT 1
         `,
         [orderId, userId]
@@ -2585,8 +2585,8 @@ const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
             promo_discount_percent,
             promo_discount_amount
           FROM public.orders
-          WHERE id = $1
-            AND user_id = $2
+          WHERE id = $1::bigint
+            AND user_id = $2::bigint
           LIMIT 1
         `,
         [orderId, userId]
@@ -3542,7 +3542,7 @@ const homePostgresTableExists = async (client, tableName) => {
   const rows = await homePostgresQueryWithClient(
     client,
     `
-      SELECT to_regclass($1) IS NOT NULL AS exists
+      SELECT to_regclass($1::text) IS NOT NULL AS exists
     `,
     [tableName]
   );
@@ -3557,8 +3557,8 @@ const homePostgresColumnExists = async (client, tableName, columnName) => {
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema = 'public'
-          AND table_name = $1
-          AND column_name = $2
+          AND table_name = $1::text
+          AND column_name = $2::text
       ) AS exists
     `,
     [tableName, columnName]
@@ -6137,84 +6137,80 @@ const findUserByPayUniqe = async (payUniqe) => {
   const normalizedValue = normalizeRevenueCatAppUserId(payUniqe);
   if (!normalizedValue) return null;
 
-  const runLookupByPayUniqe = async (value, gqlType) => {
-    const data = await hasuraRequest(
-      `
-        query GetUserByPayUniqe($payUniqe: ${gqlType}) {
-          users(where: {payUniqe: {_eq: $payUniqe}}, limit: 2) {
-            id
-            name
-            email
-            phone
-            role_id
-            payUniqe
-          }
-        }
-      `,
-      { payUniqe: value }
-    );
-    const users = data?.users || [];
-    if (users.length > 1) {
-      const err = new Error("payUniqe is not unique in users table.");
-      err.statusCode = 409;
-      throw err;
-    }
-    return users[0] || null;
-  };
-
-  const byPayUniqe = await runLookupByPayUniqe(normalizedValue, "String!");
-  if (byPayUniqe) return byPayUniqe;
-
-  const asBigint = toPositiveIntOrNull(normalizedValue);
-  if (!asBigint) return null;
-
-  const byId = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      query GetUserById($id: bigint!) {
-        users_by_pk(id: $id) {
-          id
-          name
-          email
-          phone
-          role_id
-          payUniqe
-        }
-      }
+      SELECT
+        id::bigint AS id,
+        name,
+        email,
+        phone,
+        role_id,
+        payUniqe
+      FROM public.users
+      WHERE payUniqe::text = $1::text
+      LIMIT 2
     `,
-    { id: asBigint }
+    [normalizedValue]
   );
-  return byId?.users_by_pk || null;
+
+  if (rows.length > 1) {
+    const err = new Error("payUniqe is not unique in users table.");
+    err.statusCode = 409;
+    throw err;
+  }
+
+  return rows[0] || null;
 };
 
 const setUserPayUniqe = async (userId, payUniqe) => {
-  const runUpdate = async (value, gqlType) => {
-    const data = await hasuraRequest(
-      `
-        mutation UpdateUserPayUniqe($id: bigint!, $payUniqe: ${gqlType}) {
-          update_users_by_pk(pk_columns: {id: $id}, _set: {payUniqe: $payUniqe}) {
-            id
-            payUniqe
-          }
-        }
-      `,
-      { id: userId, payUniqe: value }
-    );
-    return data?.update_users_by_pk || null;
-  };
-
   try {
-    return await runUpdate(payUniqe, "String!");
+    const normalizedValue = normalizeRevenueCatAppUserId(payUniqe);
+    if (!normalizedValue) {
+      return null;
+    }
+    const rows = await homePostgresQuery(
+      `
+        UPDATE public.users
+        SET payUniqe = $2::text
+        WHERE id = $1::bigint
+        RETURNING
+          id::bigint AS id,
+          payUniqe
+      `,
+      [userId, normalizedValue]
+    );
+    return rows[0] || null;
   } catch (err) {
-    if (!isHasuraVariableTypeMismatch(err, "payUniqe", "bigint")) {
-      throw err;
+    // Fall back to Hasura if the direct Postgres path is unavailable.
+    const runUpdate = async (value, gqlType) => {
+      const data = await hasuraRequest(
+        `
+          mutation UpdateUserPayUniqe($id: bigint!, $payUniqe: ${gqlType}) {
+            update_users_by_pk(pk_columns: {id: $id}, _set: {payUniqe: $payUniqe}) {
+              id
+              payUniqe
+            }
+          }
+        `,
+        { id: userId, payUniqe: value }
+      );
+      return data?.update_users_by_pk || null;
+    };
+
+    try {
+      return await runUpdate(payUniqe, "String!");
+    } catch (fallbackErr) {
+      if (!isHasuraVariableTypeMismatch(fallbackErr, "payUniqe", "bigint")) {
+        throw fallbackErr;
+      }
+      const asBigint = toPositiveIntOrNull(payUniqe);
+      if (!asBigint) {
+        const mismatchErr = new Error("payUniqe must be numeric for current schema.");
+        mismatchErr.statusCode = 400;
+        throw mismatchErr;
+      }
+      return runUpdate(asBigint, "bigint!");
     }
-    const asBigint = toPositiveIntOrNull(payUniqe);
-    if (!asBigint) {
-      const mismatchErr = new Error("payUniqe must be numeric for current schema.");
-      mismatchErr.statusCode = 400;
-      throw mismatchErr;
-    }
-    return runUpdate(asBigint, "bigint!");
   }
 };
 
