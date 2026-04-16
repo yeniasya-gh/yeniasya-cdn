@@ -6408,6 +6408,11 @@ const fetchRevenueCatEntitlementState = async ({ appUserId, entitlementId }) => 
   const purchasePlatform = purchasePlatformFromRevenueCatStore(
     entitlement.store || entitlement.store_name || entitlement.storeName
   );
+  const productIdentifier =
+    entitlement.product_identifier ||
+    entitlement.productIdentifier ||
+    entitlement.product_id ||
+    null;
 
   let isActive = true;
   if (hasExplicitExpiry && expirationDate) {
@@ -6423,6 +6428,7 @@ const fetchRevenueCatEntitlementState = async ({ appUserId, entitlementId }) => 
     isActive,
     expirationDate,
     purchasePlatform,
+    productIdentifier,
     store: entitlement.store || entitlement.store_name || entitlement.storeName || null,
   };
 };
@@ -7721,6 +7727,144 @@ const startRevenueCatReconcileJob = () => {
   console.log(
     `[revenuecat][reconcile] scheduled interval=${REVENUECAT_RECONCILE_INTERVAL_MINUTES}m batch=${REVENUECAT_RECONCILE_BATCH_SIZE}`
   );
+};
+
+const inspectAndRepairRevenueCatSubscriptionForUser = async ({
+  userId,
+  entitlementId = REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+}) => {
+  const normalizedUserId = toPositiveIntOrNull(userId);
+  const normalizedEntitlementId =
+    normalizeRevenueCatAppUserId(entitlementId) ||
+    normalizeRevenueCatAppUserId(REVENUECAT_DEFAULT_ENTITLEMENT_ID);
+  if (!normalizedUserId) {
+    const err = new Error("userId is required.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!normalizedEntitlementId) {
+    const err = new Error("entitlementId is required.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const user = await findUserById(normalizedUserId);
+  if (!user) {
+    const err = new Error("User not found.");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const activeAccessBefore = await getActiveNewspaperSubscriptionAccess(normalizedUserId);
+  const candidates = [];
+  const seenCandidates = new Set();
+  const addCandidate = (value, source) => {
+    const normalized = normalizeRevenueCatAppUserId(value);
+    if (!normalized || seenCandidates.has(normalized)) {
+      return;
+    }
+    seenCandidates.add(normalized);
+    candidates.push({ appUserId: normalized, source });
+  };
+
+  addCandidate(user.payUniqe, "payUniqe");
+  addCandidate(String(user.id), "userId");
+  addCandidate(
+    await getRevenueCatLockFallbackAppUserId(normalizedUserId, normalizedEntitlementId),
+    "lockFallback"
+  );
+
+  const verifications = [];
+  let matchedCandidate = null;
+  let matchedVerification = null;
+
+  for (const candidate of candidates) {
+    const verification = await fetchRevenueCatEntitlementState({
+      appUserId: candidate.appUserId,
+      entitlementId: normalizedEntitlementId,
+    });
+    verifications.push({
+      source: candidate.source,
+      appUserId: candidate.appUserId,
+      checked: verification.checked,
+      sourceType: verification.source || null,
+      reason: verification.reason || null,
+      isActive: verification.isActive === true,
+      expirationDate: verification.expirationDate || null,
+      purchasePlatform: verification.purchasePlatform || null,
+    });
+
+    if (verification.checked && verification.isActive === true) {
+      matchedCandidate = candidate;
+      matchedVerification = verification;
+      break;
+    }
+  }
+
+  if (!matchedCandidate || !matchedVerification) {
+    return {
+      ok: true,
+      fixed: false,
+      activeRevenueCat: false,
+      activeAccessBefore: Boolean(activeAccessBefore),
+      activeAccessAfter: Boolean(activeAccessBefore),
+      payUniqeUpdated: false,
+      matchedAppUserId: null,
+      matchedSource: null,
+      entitlementId: normalizedEntitlementId,
+      verifications,
+      message: "RevenueCat'te aktif abonelik bulunamadı.",
+    };
+  }
+
+  const syncResult = await syncRevenueCatAccessByEntitlement({
+    userId: normalizedUserId,
+    entitlementId: normalizedEntitlementId,
+    isActive: true,
+    expirationDate: matchedVerification.expirationDate,
+    appUserId: matchedCandidate.appUserId,
+    originalAppUserId: matchedCandidate.appUserId,
+    productIdentifier: matchedVerification.productIdentifier || null,
+    purchasePlatform: matchedVerification.purchasePlatform || null,
+  });
+
+  const currentPayUniqe = normalizeRevenueCatAppUserId(user.payUniqe);
+  let payUniqeUpdated = false;
+  if (currentPayUniqe !== matchedCandidate.appUserId) {
+    await setUserPayUniqe(normalizedUserId, matchedCandidate.appUserId);
+    payUniqeUpdated = true;
+  }
+
+  const activeAccessAfter = await getActiveNewspaperSubscriptionAccess(normalizedUserId);
+  const fixed = !activeAccessBefore && Boolean(activeAccessAfter);
+  const alreadySynced = Boolean(activeAccessBefore) && !payUniqeUpdated;
+  const message = fixed
+    ? "RevenueCat aktif abonelik bulundu ve sistem kaydı düzeltildi."
+    : payUniqeUpdated
+      ? "RevenueCat abonelik kimliği güncellendi."
+      : alreadySynced
+        ? "Abonelik zaten senkron."
+        : "RevenueCat abonelik durumu kontrol edildi.";
+
+  return {
+    ok: true,
+    fixed,
+    alreadySynced,
+    activeRevenueCat: true,
+    activeAccessBefore: Boolean(activeAccessBefore),
+    activeAccessAfter: Boolean(activeAccessAfter),
+    payUniqeUpdated,
+    matchedAppUserId: matchedCandidate.appUserId,
+    matchedSource: matchedCandidate.source,
+    entitlementId: normalizedEntitlementId,
+    verification: {
+      ...matchedVerification,
+      productIdentifier: matchedVerification.productIdentifier || null,
+    },
+    verifications,
+    syncResult,
+    message,
+  };
 };
 
 app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res) => {
@@ -10174,6 +10318,48 @@ app.post("/admin/users/purge", requireJwtOrServiceAuth, async (req, res) => {
     return res.status(err.statusCode || 500).json({
       ok: false,
       error: err.message || "Kullanıcı silinemedi.",
+    });
+  }
+});
+
+app.post("/admin/users/revenuecat/reconcile", requireJwtOrServiceAuth, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  try {
+    const actor = req.hasuraAuthMode === "jwt" ? await ensureAdminJwtActor(req) : null;
+    const userId = toPositiveIntOrNull(req.body?.userId);
+    const entitlementId =
+      normalizeRevenueCatAppUserId(req.body?.entitlementId) ||
+      REVENUECAT_DEFAULT_ENTITLEMENT_ID;
+
+    if (!userId) {
+      return res.status(400).json({
+        ok: false,
+        error: "userId zorunludur.",
+      });
+    }
+
+    const result = await inspectAndRepairRevenueCatSubscriptionForUser({
+      userId,
+      entitlementId,
+    });
+
+    console.log(
+      `[admin][users][revenuecat][reconcile][success] id=${requestId} actor=${actor?.id || "-"} userId=${userId} entitlement=${entitlementId} fixed=${result.fixed} activeRevenueCat=${result.activeRevenueCat} payUniqeUpdated=${result.payUniqeUpdated}`
+    );
+    return res.json({
+      ok: true,
+      requestId,
+      actorUserId: actor?.id || null,
+      userId,
+      ...result,
+    });
+  } catch (err) {
+    console.error(
+      `[admin][users][revenuecat][reconcile][error] id=${requestId} msg=${err.message}`
+    );
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: err.message || "Abonelik incelenemedi.",
     });
   }
 });
