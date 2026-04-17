@@ -7798,9 +7798,11 @@ const inspectAndRepairRevenueCatSubscriptionForUser = async ({
   }
 
   if (!matchedCandidate || !matchedVerification) {
+    const healthy = Boolean(activeAccessBefore);
     return {
       ok: true,
       fixed: false,
+      healthy,
       activeRevenueCat: false,
       activeAccessBefore: Boolean(activeAccessBefore),
       activeAccessAfter: Boolean(activeAccessBefore),
@@ -7809,7 +7811,9 @@ const inspectAndRepairRevenueCatSubscriptionForUser = async ({
       matchedSource: null,
       entitlementId: normalizedEntitlementId,
       verifications,
-      message: "RevenueCat'te aktif abonelik bulunamadı.",
+      message: healthy
+        ? "Abonelik tarafında kullanıcının sorunu bulunmamaktadır."
+        : "RevenueCat'te aktif abonelik bulunamadı.",
     };
   }
 
@@ -7834,18 +7838,20 @@ const inspectAndRepairRevenueCatSubscriptionForUser = async ({
   const activeAccessAfter = await getActiveNewspaperSubscriptionAccess(normalizedUserId);
   const fixed = !activeAccessBefore && Boolean(activeAccessAfter);
   const alreadySynced = Boolean(activeAccessBefore) && !payUniqeUpdated;
+  const healthy = Boolean(activeAccessAfter) || Boolean(activeAccessBefore);
   const message = fixed
-    ? "RevenueCat aktif abonelik bulundu ve sistem kaydı düzeltildi."
+    ? "Abonelik düzeltildi."
     : payUniqeUpdated
-      ? "RevenueCat abonelik kimliği güncellendi."
-      : alreadySynced
-        ? "Abonelik zaten senkron."
-        : "RevenueCat abonelik durumu kontrol edildi.";
+      ? "Abonelik düzeltildi."
+      : alreadySynced || healthy
+        ? "Abonelik tarafında kullanıcının sorunu bulunmamaktadır."
+        : "Abonelik durumu kontrol edildi.";
 
   return {
     ok: true,
     fixed,
     alreadySynced,
+    healthy,
     activeRevenueCat: true,
     activeAccessBefore: Boolean(activeAccessBefore),
     activeAccessAfter: Boolean(activeAccessAfter),
