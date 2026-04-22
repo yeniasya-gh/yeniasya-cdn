@@ -4740,6 +4740,15 @@ const requireRevenueCatAuth = async (req, res, next) => {
     return next();
   }
 
+  if (
+    typeof req.path === "string" &&
+    req.path.startsWith("/revenuecat/subscription/")
+  ) {
+    req.revenueCatAuthMode = "guest";
+    req.revenueCatGuest = true;
+    return next();
+  }
+
   return res.status(401).json({ ok: false, error: "Yetkisiz erişim." });
 };
 
@@ -10512,7 +10521,7 @@ const writeRevenueCatAuditLog = async (entry) => {
         entry.verification_reason || null,
         entry.access_action || null,
         entry.error || null,
-        entry.payload ? JSON.stringify(entry.payload) : null,
+        JSON.stringify(entry.payload ?? {}),
         entry.created_at || null,
       ]
     );
@@ -10981,6 +10990,14 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
   };
 
   try {
+    if (req.revenueCatGuest) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "guest_noop",
+      });
+    }
+
     const body = req.body || {};
     const entitlementId = normalizeRevenueCatAppUserId(body.entitlementId);
     const appUserId = normalizeRevenueCatAppUserId(body.appUserId);
@@ -11145,6 +11162,14 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
   };
 
   try {
+    if (req.revenueCatGuest) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "guest_noop",
+      });
+    }
+
     const body = req.body || {};
     const source = normalizeRevenueCatAppUserId(body.source) || "unknown";
     const result = normalizeRevenueCatAppUserId(body.result) || "unknown";
@@ -11307,6 +11332,14 @@ app.post("/revenuecat/subscription/refresh", requireRevenueCatAuth, async (req, 
   };
 
   try {
+    if (req.revenueCatGuest) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "guest_noop",
+      });
+    }
+
     const body = req.body || {};
     const source = normalizeRevenueCatAppUserId(body.source) || "manual_refresh";
     const entitlementId =
