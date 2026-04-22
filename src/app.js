@@ -1963,9 +1963,16 @@ const clonePlainObject = (value) =>
 
 const cloneMagazinePublicIssues = (value) =>
   Array.isArray(value)
-    ? value.map((item) =>
-        item && typeof item === "object" && !Array.isArray(item) ? { ...item } : item
-      )
+    ? value.map((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          return item;
+        }
+        const cloned = { ...item };
+        if (cloned.publish_date == null && cloned.added_at != null) {
+          cloned.publish_date = cloned.added_at;
+        }
+        return cloned;
+      })
     : [];
 
 const getCachedAppFeatureFlags = async (id) => {
@@ -2063,6 +2070,7 @@ const magazinePublicIssuesSql = `
     price,
     description,
     added_at,
+    added_at::date::text AS publish_date,
     EXTRACT(YEAR FROM added_at)::int AS publish_year
   FROM public.magazine_issue
   WHERE magazine_id = $1
@@ -2080,7 +2088,8 @@ const loadPublicMagazineIssuesFromHasura = async (magazineId) => {
         photo_url,
         price,
         description,
-        added_at
+        added_at,
+        added_at::date::text AS publish_date
       FROM public.magazine_issue
       WHERE magazine_id = $1::bigint
         AND COALESCE(is_published, TRUE) = TRUE
@@ -5120,7 +5129,7 @@ const selectBooksDirect = async ({
     ", b.category_id",
     ", b.author_id",
     ", b.created_at",
-    ", b.updated_at",
+    ", NULL::timestamptz AS updated_at",
     ", CASE WHEN c.id IS NULL THEN NULL ELSE jsonb_build_object('id', c.id, 'name', c.name) END AS category_rel",
     ", CASE WHEN a.id IS NULL THEN NULL ELSE jsonb_build_object('id', a.id, 'name', a.name) END AS author_rel",
     "FROM public.books b",
@@ -5150,7 +5159,7 @@ const selectMagazinesDirect = async ({
     ", m.period",
     ", m.description",
     ", m.created_at",
-    ", m.updated_at",
+    ", NULL::timestamptz AS updated_at",
     "FROM public.magazine m",
     `WHERE ${whereSql}`,
     `ORDER BY ${orderBy}`,
@@ -5178,8 +5187,9 @@ const selectMagazineIssuesDirect = async ({
     ", mi.price",
     ", mi.description",
     ", mi.added_at",
+    ", mi.added_at::date::text AS publish_date",
     ", mi.created_at",
-    ", mi.updated_at",
+    ", NULL::timestamptz AS updated_at",
     ", COALESCE(mi.is_published, TRUE) AS is_published",
     includeMagazine
       ? ", CASE WHEN m.id IS NULL THEN NULL ELSE jsonb_build_object('id', m.id, 'name', m.name) END AS magazine"
