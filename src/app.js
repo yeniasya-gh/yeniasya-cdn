@@ -3443,7 +3443,7 @@ const getUserByEmailForAuth = async (email) => {
         u.email,
         u.phone,
         u.avatar_url,
-        u.payUniqe,
+        u."payUniqe",
         u.auth_session_id,
         u.role_id::bigint AS role_id,
         u.password,
@@ -3474,7 +3474,7 @@ const getInactiveUserByEmailForAuth = async (email) => {
         u.email,
         u.phone,
         u.avatar_url,
-        u.payUniqe,
+        u."payUniqe",
         u.auth_session_id,
         u.role_id::bigint AS role_id,
         u.password,
@@ -3506,7 +3506,7 @@ const getUserByPhoneForAuth = async (phone) => {
         u.email,
         u.phone,
         u.avatar_url,
-        u.payUniqe,
+        u."payUniqe",
         u.auth_session_id,
         u.role_id::bigint AS role_id,
         u.password,
@@ -3537,7 +3537,7 @@ const getInactiveUserByPhoneForAuth = async (phone) => {
         u.email,
         u.phone,
         u.avatar_url,
-        u.payUniqe,
+        u."payUniqe",
         u.auth_session_id,
         u.role_id::bigint AS role_id,
         u.password,
@@ -3904,7 +3904,7 @@ const getUserByIdForAuth = async (id) => {
         email,
         phone,
         avatar_url,
-        payUniqe,
+        "payUniqe",
         auth_session_id,
         role_id::bigint AS role_id,
         email_verified_at,
@@ -3930,7 +3930,7 @@ const getUserByIdForPasswordChange = async (id) => {
         email,
         phone,
         avatar_url,
-        payUniqe,
+        "payUniqe",
         role_id::bigint AS role_id,
         password,
         auth_session_id,
@@ -4002,7 +4002,7 @@ const updateUserProfileFields = async ({ userId, name, phone }) => {
         email,
         phone,
         avatar_url,
-        payUniqe,
+        "payUniqe",
         role_id::bigint AS role_id,
         email_verified_at,
         is_active
@@ -4024,7 +4024,7 @@ const updateUserAvatarUrl = async ({ userId, avatarUrl }) => {
         email,
         phone,
         avatar_url,
-        payUniqe,
+        "payUniqe",
         role_id::bigint AS role_id,
         email_verified_at,
         is_active
@@ -4237,7 +4237,7 @@ const markUserEmailVerified = async (userId, verifiedAt) => {
         email,
         phone,
         avatar_url,
-        payUniqe,
+        "payUniqe",
         role_id::bigint AS role_id,
         email_verified_at
     `,
@@ -4883,7 +4883,7 @@ const selectUsersDirect = async ({
     "u.email",
     "u.phone",
     "u.avatar_url",
-    "u.payUniqe",
+    'u."payUniqe"',
     "u.auth_session_id",
     "u.role_id::bigint AS role_id",
     "u.email_verified_at",
@@ -8216,7 +8216,7 @@ app.post("/auth/social-login", async (req, res) => {
             email,
             phone,
             password,
-            payUniqe,
+            "payUniqe",
             is_active,
             email_verified_at
           ) VALUES (
@@ -8234,7 +8234,7 @@ app.post("/auth/social-login", async (req, res) => {
             email,
             phone,
             avatar_url,
-            payUniqe,
+            "payUniqe",
             role_id::bigint AS role_id,
             email_verified_at
         `,
@@ -9158,7 +9158,7 @@ const findUserById = async (userId) => {
         phone,
         avatar_url,
         role_id::bigint AS role_id,
-        payUniqe
+        "payUniqe"
       FROM public.users
       WHERE id = $1::bigint
       LIMIT 1
@@ -9215,9 +9215,9 @@ const findUserByPayUniqe = async (payUniqe) => {
         email,
         phone,
         role_id,
-        payUniqe
+        "payUniqe"
       FROM public.users
-      WHERE payUniqe::text = $1::text
+      WHERE "payUniqe"::text = $1::text
       LIMIT 2
     `,
     [normalizedValue]
@@ -9240,11 +9240,11 @@ const setUserPayUniqe = async (userId, payUniqe) => {
   const rows = await homePostgresQuery(
     `
       UPDATE public.users
-      SET payUniqe = $2::text
+      SET "payUniqe" = $2::text
       WHERE id = $1::bigint
       RETURNING
         id::bigint AS id,
-        payUniqe
+        "payUniqe"
     `,
     [userId, normalizedValue]
   );
