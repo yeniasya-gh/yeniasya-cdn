@@ -6491,6 +6491,14 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
         }),
       };
     }
+    case "GetActiveNewspaperSubscriptionTypes": {
+      return {
+        newspaper_subscription_type: await selectNewspaperSubscriptionTypesDirect({
+          whereSql: "COALESCE(is_active, TRUE) = TRUE",
+          orderBy: "sort_order ASC, id ASC",
+        }),
+      };
+    }
     case "CreateNewspaperSubscriptionType": {
       const rows = await directInsert({
         tableName: "newspaper_subscription_type",
@@ -7057,6 +7065,82 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
       const { order_items = [], ...orderRow } = order;
       return { orders_by_pk: orderRow, order_items };
     }
+    case "GetAccess": {
+      const userId = toPositiveIntOrNull(variables.user_id);
+      const itemType = String(variables.item_type || "").trim();
+      if (!userId || !itemType) return { user_content_access: [] };
+      const entries = await selectUserContentAccessDirect({
+        whereSql: "user_id = $1::bigint AND item_type = $2::text AND is_active = TRUE",
+        values: [userId, itemType],
+        orderBy: "started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC",
+      });
+      if (itemType === "newspaper_subscription") {
+        entries.push(...await getManualNewspaperAccessRows({ userId }));
+      }
+      return { user_content_access: sortUserAccessEntries(entries) };
+    }
+    case "GetAccessAll": {
+      const userId = toPositiveIntOrNull(variables.user_id);
+      if (!userId) return { user_content_access: [] };
+      return {
+        user_content_access: await selectUserContentAccessDirect({
+          whereSql: "user_id = $1::bigint AND is_active = TRUE",
+          values: [userId],
+          orderBy: "started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC",
+          includeManual: true,
+        }),
+      };
+    }
+    case "GetLatestAccess": {
+      const userId = toPositiveIntOrNull(variables.user_id);
+      const itemType = String(variables.item_type || "").trim();
+      const itemId = toPositiveIntOrNull(variables.item_id);
+      if (!userId || !itemType) return { user_content_access: [] };
+      const conditions = ["user_id = $1::bigint", "item_type = $2::text", "is_active = TRUE"];
+      const values = [userId, itemType];
+      if (itemId == null) {
+        conditions.push("item_id IS NULL");
+      } else {
+        values.push(itemId);
+        conditions.push(`item_id = $${values.length}::bigint`);
+      }
+      const accessRows = await selectUserContentAccessDirect({
+        whereSql: conditions.join(" AND "),
+        values,
+        orderBy: "expires_at DESC NULLS LAST, started_at DESC NULLS LAST, id DESC",
+        limit: 1,
+      });
+      if (itemType !== "newspaper_subscription" || itemId != null) {
+        return { user_content_access: accessRows };
+      }
+      const manualRows = await getManualNewspaperAccessRows({ userId });
+      return { user_content_access: sortUserAccessEntries([...accessRows, ...manualRows]).slice(0, 1) };
+    }
+    case "GetLatestManualNewspaperAccess": {
+      const userId = toPositiveIntOrNull(variables.user_id);
+      if (!userId) return { manual_newspaper_users: [] };
+      return {
+        manual_newspaper_users: await homePostgresQuery(
+          `
+            SELECT
+              id::bigint AS id,
+              user_id::bigint AS user_id,
+              starts_at,
+              ends_at,
+              is_active,
+              COALESCE(status, 'new') AS status,
+              note,
+              created_at,
+              updated_at
+            FROM public.manual_newspaper_users
+            WHERE user_id = $1::bigint AND is_active = TRUE
+            ORDER BY ends_at DESC NULLS LAST, starts_at DESC NULLS LAST, id DESC
+            LIMIT 1
+          `,
+          [userId]
+        ),
+      };
+    }
     case "CreateOrder": {
       const rows = await homePostgresQuery(
         `
@@ -7151,6 +7235,26 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
       }
       return { insert_order_items: { affected_rows: normalizedItems.length } };
     }
+    case "InsertContact": {
+      const rows = await homePostgresQuery(
+        `
+          INSERT INTO public.contact_messages (
+            subject,
+            message,
+            user_id,
+            email
+          ) VALUES ($1::text, $2::text, $3::bigint, $4::text)
+          RETURNING id::bigint AS id
+        `,
+        [
+          variables.subject,
+          variables.message,
+          variables.user_id ?? null,
+          variables.email ?? null,
+        ]
+      );
+      return { insert_contact_messages_one: rows[0] || null };
+    }
     case "UpdateOrderPayment": {
       const id = toPositiveIntOrNull(variables.id);
       if (!id) return { update_orders_by_pk: null };
@@ -7176,6 +7280,172 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
           includeUser: true,
         }),
       };
+    }
+    case "InsertAccess": {
+      const items = Array.isArray(variables.items) ? variables.items : [];
+      if (!items.length) return { insert_user_content_access: { affected_rows: 0 } };
+      let affectedRows = 0;
+      for (const item of items) {
+        await homePostgresQuery(
+          `
+            INSERT INTO public.user_content_access (
+              user_id,
+              item_id,
+              item_type,
+              started_at,
+              expires_at,
+              purchase_price,
+              is_active,
+              grant_source,
+              purchase_platform
+            ) VALUES (
+              $1::bigint,
+              $2::bigint,
+              $3::access_item_type,
+              $4::timestamptz,
+              $5::timestamptz,
+              $6::numeric,
+              COALESCE($7::boolean, TRUE),
+              $8::text,
+              $9::text
+            )
+          `,
+          [
+            item.user_id,
+            item.item_id ?? null,
+            item.item_type,
+            item.started_at ?? null,
+            item.expires_at ?? null,
+            item.purchase_price ?? null,
+            item.is_active ?? true,
+            item.grant_source ?? null,
+            item.purchase_platform ?? null,
+          ]
+        );
+        affectedRows += 1;
+      }
+      return { insert_user_content_access: { affected_rows: affectedRows } };
+    }
+    case "DeactivateExpiredAccess": {
+      const userId = toPositiveIntOrNull(variables.user_id);
+      const itemType = String(variables.item_type || "").trim();
+      const itemId = toPositiveIntOrNull(variables.item_id);
+      const now = variables.now || new Date().toISOString();
+      if (!userId || !itemType) return { update_user_content_access: { affected_rows: 0 } };
+      const clauses = [
+        "user_id = $1::bigint",
+        "item_type = $2::access_item_type",
+        "is_active = TRUE",
+        "expires_at <= $3::timestamptz",
+      ];
+      const values = [userId, itemType, now];
+      if (itemId == null) {
+        clauses.push("item_id IS NULL");
+      } else {
+        values.push(itemId);
+        clauses.push(`item_id = $${values.length}::bigint`);
+      }
+      const rows = await homePostgresQuery(
+        `UPDATE public.user_content_access SET is_active = FALSE WHERE ${clauses.join(" AND ")} RETURNING id`,
+        values
+      );
+      return { update_user_content_access: { affected_rows: rows.length } };
+    }
+    case "DeactivateUserContentAccess": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_user_content_access: { affected_rows: 0 } };
+      const rows = await homePostgresQuery(
+        `
+          UPDATE public.user_content_access
+          SET is_active = FALSE
+          WHERE id = $1::bigint
+          RETURNING id
+        `,
+        [id]
+      );
+      return { update_user_content_access: { affected_rows: rows.length } };
+    }
+    case "DeleteUserContentAccess": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { delete_user_content_access: { affected_rows: 0 } };
+      const rows = await homePostgresQuery(
+        `DELETE FROM public.user_content_access WHERE id = $1::bigint RETURNING id`,
+        [id]
+      );
+      return { delete_user_content_access: { affected_rows: rows.length } };
+    }
+    case "UpdateAccessExpiry": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_user_content_access_by_pk: null };
+      const set = compactObject({
+        expires_at: variables.expires_at,
+        grant_source: variables.grant_source,
+        purchase_platform: variables.purchase_platform,
+      });
+      if (!Object.keys(set).length) {
+        const row = await homePostgresQuery(
+          `
+            SELECT
+              id::bigint AS id,
+              expires_at
+            FROM public.user_content_access
+            WHERE id = $1::bigint
+            LIMIT 1
+          `,
+          [id]
+        );
+        return { update_user_content_access_by_pk: row[0] || null };
+      }
+      const rows = await homePostgresQuery(
+        `
+          UPDATE public.user_content_access
+          SET ${Object.keys(set)
+            .map((key, index) => `${quoteSqlIdentifier(key)} = $${index + 2}`)
+            .join(", ")}
+          WHERE id = $1::bigint
+          RETURNING id::bigint AS id, expires_at
+        `,
+        [id, ...Object.values(set)]
+      );
+      return { update_user_content_access_by_pk: rows[0] || null };
+    }
+    case "UpdateManualNewspaperExpiry": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_manual_newspaper_users_by_pk: null };
+      const rows = await homePostgresQuery(
+        `
+          UPDATE public.manual_newspaper_users
+          SET ends_at = $2::timestamptz,
+              updated_at = $3::timestamptz
+          WHERE id = $1::bigint
+          RETURNING id::bigint AS id, ends_at
+        `,
+        [id, variables.ends_at ?? null, variables.updated_at || new Date().toISOString()]
+      );
+      return { update_manual_newspaper_users_by_pk: rows[0] || null };
+    }
+    case "DeactivateManualNewspaperAccess": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_manual_newspaper_users: { affected_rows: 0 } };
+      const rows = await homePostgresQuery(
+        `
+          UPDATE public.manual_newspaper_users
+          SET is_active = FALSE
+          WHERE id = $1::bigint
+          RETURNING id
+        `,
+        [id]
+      );
+      return { update_manual_newspaper_users: { affected_rows: rows.length } };
+    }
+    case "DeleteManualNewspaperAccess": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { delete_manual_newspaper_users: { affected_rows: 0 } };
+      const rows = await homePostgresQuery(
+        `DELETE FROM public.manual_newspaper_users WHERE id = $1::bigint RETURNING id`,
+        [id]
+      );
+      return { delete_manual_newspaper_users: { affected_rows: rows.length } };
     }
     case "GetUserNotifications": {
       const where = variables.where || {};
