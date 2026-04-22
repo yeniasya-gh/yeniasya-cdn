@@ -7123,7 +7123,8 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
       const itemType = String(variables.item_type || "").trim();
       if (!userId || !itemType) return { user_content_access: [] };
       const entries = await selectUserContentAccessDirect({
-        whereSql: "user_id = $1::bigint AND item_type = $2::text AND is_active = TRUE",
+        whereSql:
+          "user_id = $1::bigint AND item_type = $2::public.access_item_type AND is_active = TRUE",
         values: [userId, itemType],
         orderBy: "started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC",
       });
@@ -7149,7 +7150,11 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
       const itemType = String(variables.item_type || "").trim();
       const itemId = toPositiveIntOrNull(variables.item_id);
       if (!userId || !itemType) return { user_content_access: [] };
-      const conditions = ["user_id = $1::bigint", "item_type = $2::text", "is_active = TRUE"];
+      const conditions = [
+        "user_id = $1::bigint",
+        "item_type = $2::public.access_item_type",
+        "is_active = TRUE",
+      ];
       const values = [userId, itemType];
       if (itemId == null) {
         conditions.push("item_id IS NULL");
@@ -8037,7 +8042,7 @@ app.post("/auth/register", async (req, res) => {
             email,
             phone,
             password,
-            payUniqe,
+            "payUniqe",
             is_active,
             email_verified_at
           ) VALUES (
@@ -8055,7 +8060,7 @@ app.post("/auth/register", async (req, res) => {
             email,
             phone,
             avatar_url,
-            payUniqe,
+            "payUniqe",
             role_id::bigint AS role_id
         `,
         [
@@ -8388,7 +8393,7 @@ app.post("/auth/social-register", async (req, res) => {
             email,
             phone,
             password,
-            payUniqe,
+            "payUniqe",
             is_active,
             email_verified_at
           ) VALUES (
@@ -8406,7 +8411,7 @@ app.post("/auth/social-register", async (req, res) => {
             email,
             phone,
             avatar_url,
-            payUniqe,
+            "payUniqe",
             role_id::bigint AS role_id,
             email_verified_at
         `,
