@@ -6,6 +6,7 @@ const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { spawn, spawnSync } = require("child_process");
 const https = require("https");
 const { setTimeout: sleep } = require("timers/promises");
 const nodemailer = require("nodemailer");
@@ -110,6 +111,27 @@ const UPLOAD_RATE_LIMIT_MAX =
   Number.isFinite(UPLOAD_RATE_LIMIT_MAX_RAW) && UPLOAD_RATE_LIMIT_MAX_RAW > 0
     ? UPLOAD_RATE_LIMIT_MAX_RAW
     : 60;
+const PDF_UPLOAD_OPTIMIZE_MIN_BYTES_RAW = Number(
+  process.env.PDF_UPLOAD_OPTIMIZE_MIN_BYTES || String(2 * 1024 * 1024)
+);
+const PDF_UPLOAD_OPTIMIZE_MIN_BYTES =
+  Number.isFinite(PDF_UPLOAD_OPTIMIZE_MIN_BYTES_RAW) && PDF_UPLOAD_OPTIMIZE_MIN_BYTES_RAW > 0
+    ? PDF_UPLOAD_OPTIMIZE_MIN_BYTES_RAW
+    : 2 * 1024 * 1024;
+const PDF_UPLOAD_OPTIMIZE_PDFSETTINGS = (
+  process.env.PDF_UPLOAD_OPTIMIZE_PDFSETTINGS || "/ebook"
+)
+  .trim()
+  .replace(/\s+/g, "");
+const PDF_UPLOAD_OPTIMIZE_KEEP_RATIO_RAW = Number(
+  process.env.PDF_UPLOAD_OPTIMIZE_KEEP_RATIO || "0.98"
+);
+const PDF_UPLOAD_OPTIMIZE_KEEP_RATIO =
+  Number.isFinite(PDF_UPLOAD_OPTIMIZE_KEEP_RATIO_RAW) &&
+  PDF_UPLOAD_OPTIMIZE_KEEP_RATIO_RAW > 0 &&
+  PDF_UPLOAD_OPTIMIZE_KEEP_RATIO_RAW < 1
+    ? PDF_UPLOAD_OPTIMIZE_KEEP_RATIO_RAW
+    : 0.98;
 const BCRYPT_COST_RAW = Number(process.env.BCRYPT_COST || "12");
 const BCRYPT_COST =
   Number.isInteger(BCRYPT_COST_RAW) && BCRYPT_COST_RAW >= 10 && BCRYPT_COST_RAW <= 14
@@ -8832,6 +8854,10 @@ const generateUniqueFilename = (originalName) => {
 const uploadToBunny = async (filePath, type, scope, filename) => {
   const url = `/${type}/${scope}/${filename}`;
   try {
+    const contentType =
+      path.extname(filename || filePath).toLowerCase() === ".pdf"
+        ? "application/pdf"
+        : "application/octet-stream";
     const response = await bunnyRequest(
       {
         method: "PUT",
@@ -8839,7 +8865,7 @@ const uploadToBunny = async (filePath, type, scope, filename) => {
         data: fs.createReadStream(filePath),
         timeout: BUNNY_UPLOAD_TIMEOUT_MS,
         headers: {
-          "Content-Type": "application/octet-stream",
+          "Content-Type": contentType,
         },
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
@@ -8856,6 +8882,148 @@ const uploadToBunny = async (filePath, type, scope, filename) => {
     );
     throw new Error(`BunnyCDN upload failed (${statusCode}): ${JSON.stringify(errorMsg)}`);
   }
+};
+
+const ghostscriptAvailable = (() => {
+  let checked = false;
+  let available = false;
+  return () => {
+    if (checked) return available;
+    checked = true;
+    try {
+      const probe = spawnSync("gs", ["--version"], {
+        stdio: "ignore",
+      });
+      available = !probe.error && probe.status === 0;
+    } catch (_) {
+      available = false;
+    }
+    return available;
+  };
+})();
+
+const runGhostscriptCompression = (inputPath, outputPath) =>
+  new Promise((resolve) => {
+    const args = [
+      "-q",
+      "-dNOPAUSE",
+      "-dBATCH",
+      "-dSAFER",
+      "-sDEVICE=pdfwrite",
+      "-dCompatibilityLevel=1.4",
+      `-dPDFSETTINGS=${PDF_UPLOAD_OPTIMIZE_PDFSETTINGS}`,
+      "-dDetectDuplicateImages=true",
+      "-dCompressFonts=true",
+      "-dSubsetFonts=true",
+      "-dAutoRotatePages=/None",
+      "-dDownsampleColorImages=true",
+      "-dColorImageDownsampleType=/Bicubic",
+      "-dColorImageResolution=144",
+      "-dDownsampleGrayImages=true",
+      "-dGrayImageDownsampleType=/Bicubic",
+      "-dGrayImageResolution=144",
+      "-dDownsampleMonoImages=true",
+      "-dMonoImageDownsampleType=/Subsample",
+      "-dMonoImageResolution=300",
+      `-sOutputFile=${outputPath}`,
+      inputPath,
+    ];
+
+    const child = spawn("gs", args, {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (error) => {
+      resolve({ ok: false, available: false, error });
+    });
+    child.on("close", (code) => {
+      resolve({
+        ok: code === 0,
+        available: true,
+        code,
+        stderr: stderr.trim(),
+      });
+    });
+  });
+
+const formatBytes = (bytes) => {
+  if (!Number.isFinite(bytes) || bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unitIndex]}`;
+};
+
+const maybeOptimizePdfUpload = async (inputPath, originalName) => {
+  const ext = path.extname(originalName || inputPath).toLowerCase();
+  if (ext !== ".pdf") {
+    return { filePath: inputPath, optimized: false, cleanupPath: null };
+  }
+
+  let inputStat;
+  try {
+    inputStat = await fs.promises.stat(inputPath);
+  } catch (_) {
+    return { filePath: inputPath, optimized: false, cleanupPath: null };
+  }
+
+  if (inputStat.size < PDF_UPLOAD_OPTIMIZE_MIN_BYTES) {
+    return { filePath: inputPath, optimized: false, cleanupPath: null };
+  }
+
+  if (!ghostscriptAvailable()) {
+    console.warn(
+      `[upload][pdf-optimize] ghostscript not available; skipping optimization for ${path.basename(
+        inputPath
+      )}`
+    );
+    return { filePath: inputPath, optimized: false, cleanupPath: null };
+  }
+
+  const outputPath = path.join(
+    TMP_DIR,
+    `${Date.now()}-${crypto.randomUUID()}-optimized.pdf`
+  );
+  const result = await runGhostscriptCompression(inputPath, outputPath);
+  if (!result.ok) {
+    await cleanupTempUpload(outputPath);
+    console.warn(
+      `[upload][pdf-optimize] failed for ${path.basename(inputPath)}: ${result.stderr || result.error?.message || result.code}`
+    );
+    return { filePath: inputPath, optimized: false, cleanupPath: null };
+  }
+
+  let outputStat;
+  try {
+    outputStat = await fs.promises.stat(outputPath);
+  } catch (error) {
+    await cleanupTempUpload(outputPath);
+    return { filePath: inputPath, optimized: false, cleanupPath: null };
+  }
+
+  if (!outputStat || !outputStat.size || outputStat.size >= inputStat.size * PDF_UPLOAD_OPTIMIZE_KEEP_RATIO) {
+    await cleanupTempUpload(outputPath);
+    console.log(
+      `[upload][pdf-optimize] kept original ${path.basename(inputPath)} size=${formatBytes(
+        inputStat.size
+      )}`
+    );
+    return { filePath: inputPath, optimized: false, cleanupPath: null };
+  }
+
+  console.log(
+    `[upload][pdf-optimize] optimized ${path.basename(inputPath)} ${formatBytes(
+      inputStat.size
+    )} -> ${formatBytes(outputStat.size)} preset=${PDF_UPLOAD_OPTIMIZE_PDFSETTINGS}`
+  );
+  return { filePath: outputPath, optimized: true, cleanupPath: outputPath };
 };
 
 const deleteFromBunny = async (fileReference) => {
@@ -9106,6 +9274,8 @@ const moveToFinal = (file, targetDir) =>
 
 app.post("/upload/public", requireJwt, upload.single("file"), async (req, res, next) => {
   const tempFilePath = req.file?.path;
+  let uploadPath = tempFilePath;
+  let optimizedTempPath = null;
   try {
     const type = resolveType(req, PUBLIC_TYPES);
     if (!type) {
@@ -9118,7 +9288,10 @@ app.post("/upload/public", requireJwt, upload.single("file"), async (req, res, n
     }
 
     const filename = generateUniqueFilename(req.file.originalname);
-    await uploadToBunny(req.file.path, type, "public", filename);
+    const optimized = await maybeOptimizePdfUpload(req.file.path, req.file.originalname);
+    uploadPath = optimized.filePath;
+    optimizedTempPath = optimized.cleanupPath;
+    await uploadToBunny(uploadPath, type, "public", filename);
 
     return res.json({
       ok: true,
@@ -9131,11 +9304,16 @@ app.post("/upload/public", requireJwt, upload.single("file"), async (req, res, n
     next(err);
   } finally {
     await cleanupTempUpload(tempFilePath);
+    if (optimizedTempPath && optimizedTempPath !== tempFilePath) {
+      await cleanupTempUpload(optimizedTempPath);
+    }
   }
 });
 
 app.post("/upload/private", requireJwt, upload.single("file"), async (req, res, next) => {
   const tempFilePath = req.file?.path;
+  let uploadPath = tempFilePath;
+  let optimizedTempPath = null;
   try {
     const type = resolveType(req, PRIVATE_TYPES);
     if (!type) {
@@ -9148,7 +9326,10 @@ app.post("/upload/private", requireJwt, upload.single("file"), async (req, res, 
     }
 
     const filename = generateUniqueFilename(req.file.originalname);
-    await uploadToBunny(req.file.path, type, "private", filename);
+    const optimized = await maybeOptimizePdfUpload(req.file.path, req.file.originalname);
+    uploadPath = optimized.filePath;
+    optimizedTempPath = optimized.cleanupPath;
+    await uploadToBunny(uploadPath, type, "private", filename);
 
     return res.json({
       ok: true,
@@ -9161,6 +9342,9 @@ app.post("/upload/private", requireJwt, upload.single("file"), async (req, res, 
     next(err);
   } finally {
     await cleanupTempUpload(tempFilePath);
+    if (optimizedTempPath && optimizedTempPath !== tempFilePath) {
+      await cleanupTempUpload(optimizedTempPath);
+    }
   }
 });
 
@@ -10398,9 +10582,22 @@ app.post("/admin/notifications/send", requireJwtOrServiceAuth, async (req, res) 
       userIds: userIds.length ? userIds : null,
     });
     if (!targets.length) {
+      if (userId) {
+        const existingUser = await getUserByIdForAuth(userId);
+        if (!existingUser) {
+          return res.status(404).json({
+            ok: false,
+            error: "Kullanıcı bulunamadı.",
+          });
+        }
+        return res.status(404).json({
+          ok: false,
+          error: "Bu kullanıcıda kayıtlı FCM token bulunamadı.",
+        });
+      }
       return res.status(404).json({
         ok: false,
-        error: "No users with firebase tokens were found for this target.",
+        error: "Bu hedef için kayıtlı FCM token bulunamadı.",
       });
     }
 
@@ -10417,7 +10614,7 @@ app.post("/admin/notifications/send", requireJwtOrServiceAuth, async (req, res) 
     if (!tokenMap.size) {
       return res.status(404).json({
         ok: false,
-        error: "No valid firebase token entries found.",
+        error: "Geçerli FCM token kaydı bulunamadı.",
       });
     }
 

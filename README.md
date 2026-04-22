@@ -316,11 +316,13 @@ psql "$DATABASE_URL" -f scripts/users_deactivated_at_migration.sql
   - Form-data alanları: `file` (foto/pdf), `type` (kitap|gazete|dergi|ek|slider|profil).  
   - Dosya yolları: `storage/<type>/public/`.
   - Auth: `Authorization: Bearer <JWT>`.
+  - PDF dosyalar Ghostscript varsa yükleme sırasında otomatik optimize edilir. Hedef preset varsayılan `PDF_UPLOAD_OPTIMIZE_PDFSETTINGS=/ebook`.
 - `POST /upload/private`
   - Form-data: `file` ve `type` (kitap|gazete|dergi|ek).  
   - Dosya yolu: `storage/<type>/private/`.  
   - Yanıt `url` değeri: `/private/<type>/<filename>`.
   - Auth: `Authorization: Bearer <JWT>`.
+  - PDF dosyalar Ghostscript varsa yükleme sırasında otomatik optimize edilir. Hedef preset varsayılan `PDF_UPLOAD_OPTIMIZE_PDFSETTINGS=/ebook`.
 - `POST /upload/delete`
   - Auth: `Authorization: Bearer <JWT>` (admin rol).
   - JSON body: `{ "url": "https://yeniasya.b-cdn.net/kitap/private/..." }` veya `{ "path": "/kitap/private/..." }`
