@@ -5625,7 +5625,6 @@ const selectUserAddressesDirect = async ({
     ", tax_address",
     ", company_name",
     ", created_at",
-    ", updated_at",
     "FROM public.user_addresses",
     `WHERE ${whereSql}`,
     `ORDER BY ${orderBy}`,
