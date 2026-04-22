@@ -2455,7 +2455,7 @@ const getUserAccessEntriesFromPostgres = async ({ userId, itemType = null }) => 
   let itemTypeWhere = "";
   if (itemType) {
     values.push(itemType);
-    itemTypeWhere = ` AND item_type = $${values.length}`;
+    itemTypeWhere = ` AND item_type = $${values.length}::public.access_item_type`;
   }
 
   const rows = await (async () => {
