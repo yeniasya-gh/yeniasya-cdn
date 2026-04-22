@@ -4891,6 +4891,7 @@ const selectUsersDirect = async ({
   values = [],
   orderBy = "u.id ASC",
   limit = null,
+  offset = null,
   includeRole = false,
   includePassword = false,
   includeDeactivatedAt = false,
@@ -4918,6 +4919,7 @@ const selectUsersDirect = async ({
     includeRole ? "LEFT JOIN public.roles r ON r.id = u.role_id" : "",
     `WHERE ${whereSql}`,
     `ORDER BY ${orderBy}`,
+    offset !== null && offset !== undefined ? `OFFSET ${Number(offset)}` : "",
     limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
   ]
     .filter(Boolean)
@@ -5652,6 +5654,39 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
           orderBy: "u.id ASC",
           includeRole: true,
         }),
+      };
+    }
+    case "GetUsersPage": {
+      const limit = toPositiveIntOrNull(variables.limit) || 25;
+      const offset = toPositiveIntOrNull(variables.offset) || 0;
+      const keyword = String(variables.keyword || "").trim();
+      const searchValues = [];
+      let whereSql = "u.is_active = TRUE";
+      if (keyword) {
+        searchValues.push(`%${keyword}%`);
+        whereSql +=
+          " AND (u.name ILIKE $1::text OR u.email ILIKE $1::text OR COALESCE(u.phone, '') ILIKE $1::text OR CAST(u.id AS text) ILIKE $1::text)";
+      }
+
+      const users = await selectUsersDirect({
+        whereSql,
+        values: searchValues,
+        orderBy: "u.id DESC",
+        limit,
+        offset,
+        includeRole: true,
+      });
+      const countRows = await homePostgresQuery(
+        `SELECT COUNT(*)::int AS count FROM public.users u WHERE ${whereSql}`,
+        searchValues
+      );
+      return {
+        users,
+        users_aggregate: {
+          aggregate: {
+            count: Number(countRows[0]?.count || 0),
+          },
+        },
       };
     }
     case "GetAdminUserDetail": {
