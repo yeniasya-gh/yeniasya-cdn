@@ -4978,21 +4978,21 @@ const selectOrdersDirect = async ({
 }) => {
   const selectParts = [
     "o.id::bigint AS id",
-    ", o.user_id::bigint AS user_id",
-    ", o.total_paid",
-    ", o.status::text AS status",
-    ", o.payment_provider",
-    ", o.merchant_payment_id",
-    ", o.payment_session_token",
-    ", CASE WHEN o.promo_code_id IS NULL THEN NULL ELSE o.promo_code_id::bigint END AS promo_code_id",
-    ", o.promo_code",
-    ", o.promo_discount_percent",
-    ", o.promo_discount_amount",
-    ", o.created_at",
+    "o.user_id::bigint AS user_id",
+    "o.total_paid",
+    "o.status::text AS status",
+    "o.payment_provider",
+    "o.merchant_payment_id",
+    "o.payment_session_token",
+    "CASE WHEN o.promo_code_id IS NULL THEN NULL ELSE o.promo_code_id::bigint END AS promo_code_id",
+    "o.promo_code",
+    "o.promo_discount_percent",
+    "o.promo_discount_amount",
+    "o.created_at",
   ];
   if (includeUser) {
     selectParts.push(
-      ", CASE WHEN u.id IS NULL THEN NULL ELSE jsonb_build_object('id', u.id, 'name', u.name, 'email', u.email) END AS user"
+      "CASE WHEN u.id IS NULL THEN NULL ELSE jsonb_build_object('id', u.id, 'name', u.name, 'email', u.email) END AS user"
     );
   }
   const orders = await homePostgresQuery(
