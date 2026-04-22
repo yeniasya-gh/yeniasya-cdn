@@ -548,6 +548,82 @@ const withHomePostgresClient = async (callback) => {
   }
 };
 
+const quoteSqlIdentifier = (value) =>
+  `"${String(value || "").replace(/"/g, '""')}"`;
+
+const qualifySqlTable = (tableName) => {
+  const normalized = String(tableName || "").trim();
+  if (!normalized) {
+    throw new Error("Table name is required.");
+  }
+  if (normalized.includes(".")) {
+    const [schema, table] = normalized.split(".", 2);
+    return `${quoteSqlIdentifier(schema)}.${quoteSqlIdentifier(table)}`;
+  }
+  return `public.${quoteSqlIdentifier(normalized)}`;
+};
+
+const compactObject = (value) => {
+  const entries = Object.entries(value || {}).filter(([, v]) => v !== undefined);
+  return Object.fromEntries(entries);
+};
+
+const buildInsertSql = (tableName, object, returning = "*") => {
+  const payload = compactObject(object);
+  const keys = Object.keys(payload);
+  if (!keys.length) {
+    throw new Error("Insert payload is empty.");
+  }
+  const columns = keys.map((key) => quoteSqlIdentifier(key)).join(", ");
+  const values = keys.map((key) => payload[key]);
+  const placeholders = keys.map((_, index) => `$${index + 1}`).join(", ");
+  return {
+    text: `INSERT INTO ${qualifySqlTable(tableName)} (${columns}) VALUES (${placeholders}) RETURNING ${returning}`,
+    values,
+  };
+};
+
+const buildUpdateByPkSql = (tableName, pkColumn, id, object, returning = "*") => {
+  const payload = compactObject(object);
+  const keys = Object.keys(payload);
+  if (!keys.length) {
+    throw new Error("Update payload is empty.");
+  }
+  const setSql = keys
+    .map((key, index) => `${quoteSqlIdentifier(key)} = $${index + 2}`)
+    .join(", ");
+  const values = [id, ...keys.map((key) => payload[key])];
+  return {
+    text: `UPDATE ${qualifySqlTable(tableName)} SET ${setSql} WHERE ${quoteSqlIdentifier(pkColumn)} = $1 RETURNING ${returning}`,
+    values,
+  };
+};
+
+const buildDeleteByPkSql = (tableName, pkColumn, id, returning = "*") => ({
+  text: `DELETE FROM ${qualifySqlTable(tableName)} WHERE ${quoteSqlIdentifier(pkColumn)} = $1 RETURNING ${returning}`,
+  values: [id],
+});
+
+const buildSelectSql = ({
+  tableName,
+  columns = "*",
+  where = "",
+  values = [],
+  orderBy = "",
+  limit = null,
+  offset = null,
+}) => {
+  const clauses = [
+    `SELECT ${columns}`,
+    `FROM ${qualifySqlTable(tableName)}`,
+  ];
+  if (where) clauses.push(`WHERE ${where}`);
+  if (orderBy) clauses.push(`ORDER BY ${orderBy}`);
+  if (limit !== null && limit !== undefined) clauses.push(`LIMIT ${Number(limit)}`);
+  if (offset !== null && offset !== undefined) clauses.push(`OFFSET ${Number(offset)}`);
+  return { text: clauses.join(" "), values };
+};
+
 const isMissingUserContentAccessGrantSourceError = (err) =>
   String(err?.code || "") === "42703" &&
   String(err?.message || "").toLowerCase().includes("grant_source");
@@ -1099,8 +1175,6 @@ const mustHaveEnv = (key, value) => {
 const assertRequiredEnv = () => {
   mustHaveEnv("AUTH_TOKEN", AUTH_TOKEN);
   mustHaveEnv("VIEW_TOKEN_SECRET", VIEW_TOKEN_SECRET);
-  mustHaveEnv("HASURA_ENDPOINT", HASURA_ENDPOINT);
-  mustHaveEnv("HASURA_ADMIN_SECRET", HASURA_ADMIN_SECRET);
   mustHaveEnv("JWT_SECRET", JWT_SECRET);
 };
 
@@ -1636,57 +1710,39 @@ const buildCorsHeaders = (req) => {
 };
 
 const hasuraRequest = async (query, variables = {}, options = {}) => {
-  const response = await hasuraHttp.post(
-    HASURA_ENDPOINT,
-    { query, variables },
-    {
-      timeout: options.timeout || HASURA_HTTP_TIMEOUT_MS,
-      headers: {
-        "Content-Type": "application/json",
-        "x-hasura-admin-secret": HASURA_ADMIN_SECRET,
-      },
-      validateStatus: () => true,
-    }
-  );
-
-  if (response.status !== 200) {
-    throw new Error(`Hasura HTTP ${response.status}`);
-  }
-
-  if (response.data?.errors?.length) {
-    const msg = response.data.errors[0]?.message || "Hasura error";
-    throw new Error(msg);
-  }
-
-  return response.data?.data;
+  return executeDirectGraphqlRequest({
+    query,
+    variables,
+    operationName: options.operationName,
+  });
 };
 
 const proxyHasuraRequest = async (req, res) => {
   try {
     const { query, variables, operationName } = req.body || {};
     if (!query) {
-      return res.status(400).json({ ok: false, error: "query is required." });
+      return res.status(400).json({
+        errors: [{ message: "query is required." }],
+      });
     }
 
-    const response = await hasuraHttp.post(
-      HASURA_ENDPOINT,
-      { query, variables, operationName },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          ...buildHasuraAuthHeaders(req),
-        },
-        validateStatus: () => true,
-      }
-    );
+    const data = await executeDirectGraphqlRequest({
+      query,
+      variables,
+      operationName,
+      req,
+    });
 
-    res.status(response.status);
-    if (response.headers?.["content-type"]) {
-      res.set("Content-Type", response.headers["content-type"]);
-    }
-    return res.send(response.data);
+    return res.status(200).json({ data });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: "Hasura proxy failed." });
+    return res.status(200).json({
+      errors: [
+        {
+          message: err?.message || "GraphQL request failed.",
+          extensions: err?.code ? { code: err.code } : undefined,
+        },
+      ],
+    });
   }
 };
 
@@ -1815,21 +1871,30 @@ const logHomeServerError = async ({
   }
 
   try {
-    await hasuraRequest(
+    const object = {
+      service: serviceLabel,
+      operation: section,
+      message: payload.message,
+      stack_trace: err?.stack || null,
+      payload,
+    };
+    await homePostgresQuery(
       `
-        mutation LogServerHomeError($input: app_error_logs_insert_input!) {
-          insert_app_error_logs_one(object: $input) { id }
-        }
+        INSERT INTO public.app_error_logs (
+          service,
+          operation,
+          message,
+          stack_trace,
+          payload
+        ) VALUES ($1::text, $2::text, $3::text, $4::text, $5::jsonb)
       `,
-      {
-        input: {
-          service: serviceLabel,
-          operation: section,
-          message: payload.message,
-          stack_trace: err?.stack || null,
-          payload,
-        },
-      }
+      [
+        object.service,
+        object.operation,
+        object.message,
+        object.stack_trace,
+        object.payload ? JSON.stringify(object.payload) : null,
+      ]
     );
   } catch (logErr) {
     console.error(
@@ -2006,30 +2071,24 @@ const magazinePublicIssuesSql = `
 `;
 
 const loadPublicMagazineIssuesFromHasura = async (magazineId) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      query GetPublicMagazineIssues($magazine_id: Int!) {
-        magazine_issue(
-          where: {
-            magazine_id: {_eq: $magazine_id}
-            is_published: {_eq: true}
-          }
-          order_by: {issue_number: desc}
-        ) {
-          id
-          magazine_id
-          issue_number
-          photo_url
-          price
-          description
-          added_at
-        }
-      }
+      SELECT
+        id::int AS id,
+        magazine_id::int AS magazine_id,
+        issue_number::int AS issue_number,
+        photo_url,
+        price,
+        description,
+        added_at
+      FROM public.magazine_issue
+      WHERE magazine_id = $1::bigint
+        AND COALESCE(is_published, TRUE) = TRUE
+      ORDER BY issue_number DESC NULLS LAST, added_at DESC NULLS LAST, id DESC
     `,
-    { magazine_id: magazineId },
-    { timeout: HOME_BOOTSTRAP_HASURA_TIMEOUT_MS }
+    [magazineId]
   );
-  return cloneMagazinePublicIssues(data?.magazine_issue);
+  return cloneMagazinePublicIssues(rows);
 };
 
 const loadPublicMagazineIssues = async (magazineId) => {
@@ -3093,40 +3152,36 @@ const sendFirebaseMessageToToken = async ({
 
 const fetchUsersWithFirebaseTokens = async ({ userId, userIds } = {}) => {
   if (userId) {
-    const data = await hasuraRequest(
+    const rows = await homePostgresQuery(
       `
-        query GetUserToken($id: bigint!) {
-          users_by_pk(id: $id) {
-            id
-            firebase_token
-          }
-        }
+        SELECT
+          id::bigint AS id,
+          firebase_token
+        FROM public.users
+        WHERE id = $1::bigint
+        LIMIT 1
       `,
-      { id: userId }
+      [userId]
     );
-    const user = data?.users_by_pk;
+    const user = rows[0];
     if (!user || !String(user.firebase_token || "").trim()) return [];
     return [{ id: user.id, firebase_token: String(user.firebase_token).trim() }];
   }
 
   if (Array.isArray(userIds) && userIds.length) {
-    const data = await hasuraRequest(
+    const rows = await homePostgresQuery(
       `
-        query GetUserTokensByIds($ids: [bigint!]!) {
-          users(
-            where: {
-              id: {_in: $ids}
-              firebase_token: {_is_null: false, _neq: ""}
-            }
-          ) {
-            id
-            firebase_token
-          }
-        }
+        SELECT
+          id::bigint AS id,
+          firebase_token
+        FROM public.users
+        WHERE id = ANY($1::bigint[])
+          AND firebase_token IS NOT NULL
+          AND firebase_token <> ''
       `,
-      { ids: userIds }
+      [userIds]
     );
-    return (data?.users || [])
+    return rows
       .map((u) => ({
         id: u.id,
         firebase_token: String(u.firebase_token || "").trim(),
@@ -3134,20 +3189,18 @@ const fetchUsersWithFirebaseTokens = async ({ userId, userIds } = {}) => {
       .filter((u) => !!u.firebase_token);
   }
 
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      query GetAllUserTokens {
-        users(
-          where: {firebase_token: {_is_null: false, _neq: ""}}
-          order_by: {firebase_token_updated_at: desc}
-        ) {
-          id
-          firebase_token
-        }
-      }
+      SELECT
+        id::bigint AS id,
+        firebase_token
+      FROM public.users
+      WHERE firebase_token IS NOT NULL
+        AND firebase_token <> ''
+      ORDER BY firebase_token_updated_at DESC NULLS LAST, id DESC
     `
   );
-  return (data?.users || [])
+  return rows
     .map((u) => ({
       id: u.id,
       firebase_token: String(u.firebase_token || "").trim(),
@@ -3161,37 +3214,44 @@ const persistNotifications = async ({ title, body, userIds }) => {
   }
   const uniqueIds = [...new Set(userIds.map((id) => toPositiveIntOrNull(id)).filter(Boolean))];
   if (!uniqueIds.length) return 0;
-  const objects = uniqueIds.map((id) => ({ title, body, user_id: id }));
-  const data = await hasuraRequest(
-    `
-      mutation InsertNotifications($objects: [notifications_insert_input!]!) {
-        insert_notifications(objects: $objects) {
-          affected_rows
-        }
-      }
-    `,
-    { objects }
-  );
-  return Number(data?.insert_notifications?.affected_rows || 0);
+  const rows = await withHomePostgresClient(async (client) => {
+    const inserted = [];
+    for (const userId of uniqueIds) {
+      const object = {
+        title,
+        body,
+        user_id: userId,
+      };
+      const result = await homePostgresQueryWithClient(
+        client,
+        `
+          INSERT INTO public.notifications (title, body, user_id)
+          VALUES ($1::text, $2::text, $3::bigint)
+          RETURNING id
+        `,
+        [object.title, object.body, object.user_id]
+      );
+      inserted.push(...result);
+    }
+    return inserted;
+  });
+  return Number(rows.length || 0);
 };
 
 const clearUsersFirebaseTokens = async (userIds) => {
   const uniqueIds = [...new Set((userIds || []).map((id) => toPositiveIntOrNull(id)).filter(Boolean))];
   if (!uniqueIds.length) return 0;
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation ClearFirebaseTokens($ids: [bigint!]!) {
-        update_users(
-          where: {id: {_in: $ids}},
-          _set: {firebase_token: null, firebase_token_updated_at: null}
-        ) {
-          affected_rows
-        }
-      }
+      UPDATE public.users
+      SET firebase_token = NULL,
+          firebase_token_updated_at = NULL
+      WHERE id = ANY($1::bigint[])
+      RETURNING id
     `,
-    { ids: uniqueIds }
+    [uniqueIds]
   );
-  return Number(data?.update_users?.affected_rows || 0);
+  return Number(rows.length || 0);
 };
 
 const escapeHtml = (value) =>
@@ -3318,19 +3378,22 @@ const buildEmailVerificationMailHtml = ({
 };
 
 const getUserMailProfile = async (userId) => {
-  const data = await hasuraRequest(
+  const normalizedUserId = toPositiveIntOrNull(userId);
+  if (!normalizedUserId) return null;
+
+  const rows = await homePostgresQuery(
     `
-      query GetUserMailProfile($id: bigint!) {
-        users_by_pk(id: $id) {
-          id
-          name
-          email
-        }
-      }
+      SELECT
+        id::bigint AS id,
+        name,
+        email
+      FROM public.users
+      WHERE id = $1::bigint
+      LIMIT 1
     `,
-    { id: userId }
+    [normalizedUserId]
   );
-  return data?.users_by_pk || null;
+  return rows[0] || null;
 };
 
 const getOldManualNewspaperAccessByEmail = async (email) => {
@@ -3369,135 +3432,129 @@ const getOldManualNewspaperAccessByEmail = async (email) => {
 };
 
 const getUserByEmailForAuth = async (email) => {
-  const data = await hasuraRequest(
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) return null;
+
+  const rows = await homePostgresQuery(
     `
-      query GetUserByEmailForAuth($email: String!) {
-        users(
-          where: {
-            _or: [
-              {email: {_eq: $email}},
-              {email: {_ilike: $email}}
-            ],
-            is_active: {_eq: true}
-          },
-          order_by: [{email_verified_at: desc_nulls_last}, {id: asc}],
-          limit: 1
-        ) {
-          id
-          name
-          email
-          phone
-          avatar_url
-          payUniqe
-          auth_session_id
-          role_id
-          password
-          is_active
-          email_verified_at
-        }
-      }
+      SELECT
+        u.id::bigint AS id,
+        u.name,
+        u.email,
+        u.phone,
+        u.avatar_url,
+        u.payUniqe,
+        u.auth_session_id,
+        u.role_id::bigint AS role_id,
+        u.password,
+        u.is_active,
+        u.email_verified_at,
+        jsonb_build_object('id', r.id, 'name', r.name) AS role
+      FROM public.users u
+      LEFT JOIN public.roles r ON r.id = u.role_id
+      WHERE u.is_active = TRUE
+        AND (LOWER(u.email) = $1 OR LOWER(u.email) LIKE $2)
+      ORDER BY u.email_verified_at DESC NULLS LAST, u.id ASC
+      LIMIT 1
     `,
-    { email }
+    [normalizedEmail, normalizedEmail]
   );
-  return data?.users?.[0] || null;
+  return rows[0] || null;
 };
 
 const getInactiveUserByEmailForAuth = async (email) => {
-  const data = await hasuraRequest(
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) return null;
+
+  const rows = await homePostgresQuery(
     `
-      query GetInactiveUserByEmailForAuth($email: String!) {
-        users(
-          where: {
-            _or: [
-              {email: {_eq: $email}},
-              {email: {_ilike: $email}}
-            ],
-            is_active: {_eq: false}
-          },
-          order_by: [{email_verified_at: desc_nulls_last}, {id: asc}],
-          limit: 1
-        ) {
-          id
-          name
-          email
-          phone
-          avatar_url
-          payUniqe
-          auth_session_id
-          role_id
-          password
-          is_active
-          email_verified_at
-          deactivated_at
-        }
-      }
+      SELECT
+        u.id::bigint AS id,
+        u.name,
+        u.email,
+        u.phone,
+        u.avatar_url,
+        u.payUniqe,
+        u.auth_session_id,
+        u.role_id::bigint AS role_id,
+        u.password,
+        u.is_active,
+        u.email_verified_at,
+        u.deactivated_at,
+        jsonb_build_object('id', r.id, 'name', r.name) AS role
+      FROM public.users u
+      LEFT JOIN public.roles r ON r.id = u.role_id
+      WHERE u.is_active = FALSE
+        AND (LOWER(u.email) = $1 OR LOWER(u.email) LIKE $2)
+      ORDER BY u.email_verified_at DESC NULLS LAST, u.id ASC
+      LIMIT 1
     `,
-    { email }
+    [normalizedEmail, normalizedEmail]
   );
-  return data?.users?.[0] || null;
+  return rows[0] || null;
 };
 
 const getUserByPhoneForAuth = async (phone) => {
-  const data = await hasuraRequest(
+  const normalizedPhone = String(phone || "").trim();
+  if (!normalizedPhone) return null;
+
+  const rows = await homePostgresQuery(
     `
-      query GetUserByPhoneForAuth($phone: String!) {
-        users(
-          where: {
-            phone: { _eq: $phone },
-            is_active: { _eq: true }
-          }
-          order_by: [{email_verified_at: desc_nulls_last}, {id: asc}]
-          limit: 1
-        ) {
-          id
-          name
-          email
-          phone
-          avatar_url
-          payUniqe
-          auth_session_id
-          role_id
-          password
-          is_active
-          email_verified_at
-        }
-      }
+      SELECT
+        u.id::bigint AS id,
+        u.name,
+        u.email,
+        u.phone,
+        u.avatar_url,
+        u.payUniqe,
+        u.auth_session_id,
+        u.role_id::bigint AS role_id,
+        u.password,
+        u.is_active,
+        u.email_verified_at,
+        jsonb_build_object('id', r.id, 'name', r.name) AS role
+      FROM public.users u
+      LEFT JOIN public.roles r ON r.id = u.role_id
+      WHERE u.is_active = TRUE
+        AND u.phone = $1
+      ORDER BY u.email_verified_at DESC NULLS LAST, u.id ASC
+      LIMIT 1
     `,
-    { phone }
+    [normalizedPhone]
   );
-  return data?.users?.[0] || null;
+  return rows[0] || null;
 };
 
 const getInactiveUserByPhoneForAuth = async (phone) => {
-  const data = await hasuraRequest(
+  const normalizedPhone = String(phone || "").trim();
+  if (!normalizedPhone) return null;
+
+  const rows = await homePostgresQuery(
     `
-      query GetInactiveUserByPhoneForAuth($phone: String!) {
-        users(
-          where: {
-            phone: { _eq: $phone },
-            is_active: { _eq: false }
-          }
-          order_by: [{email_verified_at: desc_nulls_last}, {id: asc}]
-          limit: 1
-        ) {
-          id
-          name
-          email
-          phone
-          avatar_url
-          payUniqe
-          auth_session_id
-          role_id
-          password
-          is_active
-          email_verified_at
-          deactivated_at
-        }
-      }
+      SELECT
+        u.id::bigint AS id,
+        u.name,
+        u.email,
+        u.phone,
+        u.avatar_url,
+        u.payUniqe,
+        u.auth_session_id,
+        u.role_id::bigint AS role_id,
+        u.password,
+        u.is_active,
+        u.email_verified_at,
+        u.deactivated_at,
+        jsonb_build_object('id', r.id, 'name', r.name) AS role
+      FROM public.users u
+      LEFT JOIN public.roles r ON r.id = u.role_id
+      WHERE u.is_active = FALSE
+        AND u.phone = $1
+      ORDER BY u.email_verified_at DESC NULLS LAST, u.id ASC
+      LIMIT 1
     `,
-    { phone }
+    [normalizedPhone]
   );
-  return data?.users?.[0] || null;
+  return rows[0] || null;
 };
 
 const getInactiveUsersByIdentityForAuth = async ({ email, phone }) => {
@@ -3836,50 +3893,56 @@ const getInactiveUserIdentityById = async (userId) => {
 };
 
 const getUserByIdForAuth = async (id) => {
-  const data = await hasuraRequest(
+  const normalizedUserId = toPositiveIntOrNull(id);
+  if (!normalizedUserId) return null;
+
+  const rows = await homePostgresQuery(
     `
-      query GetUserByIdForAuth($id: bigint!) {
-        users_by_pk(id: $id) {
-          id
-          name
-          email
-          phone
-          avatar_url
-          payUniqe
-          auth_session_id
-          role_id
-          email_verified_at
-          is_active
-        }
-      }
+      SELECT
+        id::bigint AS id,
+        name,
+        email,
+        phone,
+        avatar_url,
+        payUniqe,
+        auth_session_id,
+        role_id::bigint AS role_id,
+        email_verified_at,
+        is_active
+      FROM public.users
+      WHERE id = $1::bigint
+      LIMIT 1
     `,
-    { id }
+    [normalizedUserId]
   );
-  return data?.users_by_pk || null;
+  return rows[0] || null;
 };
 
 const getUserByIdForPasswordChange = async (id) => {
-  const data = await hasuraRequest(
+  const normalizedUserId = toPositiveIntOrNull(id);
+  if (!normalizedUserId) return null;
+
+  const rows = await homePostgresQuery(
     `
-      query GetUserByIdForPasswordChange($id: bigint!) {
-        users_by_pk(id: $id) {
-          id
-          name
-          email
-          phone
-          avatar_url
-          payUniqe
-          role_id
-          password
-          auth_session_id
-          is_active
-          email_verified_at
-        }
-      }
+      SELECT
+        id::bigint AS id,
+        name,
+        email,
+        phone,
+        avatar_url,
+        payUniqe,
+        role_id::bigint AS role_id,
+        password,
+        auth_session_id,
+        is_active,
+        email_verified_at
+      FROM public.users
+      WHERE id = $1::bigint
+      LIMIT 1
     `,
-    { id }
+    [normalizedUserId]
   );
-  return data?.users_by_pk || null;
+  return rows[0] || null;
 };
 
 const toSafeUser = (user) => {
@@ -3898,21 +3961,18 @@ const toSafeUser = (user) => {
 const issueUserAuthSession = async (userId) => {
   const sessionId = crypto.randomUUID();
   try {
-    const data = await hasuraRequest(
+    const rows = await homePostgresQuery(
       `
-        mutation IssueUserAuthSession($id: bigint!, $sessionId: String!) {
-          update_users_by_pk(
-            pk_columns: {id: $id},
-            _set: {auth_session_id: $sessionId}
-          ) {
-            id
-            auth_session_id
-          }
-        }
+        UPDATE public.users
+        SET auth_session_id = $2::text
+        WHERE id = $1::bigint
+        RETURNING
+          id::bigint AS id,
+          auth_session_id
       `,
-      { id: userId, sessionId }
+      [userId, sessionId]
     );
-    return data?.update_users_by_pk || null;
+    return rows[0] || null;
   } catch (err) {
     console.warn(
       `[auth][session-issue-warning] userId=${userId} msg=${err.message}`
@@ -3930,83 +3990,69 @@ const normalizeAvatarUrl = (value) => {
 };
 
 const updateUserProfileFields = async ({ userId, name, phone }) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation UpdateUserProfileFields(
-        $id: bigint!,
-        $name: String!,
-        $phone: String
-      ) {
-        update_users_by_pk(
-          pk_columns: {id: $id},
-          _set: {
-            name: $name,
-            phone: $phone
-          }
-        ) {
-          id
-          name
-          email
-          phone
-          avatar_url
-          payUniqe
-          role_id
-          email_verified_at
-          is_active
-        }
-      }
+      UPDATE public.users
+      SET name = $2::text,
+          phone = $3::text
+      WHERE id = $1::bigint
+      RETURNING
+        id::bigint AS id,
+        name,
+        email,
+        phone,
+        avatar_url,
+        payUniqe,
+        role_id::bigint AS role_id,
+        email_verified_at,
+        is_active
     `,
-    { id: userId, name, phone }
+    [userId, name, phone || null]
   );
-  return data?.update_users_by_pk || null;
+  return rows[0] || null;
 };
 
 const updateUserAvatarUrl = async ({ userId, avatarUrl }) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation UpdateUserAvatarUrl($id: bigint!, $avatarUrl: String) {
-        update_users_by_pk(
-          pk_columns: {id: $id},
-          _set: {avatar_url: $avatarUrl}
-        ) {
-          id
-          name
-          email
-          phone
-          avatar_url
-          payUniqe
-          role_id
-          email_verified_at
-          is_active
-        }
-      }
+      UPDATE public.users
+      SET avatar_url = $2::text
+      WHERE id = $1::bigint
+      RETURNING
+        id::bigint AS id,
+        name,
+        email,
+        phone,
+        avatar_url,
+        payUniqe,
+        role_id::bigint AS role_id,
+        email_verified_at,
+        is_active
     `,
-    { id: userId, avatarUrl }
+    [userId, avatarUrl || null]
   );
-  return data?.update_users_by_pk || null;
+  return rows[0] || null;
 };
 
 const getActiveUserByEmail = async (email) => {
-  const data = await hasuraRequest(
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) return null;
+
+  const rows = await homePostgresQuery(
     `
-      query GetActiveUserByEmail($email: String!) {
-        users(
-          where: {
-            email: {_eq: $email},
-            is_active: {_eq: true}
-          },
-          limit: 1
-        ) {
-          id
-          name
-          email
-          email_verified_at
-        }
-      }
+      SELECT
+        id::bigint AS id,
+        name,
+        email,
+        email_verified_at
+      FROM public.users
+      WHERE is_active = TRUE
+        AND LOWER(email) = $1
+      LIMIT 1
     `,
-    { email }
+    [normalizedEmail]
   );
-  return data?.users?.[0] || null;
+  return rows[0] || null;
 };
 
 const hashPasswordResetToken = (token) =>
@@ -4034,23 +4080,17 @@ const buildEmailVerificationLink = ({ token, email }) => {
 };
 
 const invalidatePasswordResetTokensForUser = async (userId, usedAt) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation InvalidatePasswordResetTokens($userId: bigint!, $usedAt: timestamptz!) {
-        update_password_reset_tokens(
-          where: {
-            user_id: {_eq: $userId},
-            used_at: {_is_null: true}
-          },
-          _set: {used_at: $usedAt}
-        ) {
-          affected_rows
-        }
-      }
+      UPDATE public.password_reset_tokens
+      SET used_at = $2::timestamptz
+      WHERE user_id = $1::bigint
+        AND used_at IS NULL
+      RETURNING id
     `,
-    { userId, usedAt }
+    [userId, usedAt]
   );
-  return Number(data?.update_password_reset_tokens?.affected_rows || 0);
+  return Number(rows.length || 0);
 };
 
 const createPasswordResetTokenRecord = async ({
@@ -4060,88 +4100,70 @@ const createPasswordResetTokenRecord = async ({
   requestedIp,
   userAgent,
 }) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation CreatePasswordResetToken($object: password_reset_tokens_insert_input!) {
-        insert_password_reset_tokens_one(object: $object) {
-          id
-          user_id
-          token_hash
-          expires_at
-          used_at
-        }
-      }
+      INSERT INTO public.password_reset_tokens (
+        user_id,
+        token_hash,
+        expires_at,
+        requested_ip,
+        user_agent
+      ) VALUES ($1::bigint, $2::text, $3::timestamptz, $4::text, $5::text)
+      RETURNING
+        id,
+        user_id,
+        token_hash,
+        expires_at,
+        used_at
     `,
-    {
-      object: {
-        user_id: userId,
-        token_hash: tokenHash,
-        expires_at: expiresAt,
-        requested_ip: requestedIp || null,
-        user_agent: userAgent || null,
-      },
-    }
+    [userId, tokenHash, expiresAt, requestedIp || null, userAgent || null]
   );
-  return data?.insert_password_reset_tokens_one || null;
+  return rows[0] || null;
 };
 
 const getPasswordResetTokenStateByHash = async (tokenHash) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      query GetPasswordResetTokenStateByHash($tokenHash: String!) {
-        password_reset_tokens(
-          where: {token_hash: {_eq: $tokenHash}},
-          order_by: {created_at: desc},
-          limit: 1
-        ) {
-          id
-          user_id
-          expires_at
-          used_at
-        }
-      }
+      SELECT
+        id::bigint AS id,
+        user_id::bigint AS user_id,
+        expires_at,
+        used_at
+      FROM public.password_reset_tokens
+      WHERE token_hash = $1::text
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
     `,
-    { tokenHash }
+    [tokenHash]
   );
-  return data?.password_reset_tokens?.[0] || null;
+  return rows[0] || null;
 };
 
 const markPasswordResetTokenUsed = async (tokenId, usedAt) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation MarkPasswordResetTokenUsed($id: bigint!, $usedAt: timestamptz!) {
-        update_password_reset_tokens_by_pk(
-          pk_columns: {id: $id},
-          _set: {used_at: $usedAt}
-        ) {
-          id
-          used_at
-        }
-      }
+      UPDATE public.password_reset_tokens
+      SET used_at = $2::timestamptz
+      WHERE id = $1::bigint
+      RETURNING id::bigint AS id, used_at
     `,
-    { id: tokenId, usedAt }
+    [tokenId, usedAt]
   );
-  return data?.update_password_reset_tokens_by_pk || null;
+  return rows[0] || null;
 };
 
 const invalidateEmailVerificationTokensForUser = async (userId, usedAt) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation InvalidateEmailVerificationTokens($userId: bigint!, $usedAt: timestamptz!) {
-        update_email_verification_tokens(
-          where: {
-            user_id: {_eq: $userId},
-            used_at: {_is_null: true}
-          },
-          _set: {used_at: $usedAt}
-        ) {
-          affected_rows
-        }
-      }
+      UPDATE public.email_verification_tokens
+      SET used_at = $2::timestamptz
+      WHERE user_id = $1::bigint
+        AND used_at IS NULL
+      RETURNING id
     `,
-    { userId, usedAt }
+    [userId, usedAt]
   );
-  return Number(data?.update_email_verification_tokens?.affected_rows || 0);
+  return Number(rows.length || 0);
 };
 
 const createEmailVerificationTokenRecord = async ({
@@ -4151,92 +4173,77 @@ const createEmailVerificationTokenRecord = async ({
   requestedIp,
   userAgent,
 }) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation CreateEmailVerificationToken($object: email_verification_tokens_insert_input!) {
-        insert_email_verification_tokens_one(object: $object) {
-          id
-          user_id
-          token_hash
-          expires_at
-          used_at
-        }
-      }
+      INSERT INTO public.email_verification_tokens (
+        user_id,
+        token_hash,
+        expires_at,
+        requested_ip,
+        user_agent
+      ) VALUES ($1::bigint, $2::text, $3::timestamptz, $4::text, $5::text)
+      RETURNING
+        id,
+        user_id,
+        token_hash,
+        expires_at,
+        used_at
     `,
-    {
-      object: {
-        user_id: userId,
-        token_hash: tokenHash,
-        expires_at: expiresAt,
-        requested_ip: requestedIp || null,
-        user_agent: userAgent || null,
-      },
-    }
+    [userId, tokenHash, expiresAt, requestedIp || null, userAgent || null]
   );
-  return data?.insert_email_verification_tokens_one || null;
+  return rows[0] || null;
 };
 
 const getEmailVerificationTokenStateByHash = async (tokenHash) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      query GetEmailVerificationTokenStateByHash($tokenHash: String!) {
-        email_verification_tokens(
-          where: {token_hash: {_eq: $tokenHash}},
-          order_by: {created_at: desc},
-          limit: 1
-        ) {
-          id
-          user_id
-          expires_at
-          used_at
-        }
-      }
+      SELECT
+        id::bigint AS id,
+        user_id::bigint AS user_id,
+        expires_at,
+        used_at
+      FROM public.email_verification_tokens
+      WHERE token_hash = $1::text
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
     `,
-    { tokenHash }
+    [tokenHash]
   );
-  return data?.email_verification_tokens?.[0] || null;
+  return rows[0] || null;
 };
 
 const markEmailVerificationTokenUsed = async (tokenId, usedAt) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation MarkEmailVerificationTokenUsed($id: bigint!, $usedAt: timestamptz!) {
-        update_email_verification_tokens_by_pk(
-          pk_columns: {id: $id},
-          _set: {used_at: $usedAt}
-        ) {
-          id
-          used_at
-        }
-      }
+      UPDATE public.email_verification_tokens
+      SET used_at = $2::timestamptz
+      WHERE id = $1::bigint
+      RETURNING id::bigint AS id, used_at
     `,
-    { id: tokenId, usedAt }
+    [tokenId, usedAt]
   );
-  return data?.update_email_verification_tokens_by_pk || null;
+  return rows[0] || null;
 };
 
 const markUserEmailVerified = async (userId, verifiedAt) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation MarkUserEmailVerified($id: bigint!, $verifiedAt: timestamptz!) {
-        update_users_by_pk(
-          pk_columns: {id: $id},
-          _set: {email_verified_at: $verifiedAt}
-        ) {
-          id
-          name
-          email
-          phone
-          avatar_url
-          payUniqe
-          role_id
-          email_verified_at
-        }
-      }
+      UPDATE public.users
+      SET email_verified_at = $2::timestamptz
+      WHERE id = $1::bigint
+      RETURNING
+        id::bigint AS id,
+        name,
+        email,
+        phone,
+        avatar_url,
+        payUniqe,
+        role_id::bigint AS role_id,
+        email_verified_at
     `,
-    { id: userId, verifiedAt }
+    [userId, verifiedAt]
   );
-  return data?.update_users_by_pk || null;
+  return rows[0] || null;
 };
 
 const sendEmailVerificationMail = async ({ user, req }) => {
@@ -4468,36 +4475,22 @@ const getActiveNewspaperSubscriptionAccess = async (userId) => {
   } catch (_) {
     // Fallback to Hasura if direct Postgres is unavailable.
   }
-
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      query GetActiveNewspaperSubscriptionAccess(
-        $user_id: Int!
-        $item_type: access_item_type!
-        $now: timestamptz!
-      ) {
-        user_content_access(
-          where: {
-            user_id: {_eq: $user_id}
-            item_type: {_eq: $item_type}
-            is_active: {_eq: true}
-            _or: [{expires_at: {_is_null: true}}, {expires_at: {_gt: $now}}]
-          }
-          order_by: {expires_at: desc_nulls_last}
-          limit: 1
-        ) {
-          id
-          expires_at
-        }
-      }
+      SELECT
+        id::bigint AS id,
+        expires_at
+      FROM public.user_content_access
+      WHERE user_id = $1::bigint
+        AND item_type = 'newspaper_subscription'
+        AND is_active = TRUE
+        AND (expires_at IS NULL OR expires_at > $2::timestamptz)
+      ORDER BY expires_at DESC NULLS LAST, id DESC
+      LIMIT 1
     `,
-    {
-      user_id: userId,
-      item_type: "newspaper_subscription",
-      now: nowIso,
-    }
+    [userId, nowIso]
   );
-  return data?.user_content_access?.[0] || null;
+  return rows[0] || null;
 };
 
 const getNewspaperByPublishDate = async (publishDate) => {
@@ -4517,83 +4510,60 @@ const getNewspaperByPublishDate = async (publishDate) => {
     );
     return rows[0] || null;
   } catch (_) {
-    // Fallback to Hasura if home postgres is unavailable.
+    return null;
   }
-
-  const data = await hasuraRequest(
-    `
-      query GetNewspaperByPublishDate($publishDate: date!) {
-        newspaper(
-          where: {publish_date: {_eq: $publishDate}}
-          order_by: {id: desc}
-          limit: 1
-        ) {
-          id
-          publish_date
-          file_url
-        }
-      }
-    `,
-    { publishDate }
-  );
-  return data?.newspaper?.[0] || null;
 };
 
 const getUserWelcomeMailState = async (userId) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      query GetUserWelcomeMailState($id: bigint!) {
-        users_by_pk(id: $id) {
-          id
-          name
-          email
-          welcome_mail_sent_at
-        }
-      }
+      SELECT
+        id::bigint AS id,
+        name,
+        email,
+        welcome_mail_sent_at
+      FROM public.users
+      WHERE id = $1::bigint
+      LIMIT 1
     `,
-    { id: userId }
+    [userId]
   );
-  return data?.users_by_pk || null;
+  return rows[0] || null;
 };
 
 const claimWelcomeMailSend = async (userId, claimedAt) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation ClaimWelcomeMailSend($id: bigint!, $claimedAt: timestamptz!) {
-        update_users(
-          where: {id: {_eq: $id}, welcome_mail_sent_at: {_is_null: true}},
-          _set: {welcome_mail_sent_at: $claimedAt}
-        ) {
-          affected_rows
-          returning {
-            id
-            name
-            email
-            welcome_mail_sent_at
-          }
-        }
-      }
+      UPDATE public.users
+      SET welcome_mail_sent_at = $2::timestamptz
+      WHERE id = $1::bigint
+        AND welcome_mail_sent_at IS NULL
+      RETURNING
+        id::bigint AS id,
+        name,
+        email,
+        welcome_mail_sent_at
     `,
-    { id: userId, claimedAt }
+    [userId, claimedAt]
   );
-  return data?.update_users || { affected_rows: 0, returning: [] };
+  return {
+    affected_rows: rows.length,
+    returning: rows,
+  };
 };
 
 const rollbackWelcomeMailClaim = async (userId, claimedAt) => {
-  const data = await hasuraRequest(
+  const rows = await homePostgresQuery(
     `
-      mutation RollbackWelcomeMailSend($id: bigint!, $claimedAt: timestamptz!) {
-        update_users(
-          where: {id: {_eq: $id}, welcome_mail_sent_at: {_eq: $claimedAt}},
-          _set: {welcome_mail_sent_at: null}
-        ) {
-          affected_rows
-        }
-      }
+      UPDATE public.users
+      SET welcome_mail_sent_at = NULL
+      WHERE id = $1::bigint
+        AND welcome_mail_sent_at = $2::timestamptz
+      RETURNING id
     `,
-    { id: userId, claimedAt }
+    [userId, claimedAt]
   );
-  return Number(data?.update_users?.affected_rows || 0);
+  return Number(rows.length || 0);
 };
 
 const sendWelcomeMailOnce = async (userId) => {
@@ -4800,34 +4770,2807 @@ const requireRevenueCatWebhookAuth = (req, res, next) => {
 };
 
 const buildHasuraAuthHeaders = (req) => {
-  const headers = {};
-
   if (req?.hasuraAuthMode === "service") {
-    headers["x-hasura-admin-secret"] = HASURA_ADMIN_SECRET;
-    return headers;
+    return { "x-direct-db-mode": "service" };
   }
-
   if (req?.hasuraAuthMode === "jwt" && req?.jwtToken) {
-    if (hasAdminRoleInBearerToken(req.jwtToken)) {
-      headers["x-hasura-admin-secret"] = HASURA_ADMIN_SECRET;
-      return headers;
-    }
-    headers.Authorization = `Bearer ${req.jwtToken}`;
+    return { Authorization: `Bearer ${req.jwtToken}` };
+  }
+  return {};
+};
+
+const extractGraphqlOperationName = (query, fallbackOperationName = null) => {
+  const fallback = String(fallbackOperationName || "").trim();
+  if (fallback) return fallback;
+  const text = String(query || "");
+  const match = text.match(/\b(query|mutation)\s+([A-Za-z0-9_]+)/);
+  return match?.[2] || null;
+};
+
+const directSelect = async ({
+  tableName,
+  columns = "*",
+  whereSql = "",
+  values = [],
+  orderBy = "",
+  limit = null,
+}) => {
+  const query = [
+    `SELECT ${columns}`,
+    `FROM ${qualifySqlTable(tableName)}`,
+    whereSql ? `WHERE ${whereSql}` : "",
+    orderBy ? `ORDER BY ${orderBy}` : "",
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(query, values);
+};
+
+const directInsert = async ({
+  tableName,
+  object,
+  returning = "*",
+}) => {
+  const payload = compactObject(object);
+  const keys = Object.keys(payload);
+  if (!keys.length) {
+    throw new Error(`Insert payload for ${tableName} is empty.`);
+  }
+  const columns = keys.map((key) => quoteSqlIdentifier(key)).join(", ");
+  const placeholders = keys.map((_, index) => `$${index + 1}`).join(", ");
+  const values = keys.map((key) => payload[key]);
+  return homePostgresQuery(
+    `INSERT INTO ${qualifySqlTable(tableName)} (${columns}) VALUES (${placeholders}) RETURNING ${returning}`,
+    values
+  );
+};
+
+const directUpdateByPk = async ({
+  tableName,
+  pkColumn = "id",
+  id,
+  object,
+  returning = "*",
+}) => {
+  const payload = compactObject(object);
+  const keys = Object.keys(payload);
+  if (!keys.length) {
+    throw new Error(`Update payload for ${tableName} is empty.`);
+  }
+  const setSql = keys
+    .map((key, index) => `${quoteSqlIdentifier(key)} = $${index + 2}`)
+    .join(", ");
+  const values = [id, ...keys.map((key) => payload[key])];
+  return homePostgresQuery(
+    `UPDATE ${qualifySqlTable(tableName)} SET ${setSql} WHERE ${quoteSqlIdentifier(pkColumn)} = $1 RETURNING ${returning}`,
+    values
+  );
+};
+
+const directDeleteByPk = async ({
+  tableName,
+  pkColumn = "id",
+  id,
+  returning = "*",
+}) => {
+  return homePostgresQuery(
+    `DELETE FROM ${qualifySqlTable(tableName)} WHERE ${quoteSqlIdentifier(pkColumn)} = $1 RETURNING ${returning}`,
+    [id]
+  );
+};
+
+const directCount = async ({ tableName, whereSql = "", values = [] }) => {
+  const rows = await homePostgresQuery(
+    `SELECT COUNT(*)::int AS count FROM ${qualifySqlTable(tableName)} ${whereSql ? `WHERE ${whereSql}` : ""}`,
+    values
+  );
+  return Number(rows[0]?.count || 0);
+};
+
+const selectUsersDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "u.id ASC",
+  limit = null,
+  includeRole = false,
+  includePassword = false,
+  includeDeactivatedAt = false,
+}) => {
+  const selectParts = [
+    "u.id::bigint AS id",
+    "u.name",
+    "u.email",
+    "u.phone",
+    "u.avatar_url",
+    "u.payUniqe",
+    "u.auth_session_id",
+    "u.role_id::bigint AS role_id",
+    "u.email_verified_at",
+    "u.is_active",
+  ];
+  if (includePassword) selectParts.push("u.password");
+  if (includeDeactivatedAt) selectParts.push("u.deactivated_at");
+  if (includeRole) {
+    selectParts.push("jsonb_build_object('id', r.id, 'name', r.name) AS role");
+  }
+  const sql = [
+    `SELECT ${selectParts.join(", ")}`,
+    "FROM public.users u",
+    includeRole ? "LEFT JOIN public.roles r ON r.id = u.role_id" : "",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(sql, values);
+};
+
+const selectRolesDirect = async () =>
+  homePostgresQuery(
+    `
+      SELECT
+        id::bigint AS id,
+        name,
+        description
+      FROM public.roles
+      ORDER BY id ASC
+    `
+  );
+
+const selectNotificationsDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "created_at DESC, id DESC",
+  limit = null,
+  includeUser = false,
+}) => {
+  const selectParts = [
+    "n.id::bigint AS id",
+    "n.user_id::bigint AS user_id",
+    "n.title",
+    "n.body",
+    "n.created_at",
+    "n.is_read",
+  ];
+  if (includeUser) {
+    selectParts.push("jsonb_build_object('id', u.id, 'name', u.name, 'email', u.email) AS user");
+  }
+  const sql = [
+    `SELECT ${selectParts.join(", ")}`,
+    "FROM public.notifications n",
+    includeUser ? "LEFT JOIN public.users u ON u.id = n.user_id" : "",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(sql, values);
+};
+
+const selectOrdersDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "created_at DESC, id DESC",
+  limit = null,
+  includeItems = false,
+  includeUser = false,
+}) => {
+  const selectParts = [
+    "o.id::bigint AS id",
+    ", o.user_id::bigint AS user_id",
+    ", o.total_paid",
+    ", o.status::text AS status",
+    ", o.payment_provider",
+    ", o.merchant_payment_id",
+    ", o.payment_session_token",
+    ", CASE WHEN o.promo_code_id IS NULL THEN NULL ELSE o.promo_code_id::bigint END AS promo_code_id",
+    ", o.promo_code",
+    ", o.promo_discount_percent",
+    ", o.promo_discount_amount",
+    ", o.created_at",
+  ];
+  if (includeUser) {
+    selectParts.push(
+      ", CASE WHEN u.id IS NULL THEN NULL ELSE jsonb_build_object('id', u.id, 'name', u.name, 'email', u.email) END AS user"
+    );
+  }
+  const orders = await homePostgresQuery(
+    [
+      `SELECT ${selectParts.join(", ")}`,
+      "FROM public.orders o",
+      includeUser ? "LEFT JOIN public.users u ON u.id = o.user_id" : "",
+      `WHERE ${whereSql}`,
+      `ORDER BY ${orderBy}`,
+      limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
+    values
+  );
+
+  if (!includeItems || !orders.length) {
+    return orders.map((order) => ({ ...order }));
   }
 
-  return headers;
+  const orderIds = orders.map((order) => Number(order.id)).filter(Number.isFinite);
+  const items = await homePostgresQuery(
+    `
+      SELECT
+        id::bigint AS id,
+        order_id::bigint AS order_id,
+        product_id::bigint AS product_id,
+        ek_id::bigint AS ek_id,
+        title,
+        quantity::int AS quantity,
+        unit_price,
+        line_total,
+        product_type,
+        metadata,
+        created_at
+      FROM public.order_items
+      WHERE order_id = ANY($1::bigint[])
+      ORDER BY id ASC
+    `,
+    [orderIds]
+  );
+  const itemsByOrderId = new Map();
+  for (const item of items) {
+    const key = Number(item.order_id);
+    if (!itemsByOrderId.has(key)) itemsByOrderId.set(key, []);
+    itemsByOrderId.get(key).push({ ...item });
+  }
+  return orders.map((order) => ({
+    ...order,
+    order_items: itemsByOrderId.get(Number(order.id)) || [],
+  }));
+};
+
+const selectUserContentAccessDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC",
+  limit = null,
+  includeManual = false,
+}) => {
+  const rows = await homePostgresQuery(
+    [
+      "SELECT",
+      "id::bigint AS id",
+      ", user_id::bigint AS user_id",
+      ", CASE WHEN item_id IS NULL THEN NULL ELSE item_id::bigint END AS item_id",
+      ", item_type",
+      ", started_at",
+      ", expires_at",
+      ", purchase_price",
+      ", is_active",
+      ", grant_source",
+      ", purchase_platform",
+      "FROM public.user_content_access",
+      `WHERE ${whereSql}`,
+      `ORDER BY ${orderBy}`,
+      limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
+    values
+  );
+
+  const entries = rows.map((row) => ({ ...row }));
+  if (includeManual) {
+    const manualRows = await homePostgresQuery(
+      `
+        SELECT
+          id::bigint AS id,
+          user_id::bigint AS user_id,
+          NULL::bigint AS item_id,
+          'newspaper_subscription'::text AS item_type,
+          starts_at AS started_at,
+          ends_at AS expires_at,
+          NULL::numeric AS purchase_price,
+          is_active,
+          COALESCE(status, 'new') AS status,
+          'manual_newspaper'::text AS grant_source,
+          NULL::text AS purchase_platform,
+          note
+        FROM public.manual_newspaper_users
+        WHERE ${whereSql.replaceAll("user_id", "user_id")}
+      `,
+      values
+    ).catch(() => []);
+    entries.push(...manualRows);
+  }
+  return entries;
+};
+
+const selectBooksDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "b.id DESC",
+  limit = null,
+  onlyPublished = false,
+}) => {
+  const conditions = [whereSql];
+  if (onlyPublished) {
+    conditions.push("COALESCE(b.is_published, TRUE) = TRUE");
+  }
+  const query = [
+    "SELECT",
+    "b.id::int AS id",
+    ", b.title",
+    ", b.isbn",
+    ", b.cover_url",
+    ", b.book_url",
+    ", COALESCE(b.is_published, TRUE) AS is_published",
+    ", b.price",
+    ", b.discount_price",
+    ", b.description",
+    ", b.min_description",
+    ", b.category_id",
+    ", b.author_id",
+    ", b.created_at",
+    ", b.updated_at",
+    ", CASE WHEN c.id IS NULL THEN NULL ELSE jsonb_build_object('id', c.id, 'name', c.name) END AS category_rel",
+    ", CASE WHEN a.id IS NULL THEN NULL ELSE jsonb_build_object('id', a.id, 'name', a.name) END AS author_rel",
+    "FROM public.books b",
+    "LEFT JOIN public.categories c ON c.id = b.category_id",
+    "LEFT JOIN public.authors a ON a.id = b.author_id",
+    `WHERE ${conditions.join(" AND ")}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(query, values);
+};
+
+const selectMagazinesDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "m.id DESC",
+  limit = null,
+}) => {
+  const query = [
+    "SELECT",
+    "m.id::int AS id",
+    ", m.name",
+    ", m.category",
+    ", m.cover_image_url",
+    ", m.period",
+    ", m.description",
+    ", m.created_at",
+    ", m.updated_at",
+    "FROM public.magazine m",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(query, values);
+};
+
+const selectMagazineIssuesDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "mi.issue_number DESC NULLS LAST, mi.added_at DESC NULLS LAST, mi.id DESC",
+  limit = null,
+  includeMagazine = false,
+}) => {
+  const query = [
+    "SELECT",
+    "mi.id::int AS id",
+    ", mi.magazine_id::int AS magazine_id",
+    ", mi.issue_number::int AS issue_number",
+    ", mi.file_url",
+    ", mi.photo_url",
+    ", mi.price",
+    ", mi.description",
+    ", mi.added_at",
+    ", mi.created_at",
+    ", mi.updated_at",
+    ", COALESCE(mi.is_published, TRUE) AS is_published",
+    includeMagazine
+      ? ", CASE WHEN m.id IS NULL THEN NULL ELSE jsonb_build_object('id', m.id, 'name', m.name) END AS magazine"
+      : "",
+    "FROM public.magazine_issue mi",
+    includeMagazine ? "LEFT JOIN public.magazine m ON m.id = mi.magazine_id" : "",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(query, values);
+};
+
+const selectNewspapersDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "publish_date DESC, id DESC",
+  limit = null,
+}) => {
+  const query = [
+    "SELECT",
+    "id::int AS id",
+    ", image_url",
+    ", publish_date::text AS publish_date",
+    ", file_url",
+    ", created_at",
+    ", updated_at",
+    "FROM public.newspaper",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(query, values);
+};
+
+const selectEklerDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "e.created_at DESC, e.id DESC",
+  limit = null,
+}) => {
+  const query = [
+    "SELECT",
+    "e.id::bigint AS id",
+    ", e.ad",
+    ", e.aciklama",
+    ", e.fiyat",
+    ", e.pdf_url",
+    ", e.photo_url",
+    ", COALESCE(e.is_public, TRUE) AS is_public",
+    ", e.created_at",
+    ", e.updated_at",
+    "FROM public.ekler e",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(query, values);
+};
+
+const selectSlidersDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "sort_order ASC NULLS LAST, created_at DESC",
+  limit = null,
+}) => {
+  const query = [
+    "SELECT",
+    "id::int AS id",
+    ", title",
+    ", subtitle",
+    ", description",
+    ", image_url",
+    ", link_url",
+    ", sort_order",
+    ", COALESCE(is_active, TRUE) AS is_active",
+    ", created_at",
+    ", updated_at",
+    "FROM public.slider",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(query, values);
+};
+
+const selectFaqDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "sort_order ASC, id ASC",
+  limit = null,
+}) => {
+  const query = [
+    "SELECT",
+    "id::int AS id",
+    ", title",
+    ", description",
+    ", sort_order",
+    ", COALESCE(is_active, TRUE) AS is_active",
+    ", created_at",
+    ", updated_at",
+    "FROM public.faq",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(query, values);
+};
+
+const selectAuthorsDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "id ASC",
+  limit = null,
+}) => homePostgresQuery(
+  [
+    "SELECT",
+    "id::int AS id",
+    ", name",
+    ", created_at",
+    ", updated_at",
+    "FROM public.authors",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" "),
+  values
+);
+
+const selectCategoriesDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "id ASC",
+  limit = null,
+}) => homePostgresQuery(
+  [
+    "SELECT",
+    "id::int AS id",
+    ", name",
+    ", created_at",
+    ", updated_at",
+    "FROM public.categories",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" "),
+  values
+);
+
+const selectMagazineTypesDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "sort_order ASC, id ASC",
+  limit = null,
+}) => homePostgresQuery(
+  [
+    "SELECT",
+    "id::int AS id",
+    ", title",
+    ", duration_months",
+    ", COALESCE(is_active, TRUE) AS is_active",
+    ", sort_order",
+    ", created_at",
+    ", updated_at",
+    "FROM public.magazine_type",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" "),
+  values
+);
+
+const selectNewspaperSubscriptionTypesDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "sort_order ASC, id DESC",
+  limit = null,
+}) => homePostgresQuery(
+  [
+    "SELECT",
+    "id::bigint AS id",
+    ", title",
+    ", duration_months",
+    ", price",
+    ", COALESCE(is_active, TRUE) AS is_active",
+    ", sort_order",
+    ", created_at",
+    ", updated_at",
+    "FROM public.newspaper_subscription_type",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" "),
+  values
+);
+
+const selectMagazineTypePricesDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "sort_order ASC, id ASC",
+  limit = null,
+  includeTypes = false,
+}) => {
+  const sql = [
+    "SELECT",
+    "mtp.id::int AS id",
+    ", mtp.magazine_id::int AS magazine_id",
+    ", mtp.magazine_type_id::int AS magazine_type_id",
+    ", mtp.price",
+    ", COALESCE(mtp.is_active, TRUE) AS is_active",
+    ", mtp.sort_order",
+    includeTypes
+      ? ", CASE WHEN mt.id IS NULL THEN NULL ELSE jsonb_build_object('id', mt.id, 'title', mt.title, 'duration_months', mt.duration_months) END AS magazine_type"
+      : "",
+    "FROM public.magazine_type_price mtp",
+    includeTypes ? "LEFT JOIN public.magazine_type mt ON mt.id = mtp.magazine_type_id" : "",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(sql, values);
+};
+
+const selectPromoCodesDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "created_at DESC, id DESC",
+  limit = null,
+}) => homePostgresQuery(
+  [
+    "SELECT",
+    "id::bigint AS id",
+    ", code",
+    ", discount_percent",
+    ", starts_at",
+    ", ends_at",
+    ", COALESCE(is_active, TRUE) AS is_active",
+    ", usage_limit",
+    ", usage_count",
+    ", created_at",
+    ", updated_at",
+    "FROM public.promo_codes",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" "),
+  values
+);
+
+const selectReviewsDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "created_at DESC, id DESC",
+  limit = null,
+}) => homePostgresQuery(
+  [
+    "SELECT",
+    "id::bigint AS id",
+    ", product_type",
+    ", product_id::bigint AS product_id",
+    ", product_title",
+    ", user_id::bigint AS user_id",
+    ", user_name",
+    ", user_email",
+    ", rating",
+    ", comment",
+    ", status",
+    ", created_at",
+    ", updated_at",
+    "FROM public.product_reviews",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" "),
+  values
+);
+
+const selectContactMessagesDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "created_at DESC, id DESC",
+  limit = null,
+  includeUser = false,
+}) => {
+  const sql = [
+    "SELECT",
+    "cm.id::bigint AS id",
+    ", cm.subject",
+    ", cm.message",
+    ", cm.email",
+    ", cm.user_id::bigint AS user_id",
+    ", cm.created_at",
+    includeUser
+      ? ", CASE WHEN u.id IS NULL THEN NULL ELSE jsonb_build_object('id', u.id, 'name', u.name, 'email', u.email, 'phone', u.phone, 'role', jsonb_build_object('id', r.id, 'name', r.name)) END AS user"
+      : "",
+    "FROM public.contact_messages cm",
+    includeUser ? "LEFT JOIN public.users u ON u.id = cm.user_id LEFT JOIN public.roles r ON r.id = u.role_id" : "",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return homePostgresQuery(sql, values);
+};
+
+const selectUserAccessAuditLogsDirect = async ({
+  userId = null,
+  limit = 20,
+  includeActors = false,
+}) => {
+  const values = [];
+  let whereSql = "TRUE";
+  if (userId !== null && userId !== undefined) {
+    values.push(userId);
+    whereSql = `user_id = $${values.length}::bigint`;
+  }
+  values.push(limit);
+  const rows = await homePostgresQuery(
+    [
+      "SELECT",
+      "id::bigint AS id",
+      ", user_id::bigint AS user_id",
+      ", actor_user_id::bigint AS actor_user_id",
+      ", action",
+      ", item_type",
+      ", item_id::bigint AS item_id",
+      ", item_title",
+      ", access_source",
+      ", previous_expires_at",
+      ", new_expires_at",
+      ", note",
+      ", created_at",
+      "FROM public.user_access_audit_log",
+      `WHERE ${whereSql}`,
+      "ORDER BY created_at DESC, id DESC",
+      `LIMIT $${values.length}::int`,
+    ]
+      .filter(Boolean)
+      .join(" "),
+    values
+  );
+
+  if (!includeActors || rows.length === 0) {
+    return rows.map((row) => ({ ...row }));
+  }
+
+  const actorIds = rows
+    .map((row) => row.actor_user_id)
+    .filter((value) => value !== null && value !== undefined)
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value));
+  if (!actorIds.length) return rows.map((row) => ({ ...row }));
+
+  const actors = await selectUsersDirect({
+    whereSql: "u.id = ANY($1::bigint[])",
+    values: [actorIds],
+    includeRole: false,
+  });
+  const byId = new Map(actors.map((user) => [String(user.id), user]));
+  return rows.map((row) => ({
+    ...row,
+    actor: byId.get(String(row.actor_user_id)) || null,
+  }));
+};
+
+const selectHomeShowcaseDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "sort_order ASC NULLS LAST, created_at DESC",
+  limit = null,
+}) => homePostgresQuery(
+  [
+    "SELECT",
+    "id::bigint AS id",
+    ", product_type",
+    ", product_id::bigint AS product_id",
+    ", sort_order",
+    ", COALESCE(is_active, TRUE) AS is_active",
+    ", created_at",
+    "FROM public.home_showcase",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" "),
+  values
+);
+
+const selectUserAddressesDirect = async ({
+  whereSql = "TRUE",
+  values = [],
+  orderBy = "created_at DESC, id DESC",
+  limit = null,
+}) => homePostgresQuery(
+  [
+    "SELECT",
+    "id::bigint AS id",
+    ", user_id::bigint AS user_id",
+    ", address_name",
+    ", address_type",
+    ", country",
+    ", city",
+    ", district",
+    ", full_address",
+    ", postal_code",
+    ", tax_or_tc_no",
+    ", tax_address",
+    ", company_name",
+    ", created_at",
+    ", updated_at",
+    "FROM public.user_addresses",
+    `WHERE ${whereSql}`,
+    `ORDER BY ${orderBy}`,
+    limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
+  ]
+    .filter(Boolean)
+    .join(" "),
+  values
+);
+
+const executeDirectGraphqlRequest = async ({ query, variables = {}, operationName, req }) => {
+  const op = extractGraphqlOperationName(query, operationName);
+  if (!op) {
+    throw new Error("GraphQL operation name could not be determined.");
+  }
+
+  switch (op) {
+    case "GetRoles": {
+      return { roles: await selectRolesDirect() };
+    }
+    case "GetAllUsers": {
+      return {
+        users: await selectUsersDirect({
+          whereSql: "u.is_active = TRUE",
+          orderBy: "u.id ASC",
+          includeRole: true,
+        }),
+      };
+    }
+    case "GetAdminUserDetail": {
+      const userId = toPositiveIntOrNull(variables.id);
+      return { users_by_pk: userId ? (await selectUsersDirect({ whereSql: "u.id = $1::bigint", values: [userId], includeRole: true, includeDeactivatedAt: true, includePassword: true, limit: 1 }))[0] || null : null };
+    }
+    case "GetPassiveUsers": {
+      return {
+        users: await selectUsersDirect({
+          whereSql: "u.is_active = FALSE",
+          orderBy: "u.deactivated_at DESC NULLS LAST, u.id DESC",
+          includeRole: true,
+          includeDeactivatedAt: true,
+        }),
+      };
+    }
+    case "GetPassiveUsersFallback": {
+      return {
+        users: await selectUsersDirect({
+          whereSql: "TRUE",
+          orderBy: "u.id DESC",
+          includeRole: true,
+          includeDeactivatedAt: true,
+        }),
+      };
+    }
+    case "GetUserByEmail":
+    case "GetUserByEmailForAuth": {
+      const email = normalizeEmail(variables.email);
+      return {
+        users: await selectUsersDirect({
+          whereSql: "u.is_active = TRUE AND (LOWER(u.email) = $1 OR LOWER(u.email) = $2)",
+          values: [email, email],
+          orderBy: "u.email_verified_at DESC NULLS LAST, u.id ASC",
+          includeRole: true,
+        }),
+      };
+    }
+    case "GetUser":
+    case "GetUserById":
+    case "GetUserByIdForAuth":
+    case "GetUserByIdForPasswordChange": {
+      const userId = toPositiveIntOrNull(variables.id);
+      return {
+        users_by_pk: userId
+          ? (await selectUsersDirect({
+              whereSql: "u.id = $1::bigint",
+              values: [userId],
+              includeRole: true,
+              includePassword: op === "GetUserByIdForPasswordChange",
+              includeDeactivatedAt: true,
+              limit: 1,
+            }))[0] || null
+          : null,
+      };
+    }
+    case "Register":
+    case "AddUser":
+    case "CreateSocialLoginUser":
+    case "CreateSocialUser": {
+      const payload =
+        variables.object ||
+        {
+          name: variables.name,
+          phone: variables.phone,
+          email: variables.email,
+          password: variables.password,
+          payUniqe: variables.payUniqe || crypto.randomUUID(),
+          role_id: variables.role_id || 1,
+          is_active: variables.is_active ?? true,
+          email_verified_at: variables.email_verified_at || new Date().toISOString(),
+        };
+      const rows = await directInsert({
+        tableName: "users",
+        object: {
+          name: payload.name,
+          phone: payload.phone || null,
+          email: normalizeEmail(payload.email),
+          password: payload.password || null,
+          payUniqe: payload.payUniqe || crypto.randomUUID(),
+          role_id: payload.role_id || 1,
+          is_active: payload.is_active ?? true,
+          email_verified_at: payload.email_verified_at || new Date().toISOString(),
+          avatar_url: payload.avatar_url || null,
+          auth_session_id: payload.auth_session_id || null,
+        },
+        returning: "id",
+      });
+      const insertedId = rows[0]?.id;
+      return {
+        insert_users_one: insertedId
+          ? (await selectUsersDirect({
+              whereSql: "u.id = $1::bigint",
+              values: [insertedId],
+              includeRole: true,
+              includePassword: true,
+              includeDeactivatedAt: true,
+              limit: 1,
+            }))[0] || null
+          : null,
+      };
+    }
+    case "Login": {
+      const email = normalizeEmail(variables.email);
+      const password = String(variables.password || "");
+      return {
+        users: await selectUsersDirect({
+          whereSql:
+            "(LOWER(u.email) = $1 OR LOWER(u.email) = $2) AND u.password = $3 AND u.is_active = TRUE",
+          values: [email, email, password],
+          orderBy: "u.email_verified_at DESC NULLS LAST, u.id ASC",
+          includeRole: true,
+          includePassword: false,
+        }),
+      };
+    }
+    case "UpdateProfile":
+    case "UpdateUser":
+    case "UpdateProfileFields":
+    case "UpdateUserProfileFields": {
+      const userId = toPositiveIntOrNull(variables.id);
+      if (!userId) return { update_users_by_pk: null };
+      const updates = {
+        name: variables.name,
+        phone: variables.phone ?? null,
+        email: variables.email,
+        role_id: variables.role_id,
+      };
+      const rows = await directUpdateByPk({
+        tableName: "users",
+        id: userId,
+        object: updates,
+        returning: "id",
+      }).catch(async () => {
+        const safeUpdates = compactObject(updates);
+        const safeRows = await homePostgresQuery(
+          `UPDATE public.users SET ${Object.keys(safeUpdates)
+            .map((key, index) => `${quoteSqlIdentifier(key)} = $${index + 2}`)
+            .join(", ")} WHERE id = $1::bigint RETURNING id`,
+          [userId, ...Object.values(safeUpdates)]
+        );
+        return safeRows;
+      });
+      const id = rows[0]?.id || userId;
+      return {
+        update_users_by_pk: id
+          ? (await selectUsersDirect({
+              whereSql: "u.id = $1::bigint",
+              values: [id],
+              includeRole: true,
+              includePassword: true,
+              includeDeactivatedAt: true,
+              limit: 1,
+            }))[0] || null
+          : null,
+      };
+    }
+    case "ChangePassword": {
+      const userId = toPositiveIntOrNull(variables.id);
+      if (!userId) {
+        return { update_users: { affected_rows: 0 } };
+      }
+      const rows = await homePostgresQuery(
+        `
+          UPDATE public.users
+          SET password = $3::text
+          WHERE id = $1::bigint AND password = $2::text
+          RETURNING id
+        `,
+        [userId, String(variables.current || variables.password || ""), String(variables.next || variables.password || "")]
+      );
+      return { update_users: { affected_rows: rows.length } };
+    }
+    case "DeleteAccount": {
+      const userId = toPositiveIntOrNull(variables.id);
+      if (!userId) return { delete_users_by_pk: null };
+      const deleted = await homePostgresQuery(
+        `DELETE FROM public.users WHERE id = $1::bigint RETURNING id`,
+        [userId]
+      ).catch(() => []);
+      if (deleted.length) {
+        return { delete_users_by_pk: { id: deleted[0].id } };
+      }
+      const anonEmail = `deleted_${userId}_${Date.now()}@yeniasya.local`;
+      const rows = await homePostgresQuery(
+        `
+          UPDATE public.users
+          SET name = 'Silinmiş Hesap',
+              email = $2::text,
+              phone = NULL,
+              password = $3::text,
+              is_active = FALSE,
+              firebase_token = NULL,
+              deactivated_at = NOW()
+          WHERE id = $1::bigint
+          RETURNING id
+        `,
+        [userId, anonEmail, HashHelper.hashPassword(`deleted_${userId}_${Date.now()}`)]
+      ).catch(() => []);
+      return { delete_users_by_pk: rows[0] ? { id: rows[0].id } : null };
+    }
+    case "DeactivateAccount":
+    case "DeactivateUser": {
+      const userId = toPositiveIntOrNull(variables.id);
+      if (!userId) return { update_users_by_pk: null };
+      const rows = await homePostgresQuery(
+        `
+          UPDATE public.users
+          SET is_active = FALSE,
+              deactivated_at = COALESCE($2::timestamptz, NOW())
+          WHERE id = $1::bigint
+          RETURNING id
+        `,
+        [userId, variables.deactivated_at || variables.deactivatedAt || null]
+      );
+      return { update_users_by_pk: rows[0] ? { id: rows[0].id, is_active: false } : null };
+    }
+    case "UpdateUserToken": {
+      const userId = toPositiveIntOrNull(variables.user_id || variables.id);
+      if (!userId) return { update_users_by_pk: null };
+      const rows = await homePostgresQuery(
+        `
+          UPDATE public.users
+          SET firebase_token = $2::text,
+              firebase_token_updated_at = $3::timestamptz
+          WHERE id = $1::bigint
+          RETURNING id
+        `,
+        [userId, variables.token || null, variables.firebase_token_updated_at || new Date().toISOString()]
+      );
+      return { update_users_by_pk: rows[0] ? { id: rows[0].id } : null };
+    }
+    case "GetTokens":
+    case "GetUserTokensByIds":
+    case "GetAllUserTokens": {
+      const whereSql =
+        op === "GetUserTokensByIds"
+          ? "id = ANY($1::bigint[]) AND firebase_token IS NOT NULL AND firebase_token <> ''"
+          : "firebase_token IS NOT NULL AND firebase_token <> ''";
+      const values = op === "GetUserTokensByIds" ? [variables.ids || []] : [];
+      return {
+        users: await selectUsersDirect({
+          whereSql: `u.${whereSql.replaceAll("id", "id").replaceAll("firebase_token", "firebase_token")}`,
+          values,
+          orderBy: "u.firebase_token_updated_at DESC NULLS LAST, u.id DESC",
+          includeRole: false,
+        }),
+      };
+    }
+    case "GetPublicBooks": {
+      return { books: await selectBooksDirect({ onlyPublished: true }) };
+    }
+    case "GetAllBooks": {
+      return { books: await selectBooksDirect({ orderBy: "b.id DESC" }) };
+    }
+    case "GetBook": {
+      const id = toPositiveIntOrNull(variables.id);
+      return {
+        books_by_pk: id
+          ? (await selectBooksDirect({
+              whereSql: "b.id = $1::bigint",
+              values: [id],
+              orderBy: "b.id DESC",
+              limit: 1,
+            }))[0] || null
+          : null,
+      };
+    }
+    case "AddBook": {
+      const rows = await directInsert({
+        tableName: "books",
+        object: {
+          title: variables.title,
+          isbn: variables.isbn,
+          cover_url: variables.cover_url ?? null,
+          book_url: variables.book_url ?? null,
+          price: variables.price,
+          discount_price: variables.discount_price ?? null,
+          category_id: variables.category_id ?? null,
+          author_id: variables.author_id ?? null,
+          description: variables.description ?? null,
+          min_description: variables.min_description ?? null,
+        },
+        returning: "id::int AS id",
+      });
+      return { insert_books_one: rows[0] || null };
+    }
+    case "UpdateBook": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_books_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "books",
+        id,
+        object: {
+          title: variables.title,
+          isbn: variables.isbn,
+          cover_url: variables.cover_url ?? null,
+          book_url: variables.book_url ?? null,
+          price: variables.price,
+          discount_price: variables.discount_price ?? null,
+          category_id: variables.category_id ?? null,
+          author_id: variables.author_id ?? null,
+          description: variables.description ?? null,
+          min_description: variables.min_description ?? null,
+        },
+        returning: "id::int AS id",
+      });
+      return { update_books_by_pk: rows[0] || null };
+    }
+    case "DeleteBook": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "books",
+            id,
+            returning: "id::int AS id",
+          })
+        : [];
+      return { delete_books_by_pk: rows[0] || null };
+    }
+    case "SetBookPublicationStatus": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_books_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "books",
+        id,
+        object: { is_published: toBool(variables.is_published) },
+        returning: "id::int AS id, COALESCE(is_published, TRUE) AS is_published",
+      });
+      return { update_books_by_pk: rows[0] || null };
+    }
+    case "GetBooksByIds": {
+      const ids = (variables.ids || []).map((value) => Number.parseInt(value, 10)).filter((v) => Number.isInteger(v) && v > 0);
+      return {
+        books: ids.length
+          ? await selectBooksDirect({
+              whereSql: "b.id = ANY($1::bigint[])",
+              values: [ids],
+              orderBy: "b.id ASC",
+            })
+          : [],
+      };
+    }
+    case "GetMagazines":
+      return { magazine: await selectMagazinesDirect({ orderBy: "m.id DESC" }) };
+    case "GetMagazine": {
+      const id = toPositiveIntOrNull(variables.id);
+      return {
+        magazine_by_pk: id
+          ? (await selectMagazinesDirect({
+              whereSql: "m.id = $1::bigint",
+              values: [id],
+              orderBy: "m.id DESC",
+              limit: 1,
+            }))[0] || null
+          : null,
+      };
+    }
+    case "AddMagazine": {
+      const rows = await directInsert({
+        tableName: "magazine",
+        object: {
+          name: variables.name,
+          category: variables.category,
+          period: variables.period,
+          description: variables.description ?? null,
+          cover_image_url: variables.cover_image_url ?? null,
+        },
+        returning: "id::int AS id",
+      });
+      return { insert_magazine_one: rows[0] || null };
+    }
+    case "UpdateMagazine": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_magazine_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "magazine",
+        id,
+        object: {
+          name: variables.name,
+          category: variables.category,
+          period: variables.period,
+          description: variables.description ?? null,
+          cover_image_url: variables.cover_image_url ?? null,
+        },
+        returning: "id::int AS id",
+      });
+      return { update_magazine_by_pk: rows[0] || null };
+    }
+    case "DeleteMagazine": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "magazine",
+            id,
+            returning: "id::int AS id",
+          })
+        : [];
+      return { delete_magazine_by_pk: rows[0] || null };
+    }
+    case "GetIssues": {
+      const magazineId = toPositiveIntOrNull(variables.magazine_id);
+      return {
+        magazine_issue: magazineId
+          ? await selectMagazineIssuesDirect({
+              whereSql: "mi.magazine_id = $1::bigint",
+              values: [magazineId],
+              orderBy: "mi.issue_number DESC NULLS LAST, mi.id DESC",
+            })
+          : [],
+      };
+    }
+    case "GetAdminIssues": {
+      const magazineId = toPositiveIntOrNull(variables.magazine_id);
+      return {
+        magazine_issue: magazineId
+          ? await selectMagazineIssuesDirect({
+              whereSql: "mi.magazine_id = $1::bigint",
+              values: [magazineId],
+              orderBy: "mi.issue_number DESC NULLS LAST, mi.id DESC",
+            })
+          : [],
+      };
+    }
+    case "GetIssue": {
+      const id = toPositiveIntOrNull(variables.id);
+      return {
+        magazine_issue_by_pk: id
+          ? (await selectMagazineIssuesDirect({
+              whereSql: "mi.id = $1::bigint",
+              values: [id],
+              orderBy: "mi.id DESC",
+              limit: 1,
+              includeMagazine: true,
+            }))[0] || null
+          : null,
+      };
+    }
+    case "AddIssue": {
+      const rows = await directInsert({
+        tableName: "magazine_issue",
+        object: {
+          magazine_id: variables.magazine_id,
+          issue_number: variables.issue_number,
+          file_url: variables.file_url,
+          photo_url: variables.photo_url ?? null,
+          price: variables.price,
+          description: variables.description ?? null,
+          added_at: variables.added_at ?? null,
+        },
+        returning: "id::int AS id",
+      });
+      return { insert_magazine_issue_one: rows[0] || null };
+    }
+    case "UpdateIssue": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_magazine_issue_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "magazine_issue",
+        id,
+        object: {
+          issue_number: variables.issue_number,
+          file_url: variables.file_url,
+          photo_url: variables.photo_url ?? null,
+          price: variables.price,
+          description: variables.description ?? null,
+          added_at: variables.added_at ?? null,
+        },
+        returning: "id::int AS id",
+      });
+      return { update_magazine_issue_by_pk: rows[0] || null };
+    }
+    case "DeleteIssue": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "magazine_issue",
+            id,
+            returning: "id::int AS id",
+          })
+        : [];
+      return { delete_magazine_issue_by_pk: rows[0] || null };
+    }
+    case "SetIssuePublicationStatus": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_magazine_issue_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "magazine_issue",
+        id,
+        object: { is_published: toBool(variables.is_published) },
+        returning: "id::int AS id, COALESCE(is_published, TRUE) AS is_published",
+      });
+      return { update_magazine_issue_by_pk: rows[0] || null };
+    }
+    case "GetMagazinesByIds": {
+      const ids = (variables.ids || []).map((value) => Number.parseInt(value, 10)).filter((v) => Number.isInteger(v) && v > 0);
+      return {
+        magazine: ids.length
+          ? await selectMagazinesDirect({
+              whereSql: "m.id = ANY($1::bigint[])",
+              values: [ids],
+              orderBy: "m.id ASC",
+            })
+          : [],
+      };
+    }
+    case "GetMagazineIssuesByIds": {
+      const ids = (variables.ids || []).map((value) => Number.parseInt(value, 10)).filter((v) => Number.isInteger(v) && v > 0);
+      return {
+        magazine_issue: ids.length
+          ? await selectMagazineIssuesDirect({
+              whereSql: "mi.id = ANY($1::bigint[])",
+              values: [ids],
+              orderBy: "mi.id ASC",
+              includeMagazine: true,
+            })
+          : [],
+      };
+    }
+    case "GetPublicNewspapers": {
+      return {
+        newspaper: await selectNewspapersDirect({
+          orderBy: "publish_date DESC, id DESC",
+        }),
+      };
+    }
+    case "GetNewspapers": {
+      return {
+        newspaper: await selectNewspapersDirect({
+          orderBy: "publish_date DESC, id DESC",
+        }),
+      };
+    }
+    case "GetNewspaper": {
+      const id = toPositiveIntOrNull(variables.id);
+      return {
+        newspaper_by_pk: id
+          ? (await selectNewspapersDirect({
+              whereSql: "id = $1::bigint",
+              values: [id],
+              orderBy: "publish_date DESC, id DESC",
+              limit: 1,
+            }))[0] || null
+          : null,
+      };
+    }
+    case "AddNewspaper": {
+      const rows = await directInsert({
+        tableName: "newspaper",
+        object: {
+          image_url: variables.image_url,
+          file_url: variables.file_url,
+          publish_date: variables.publish_date,
+        },
+        returning: "id::int AS id",
+      });
+      return { insert_newspaper_one: rows[0] || null };
+    }
+    case "UpdateNewspaper": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_newspaper_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "newspaper",
+        id,
+        object: {
+          image_url: variables.image_url,
+          file_url: variables.file_url,
+          publish_date: variables.publish_date,
+        },
+        returning: "id::int AS id",
+      });
+      return { update_newspaper_by_pk: rows[0] || null };
+    }
+    case "DeleteNewspaper": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "newspaper",
+            id,
+            returning: "id::int AS id",
+          })
+        : [];
+      return { delete_newspaper_by_pk: rows[0] || null };
+    }
+    case "GetEkler": {
+      return { ekler: await selectEklerDirect({ orderBy: "e.created_at DESC, e.id DESC" }) };
+    }
+    case "GetEk": {
+      const id = toPositiveIntOrNull(variables.id);
+      return {
+        ekler_by_pk: id
+          ? (await selectEklerDirect({
+              whereSql: "e.id = $1::bigint",
+              values: [id],
+              orderBy: "e.created_at DESC, e.id DESC",
+              limit: 1,
+            }))[0] || null
+          : null,
+      };
+    }
+    case "GetEklerByIds": {
+      const ids = (variables.ids || []).map((value) => Number.parseInt(value, 10)).filter((v) => Number.isInteger(v) && v > 0);
+      return {
+        ekler: ids.length
+          ? await selectEklerDirect({
+              whereSql: "e.id = ANY($1::bigint[])",
+              values: [ids],
+              orderBy: "e.id ASC",
+            })
+          : [],
+      };
+    }
+    case "InsertEk": {
+      const rows = await directInsert({
+        tableName: "ekler",
+        object: {
+          ad: variables.ad,
+          aciklama: variables.aciklama ?? null,
+          fiyat: variables.fiyat,
+          pdf_url: variables.pdf_url,
+          photo_url: variables.photo_url ?? null,
+          is_public: variables.is_public ?? true,
+        },
+        returning: "id::bigint AS id",
+      });
+      return { insert_ekler_one: rows[0] || null };
+    }
+    case "UpdateEk": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_ekler_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "ekler",
+        id,
+        object: {
+          ad: variables.ad,
+          aciklama: variables.aciklama ?? null,
+          fiyat: variables.fiyat,
+          pdf_url: variables.pdf_url,
+          photo_url: variables.photo_url ?? null,
+          is_public: variables.is_public,
+        },
+        returning: "id::bigint AS id",
+      });
+      return { update_ekler_by_pk: rows[0] || null };
+    }
+    case "DeleteEk": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "ekler",
+            id,
+            returning: "id::bigint AS id",
+          })
+        : [];
+      return { delete_ekler_by_pk: rows[0] || null };
+    }
+    case "GetAuthors": {
+      return { authors: await selectAuthorsDirect({ orderBy: "id ASC" }) };
+    }
+    case "AddAuthor": {
+      const rows = await directInsert({
+        tableName: "authors",
+        object: { name: variables.name },
+        returning: "id::int AS id",
+      });
+      return { insert_authors_one: rows[0] || null };
+    }
+    case "UpdateAuthor": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_authors_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "authors",
+        id,
+        object: { name: variables.name },
+        returning: "id::int AS id",
+      });
+      return { update_authors_by_pk: rows[0] || null };
+    }
+    case "DeleteAuthor": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({ tableName: "authors", id, returning: "id::int AS id" })
+        : [];
+      return { delete_authors_by_pk: rows[0] || null };
+    }
+    case "GetCategories": {
+      return { categories: await selectCategoriesDirect({ orderBy: "id ASC" }) };
+    }
+    case "AddCategory": {
+      const rows = await directInsert({
+        tableName: "categories",
+        object: { name: variables.name },
+        returning: "id::int AS id",
+      });
+      return { insert_categories_one: rows[0] || null };
+    }
+    case "UpdateCategory": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_categories_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "categories",
+        id,
+        object: { name: variables.name },
+        returning: "id::int AS id",
+      });
+      return { update_categories_by_pk: rows[0] || null };
+    }
+    case "DeleteCategory": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "categories",
+            id,
+            returning: "id::int AS id",
+          })
+        : [];
+      return { delete_categories_by_pk: rows[0] || null };
+    }
+    case "GetFaqAdminList":
+    case "GetActiveFaqs": {
+      const whereSql = op === "GetActiveFaqs" ? "COALESCE(is_active, TRUE) = TRUE" : "TRUE";
+      return { faq: await selectFaqDirect({ whereSql, orderBy: "sort_order ASC, id ASC" }) };
+    }
+    case "AddFaq": {
+      const rows = await directInsert({
+        tableName: "faq",
+        object: {
+          title: variables.title,
+          description: variables.description,
+          sort_order: variables.sort_order,
+          is_active: variables.is_active,
+        },
+        returning: "id::int AS id",
+      });
+      return { insert_faq_one: rows[0] || null };
+    }
+    case "UpdateFaq": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_faq_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "faq",
+        id,
+        object: {
+          title: variables.title,
+          description: variables.description,
+          sort_order: variables.sort_order,
+          is_active: variables.is_active,
+        },
+        returning: "id::int AS id",
+      });
+      return { update_faq_by_pk: rows[0] || null };
+    }
+    case "DeleteFaq": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({ tableName: "faq", id, returning: "id::int AS id" })
+        : [];
+      return { delete_faq_by_pk: rows[0] || null };
+    }
+    case "GetSliders": {
+      const whereSql = op === "GetSliders" && req?.query?.onlyActive === "true"
+        ? "COALESCE(is_active, TRUE) = TRUE"
+        : "TRUE";
+      return { slider: await selectSlidersDirect({ whereSql, orderBy: "sort_order ASC, created_at DESC" }) };
+    }
+    case "AddSlider": {
+      const rows = await directInsert({
+        tableName: "slider",
+        object: {
+          title: variables.title,
+          subtitle: variables.subtitle ?? null,
+          description: variables.description ?? null,
+          image_url: variables.image_url,
+          link_url: variables.link_url ?? null,
+          sort_order: variables.sort_order,
+          is_active: variables.is_active,
+        },
+        returning: "id::int AS id",
+      });
+      return { insert_slider_one: rows[0] || null };
+    }
+    case "UpdateSlider": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_slider_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "slider",
+        id,
+        object: {
+          title: variables.title,
+          subtitle: variables.subtitle ?? null,
+          description: variables.description ?? null,
+          image_url: variables.image_url,
+          link_url: variables.link_url ?? null,
+          sort_order: variables.sort_order,
+          is_active: variables.is_active,
+        },
+        returning: "id::int AS id",
+      });
+      return { update_slider_by_pk: rows[0] || null };
+    }
+    case "DeleteSlider": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({ tableName: "slider", id, returning: "id::int AS id" })
+        : [];
+      return { delete_slider_by_pk: rows[0] || null };
+    }
+    case "GetMagazineTypes": {
+      return { magazine_type: await selectMagazineTypesDirect({ orderBy: "sort_order ASC, id ASC" }) };
+    }
+    case "CreateMagazineType": {
+      const rows = await directInsert({
+        tableName: "magazine_type",
+        object: {
+          title: variables.title,
+          duration_months: variables.duration_months,
+          is_active: variables.is_active,
+          sort_order: variables.sort_order,
+        },
+        returning: "id::int AS id",
+      });
+      return { insert_magazine_type_one: rows[0] || null };
+    }
+    case "UpdateMagazineType": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_magazine_type_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "magazine_type",
+        id,
+        object: {
+          title: variables.title,
+          duration_months: variables.duration_months,
+          is_active: variables.is_active,
+          sort_order: variables.sort_order,
+        },
+        returning: "id::int AS id",
+      });
+      return { update_magazine_type_by_pk: rows[0] || null };
+    }
+    case "DeleteMagazineType": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "magazine_type",
+            id,
+            returning: "id::int AS id",
+          })
+        : [];
+      return { delete_magazine_type_by_pk: rows[0] || null };
+    }
+    case "GetNewspaperSubscriptionTypes": {
+      return {
+        newspaper_subscription_type: await selectNewspaperSubscriptionTypesDirect({
+          orderBy: "sort_order ASC, id DESC",
+        }),
+      };
+    }
+    case "CreateNewspaperSubscriptionType": {
+      const rows = await directInsert({
+        tableName: "newspaper_subscription_type",
+        object: {
+          title: variables.title,
+          duration_months: variables.duration_months,
+          price: variables.price,
+          is_active: variables.is_active,
+          sort_order: variables.sort_order,
+        },
+        returning: "id::bigint AS id",
+      });
+      return { insert_newspaper_subscription_type_one: rows[0] || null };
+    }
+    case "UpdateNewspaperSubscriptionType": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_newspaper_subscription_type_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "newspaper_subscription_type",
+        id,
+        object: {
+          title: variables.title,
+          duration_months: variables.duration_months,
+          price: variables.price,
+          is_active: variables.is_active,
+          sort_order: variables.sort_order,
+        },
+        returning: "id::bigint AS id",
+      });
+      return { update_newspaper_subscription_type_by_pk: rows[0] || null };
+    }
+    case "DeleteNewspaperSubscriptionType": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "newspaper_subscription_type",
+            id,
+            returning: "id::bigint AS id",
+          })
+        : [];
+      return { delete_newspaper_subscription_type_by_pk: rows[0] || null };
+    }
+    case "GetMagazineTypePrices": {
+      const magazineId = toPositiveIntOrNull(variables.magazine_id);
+      return {
+        magazine_type_price: magazineId
+          ? await selectMagazineTypePricesDirect({
+              whereSql: "mtp.magazine_id = $1::bigint",
+              values: [magazineId],
+              orderBy: "mtp.sort_order ASC, mtp.id ASC",
+              includeTypes: true,
+            })
+          : [],
+      };
+    }
+    case "GetActiveMagazineTypePrices": {
+      const magazineId = toPositiveIntOrNull(variables.magazine_id);
+      return {
+        magazine_type_price: magazineId
+          ? await selectMagazineTypePricesDirect({
+              whereSql: "mtp.magazine_id = $1::bigint AND COALESCE(mtp.is_active, TRUE) = TRUE",
+              values: [magazineId],
+              orderBy: "mtp.sort_order ASC, mtp.id ASC",
+              includeTypes: true,
+            })
+          : [],
+      };
+    }
+    case "GetMagazineTypesByIds": {
+      const ids = (variables.ids || []).map((value) => Number.parseInt(value, 10)).filter((v) => Number.isInteger(v) && v > 0);
+      return {
+        magazine_type: ids.length
+          ? await selectMagazineTypesDirect({
+              whereSql: "id = ANY($1::bigint[])",
+              values: [ids],
+              orderBy: "id ASC",
+            })
+          : [],
+      };
+    }
+    case "GetNewspaperTypesByIds": {
+      const ids = (variables.ids || []).map((value) => Number.parseInt(value, 10)).filter((v) => Number.isInteger(v) && v > 0);
+      return {
+        newspaper_subscription_type: ids.length
+          ? await selectNewspaperSubscriptionTypesDirect({
+              whereSql: "id = ANY($1::bigint[])",
+              values: [ids],
+              orderBy: "id ASC",
+            })
+          : [],
+      };
+    }
+    case "InsertMagazineTypePrices": {
+      const items = Array.isArray(variables.items) ? variables.items : [];
+      if (!items.length) return { insert_magazine_type_price: { affected_rows: 0 } };
+      const rows = [];
+      for (const item of items) {
+        const inserted = await directInsert({
+          tableName: "magazine_type_price",
+          object: {
+            magazine_id: item.magazine_id,
+            magazine_type_id: item.magazine_type_id,
+            price: item.price,
+            is_active: item.is_active ?? true,
+            sort_order: item.sort_order ?? 0,
+          },
+          returning: "id::int AS id",
+        });
+        rows.push(...inserted);
+      }
+      return { insert_magazine_type_price: { affected_rows: rows.length } };
+    }
+    case "DeleteMagazineTypePrices": {
+      const magazineId = toPositiveIntOrNull(variables.magazine_id);
+      if (!magazineId) return { delete_magazine_type_price: { affected_rows: 0 } };
+      const rows = await homePostgresQuery(
+        `DELETE FROM public.magazine_type_price WHERE magazine_id = $1::bigint RETURNING id`,
+        [magazineId]
+      );
+      return { delete_magazine_type_price: { affected_rows: rows.length } };
+    }
+    case "AdminPromoCodes":
+      return { promo_codes: await selectPromoCodesDirect({ orderBy: "created_at DESC, id DESC" }) };
+    case "InsertPromoCode": {
+      const rows = await directInsert({
+        tableName: "promo_codes",
+        object: {
+          code: variables.code,
+          discount_percent: variables.discount_percent,
+          starts_at: variables.starts_at,
+          ends_at: variables.ends_at,
+          is_active: variables.is_active,
+          usage_limit: variables.usage_limit ?? null,
+          usage_count: 0,
+        },
+        returning: "id::bigint AS id",
+      });
+      return { insert_promo_codes_one: rows[0] || null };
+    }
+    case "TogglePromo": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_promo_codes_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "promo_codes",
+        id,
+        object: { is_active: toBool(variables.is_active) },
+        returning: "id::bigint AS id",
+      });
+      return { update_promo_codes_by_pk: rows[0] || null };
+    }
+    case "DeletePromo": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "promo_codes",
+            id,
+            returning: "id::bigint AS id",
+          })
+        : [];
+      return { delete_promo_codes_by_pk: rows[0] || null };
+    }
+    case "PromoCode": {
+      const code = String(variables.code || "").trim();
+      const rows = code
+        ? await selectPromoCodesDirect({
+            whereSql: "LOWER(code) = LOWER($1::text) AND COALESCE(is_active, TRUE) = TRUE",
+            values: [code],
+            limit: 1,
+            orderBy: "created_at DESC, id DESC",
+          })
+        : [];
+      return { promo_codes: rows };
+    }
+    case "IncreaseUsage": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_promo_codes_by_pk: null };
+      const rows = await homePostgresQuery(
+        `UPDATE public.promo_codes SET usage_count = COALESCE(usage_count, 0) + 1 WHERE id = $1::bigint RETURNING id::bigint AS id`,
+        [id]
+      );
+      return { update_promo_codes_by_pk: rows[0] || null };
+    }
+    case "AdminAllReviews":
+      return { product_reviews: await selectReviewsDirect({ orderBy: "created_at DESC, id DESC" }) };
+    case "AdminProductReviews": {
+      const productType = String(variables.product_type || "").trim();
+      const productId = toPositiveIntOrNull(variables.product_id);
+      const rows = productId
+        ? await selectReviewsDirect({
+            whereSql: "product_type = $1::text AND product_id = $2::bigint",
+            values: [productType, productId],
+            orderBy: "created_at DESC, id DESC",
+          })
+        : [];
+      const stats = await homePostgresQuery(
+        `
+          SELECT
+            COUNT(*)::int AS count,
+            AVG(rating)::numeric AS avg_rating
+          FROM public.product_reviews
+          WHERE product_type = $1::text AND product_id = $2::bigint
+        `,
+        [productType, productId || 0]
+      ).catch(() => [{ count: 0, avg_rating: null }]);
+      return {
+        product_reviews: rows,
+        product_reviews_aggregate: {
+          aggregate: {
+            count: stats[0]?.count ?? 0,
+            avg: { rating: stats[0]?.avg_rating ? Number(stats[0].avg_rating) : null },
+          },
+        },
+      };
+    }
+    case "UpdateReviewStatus": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_product_reviews_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "product_reviews",
+        id,
+        object: { status: variables.status },
+        returning: "id::bigint AS id",
+      });
+      return { update_product_reviews_by_pk: rows[0] || null };
+    }
+    case "DeleteReview": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "product_reviews",
+            id,
+            returning: "id::bigint AS id",
+          })
+        : [];
+      return { delete_product_reviews_by_pk: rows[0] || null };
+    }
+    case "InsertReview": {
+      const rows = await directInsert({
+        tableName: "product_reviews",
+        object: {
+          product_type: variables.product_type,
+          product_id: variables.product_id,
+          user_id: variables.user_id,
+          rating: variables.rating,
+          comment: variables.comment,
+          user_name: variables.user_name ?? null,
+          user_email: variables.user_email ?? null,
+          product_title: variables.product_title ?? null,
+          status: variables.status ?? "pending",
+        },
+        returning: "id::bigint AS id",
+      });
+      return { insert_product_reviews_one: rows[0] || null };
+    }
+    case "ProductReviews": {
+      const productType = String(variables.product_type || "").trim();
+      const productId = toPositiveIntOrNull(variables.product_id);
+      const rows = productId
+        ? await selectReviewsDirect({
+            whereSql: "product_type = $1::text AND product_id = $2::bigint AND status = 'published'",
+            values: [productType, productId],
+            orderBy: "created_at DESC, id DESC",
+          })
+        : [];
+      const stats = await homePostgresQuery(
+        `
+          SELECT
+            COUNT(*)::int AS count,
+            AVG(rating)::numeric AS avg_rating
+          FROM public.product_reviews
+          WHERE product_type = $1::text AND product_id = $2::bigint AND status = 'published'
+        `,
+        [productType, productId || 0]
+      ).catch(() => [{ count: 0, avg_rating: null }]);
+      return {
+        product_reviews: rows,
+        product_reviews_aggregate: {
+          aggregate: {
+            count: stats[0]?.count ?? 0,
+            avg: { rating: stats[0]?.avg_rating ? Number(stats[0].avg_rating) : null },
+          },
+        },
+      };
+    }
+    case "AdminContactMessages":
+    case "AdminContactMessagesFallback": {
+      return {
+        contact_messages: await selectContactMessagesDirect({
+          orderBy: op === "AdminContactMessagesFallback" ? "id DESC" : "created_at DESC, id DESC",
+          includeUser: true,
+        }),
+      };
+    }
+    case "AdminContactMessageUsers": {
+      const ids = (variables.ids || []).map((value) => Number.parseInt(value, 10)).filter((v) => Number.isInteger(v) && v > 0);
+      return {
+        users: ids.length
+          ? await selectUsersDirect({
+              whereSql: "u.id = ANY($1::bigint[])",
+              values: [ids],
+              includeRole: true,
+              orderBy: "u.id ASC",
+            })
+          : [],
+      };
+    }
+    case "DeleteContactMessage": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "contact_messages",
+            id,
+            returning: "id::bigint AS id",
+          })
+        : [];
+      return { delete_contact_messages_by_pk: rows[0] || null };
+    }
+    case "AdminStats": {
+      const today = new Date();
+      const startOfDay = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+      const lastMonth = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      const [booksCount, magazinesCount, newspapersCount, ordersCount, usersCount, ordersToday, ordersLastMonth] = await Promise.all([
+        directCount({ tableName: "books" }),
+        directCount({ tableName: "magazine" }),
+        directCount({ tableName: "newspaper" }),
+        directCount({ tableName: "orders" }),
+        directCount({ tableName: "users" }),
+        homePostgresQuery(`SELECT COUNT(*)::int AS count FROM public.orders WHERE created_at >= $1::timestamptz`, [startOfDay.toISOString()]).then((rows) => Number(rows[0]?.count || 0)).catch(() => 0),
+        homePostgresQuery(`SELECT COUNT(*)::int AS count FROM public.orders WHERE created_at >= $1::timestamptz`, [lastMonth.toISOString()]).then((rows) => Number(rows[0]?.count || 0)).catch(() => 0),
+      ]);
+      return {
+        books_aggregate: { aggregate: { count: booksCount } },
+        magazine_aggregate: { aggregate: { count: magazinesCount } },
+        newspaper_aggregate: { aggregate: { count: newspapersCount } },
+        orders_aggregate: { aggregate: { count: ordersCount } },
+        users_aggregate: { aggregate: { count: usersCount } },
+        orders_today: { aggregate: { count: ordersToday } },
+        orders_last_month: { aggregate: { count: ordersLastMonth } },
+      };
+    }
+    case "AdminReport": {
+      const type = String(variables.type || "").trim();
+      const start = variables.start ? new Date(variables.start) : null;
+      const end = variables.end ? new Date(variables.end) : null;
+      const whereParts = ["product_type = $1::text"];
+      const params = [type];
+      if (start) {
+        params.push(start.toISOString());
+        whereParts.push(`created_at >= $${params.length}::timestamptz`);
+      }
+      if (end) {
+        params.push(end.toISOString());
+        whereParts.push(`created_at <= $${params.length}::timestamptz`);
+      }
+      const whereSql = whereParts.join(" AND ");
+      const rows = await homePostgresQuery(
+        `
+          SELECT
+            id::bigint AS id,
+            title,
+            quantity::int AS quantity,
+            unit_price,
+            line_total,
+            created_at
+          FROM public.order_items
+          WHERE ${whereSql}
+          ORDER BY line_total DESC NULLS LAST, id DESC
+          LIMIT 100
+        `,
+        params
+      );
+      const agg = await homePostgresQuery(
+        `
+          SELECT
+            COUNT(*)::int AS count,
+            COALESCE(SUM(line_total), 0)::numeric AS revenue,
+            COALESCE(AVG(unit_price), 0)::numeric AS avg_price
+          FROM public.order_items
+          WHERE ${whereSql}
+        `,
+        params
+      );
+      return {
+        agg: {
+          aggregate: {
+            count: Number(agg[0]?.count || 0),
+            sum: { line_total: Number(agg[0]?.revenue || 0) },
+            avg: { unit_price: Number(agg[0]?.avg_price || 0) },
+          },
+        },
+        items: rows,
+      };
+    }
+    case "GetHomeShowcase": {
+      const type = String(variables.type || "").trim();
+      const isActive = query.includes("is_active: {_eq: true}");
+      const rows = await selectHomeShowcaseDirect({
+        whereSql: isActive
+          ? "product_type = $1::text AND COALESCE(is_active, TRUE) = TRUE"
+          : "product_type = $1::text",
+        values: [type],
+        orderBy: "sort_order ASC NULLS LAST, created_at DESC",
+      });
+      return { home_showcase: rows };
+    }
+    case "AddHomeShowcase": {
+      const rows = await directInsert({
+        tableName: "home_showcase",
+        object: {
+          product_type: variables.product_type,
+          product_id: variables.product_id,
+          sort_order: variables.sort_order,
+          is_active: variables.is_active,
+        },
+        returning: "id::bigint AS id",
+      });
+      return { insert_home_showcase_one: rows[0] || null };
+    }
+    case "UpdateHomeShowcaseOrder": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_home_showcase_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "home_showcase",
+        id,
+        object: { sort_order: variables.sort_order },
+        returning: "id::bigint AS id",
+      });
+      return { update_home_showcase_by_pk: rows[0] || null };
+    }
+    case "DeleteHomeShowcase": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "home_showcase",
+            id,
+            returning: "id::bigint AS id",
+          })
+        : [];
+      return { delete_home_showcase_by_pk: rows[0] || null };
+    }
+    case "GetAddresses": {
+      const userId = toPositiveIntOrNull(variables.user_id);
+      return {
+        user_addresses: userId
+          ? await selectUserAddressesDirect({
+              whereSql: "user_id = $1::bigint",
+              values: [userId],
+              orderBy: "created_at DESC, id DESC",
+            })
+          : [],
+      };
+    }
+    case "GetAddressById": {
+      const id = toPositiveIntOrNull(variables.id);
+      return {
+        user_addresses_by_pk: id
+          ? (await selectUserAddressesDirect({
+              whereSql: "id = $1::bigint",
+              values: [id],
+              orderBy: "created_at DESC, id DESC",
+              limit: 1,
+            }))[0] || null
+          : null,
+      };
+    }
+    case "InsertUserAddress": {
+      const rows = await directInsert({
+        tableName: "user_addresses",
+        object: {
+          user_id: variables.user_id,
+          address_type: variables.address_type,
+          address_name: variables.address_name,
+          country: variables.country,
+          city: variables.city,
+          district: variables.district,
+          full_address: variables.full_address,
+          postal_code: variables.postal_code ?? null,
+          tax_or_tc_no: variables.tax_or_tc_no ?? null,
+          tax_address: variables.tax_address ?? null,
+          company_name: variables.company_name ?? null,
+        },
+        returning: "id::bigint AS id",
+      });
+      return { insert_user_addresses_one: rows[0] || null };
+    }
+    case "UpdateUserAddress": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_user_addresses_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "user_addresses",
+        id,
+        object: {
+          address_type: variables.address_type,
+          address_name: variables.address_name,
+          country: variables.country,
+          city: variables.city,
+          district: variables.district,
+          full_address: variables.full_address,
+          postal_code: variables.postal_code ?? null,
+          tax_or_tc_no: variables.tax_or_tc_no ?? null,
+          tax_address: variables.tax_address ?? null,
+          company_name: variables.company_name ?? null,
+        },
+        returning: "id::bigint AS id",
+      });
+      return { update_user_addresses_by_pk: rows[0] || null };
+    }
+    case "DeleteAddress": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "user_addresses",
+            id,
+            returning: "id::bigint AS id",
+          })
+        : [];
+      return { delete_user_addresses_by_pk: rows[0] || null };
+    }
+    case "GetOrders": {
+      const userId = toPositiveIntOrNull(variables.user_id);
+      return {
+        orders: userId
+          ? await getUserOrdersFromPostgres({ userId, includeItems: false })
+          : [],
+      };
+    }
+    case "GetOrderItems": {
+      const orderIds = (variables.order_ids || [])
+        .map((value) => Number.parseInt(value, 10))
+        .filter((value) => Number.isInteger(value) && value > 0);
+      if (!orderIds.length) return { order_items: [] };
+      const rows = await homePostgresQuery(
+        `
+          SELECT
+            id::bigint AS id,
+            order_id::bigint AS order_id,
+            product_id::bigint AS product_id,
+            ek_id::bigint AS ek_id,
+            title,
+            quantity::int AS quantity,
+            unit_price,
+            line_total,
+            product_type,
+            metadata,
+            created_at
+          FROM public.order_items
+          WHERE order_id = ANY($1::bigint[])
+          ORDER BY id ASC
+        `,
+        [orderIds]
+      );
+      return { order_items: rows };
+    }
+    case "GetOrderDetail": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) {
+        return { orders_by_pk: null, order_items: [] };
+      }
+      const userId = extractJwtUserId(req?.jwt);
+      const order = await getUserOrderDetailFromPostgres({ userId, orderId: id });
+      if (!order) {
+        return { orders_by_pk: null, order_items: [] };
+      }
+      const { order_items = [], ...orderRow } = order;
+      return { orders_by_pk: orderRow, order_items };
+    }
+    case "CreateOrder": {
+      const rows = await homePostgresQuery(
+        `
+          INSERT INTO public.orders (
+            user_id,
+            delivery_address_id,
+            billing_address_id,
+            total_paid,
+            status,
+            promo_code_id,
+            promo_code,
+            promo_discount_percent,
+            promo_discount_amount,
+            payment_provider,
+            merchant_payment_id,
+            payment_session_token,
+            payment_approved,
+            payment_response_code,
+            payment_response_msg,
+            payment_error_code,
+            payment_error_msg
+          ) VALUES (
+            $1::bigint,
+            $2::bigint,
+            $3::bigint,
+            $4::numeric,
+            $5::order_status,
+            $6::bigint,
+            $7::text,
+            $8::numeric,
+            $9::numeric,
+            $10::text,
+            $11::text,
+            $12::text,
+            $13::boolean,
+            $14::text,
+            $15::text,
+            $16::text,
+            $17::text
+          )
+          RETURNING
+            id::bigint AS id,
+            total_paid,
+            created_at,
+            promo_code,
+            promo_discount_percent,
+            promo_discount_amount,
+            payment_provider
+        `,
+        [
+          variables.user_id,
+          variables.delivery_address_id,
+          variables.billing_address_id,
+          variables.total_paid,
+          variables.status,
+          variables.promo_code_id ?? null,
+          variables.promo_code ?? null,
+          variables.promo_discount_percent ?? null,
+          variables.promo_discount_amount ?? null,
+          variables.payment_provider ?? null,
+          variables.merchant_payment_id ?? null,
+          variables.payment_session_token ?? null,
+          variables.payment_approved ?? null,
+          variables.payment_response_code ?? null,
+          variables.payment_response_msg ?? null,
+          variables.payment_error_code ?? null,
+          variables.payment_error_msg ?? null,
+        ]
+      );
+      return { insert_orders_one: rows[0] || null };
+    }
+    case "InsertItems": {
+      const items = Array.isArray(variables.items) ? variables.items : [];
+      if (!items.length) return { insert_order_items: { affected_rows: 0 } };
+      const normalizedItems = items.map((item) => ({
+        order_id: item.order_id,
+        product_id: item.product_id ?? null,
+        ek_id: item.ek_id ?? null,
+        title: item.title,
+        quantity: item.quantity,
+        unit_price: item.unit_price,
+        line_total: item.line_total,
+        product_type: item.product_type,
+        metadata: item.metadata ?? null,
+      }));
+      for (const item of normalizedItems) {
+        await directInsert({
+          tableName: "order_items",
+          object: item,
+          returning: "id::bigint AS id",
+        });
+      }
+      return { insert_order_items: { affected_rows: normalizedItems.length } };
+    }
+    case "UpdateOrderPayment": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_orders_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "orders",
+        id,
+        object: {
+          status: variables.status,
+          payment_approved: variables.payment_approved ?? null,
+          payment_response_code: variables.payment_response_code ?? null,
+          payment_response_msg: variables.payment_response_msg ?? null,
+          payment_error_code: variables.payment_error_code ?? null,
+          payment_error_msg: variables.payment_error_msg ?? null,
+        },
+        returning: "id::bigint AS id",
+      });
+      return { update_orders_by_pk: rows[0] || null };
+    }
+    case "GetAllOrders": {
+      return {
+        orders: await selectOrdersDirect({
+          orderBy: "o.created_at DESC, o.id DESC",
+          includeUser: true,
+        }),
+      };
+    }
+    case "GetUserNotifications": {
+      const where = variables.where || {};
+      const userId = toPositiveIntOrNull(where?.user_id?._eq);
+      const isRead = where?.is_read?._eq;
+      const clauses = [];
+      const values = [];
+      if (userId) {
+        values.push(userId);
+        clauses.push(`n.user_id = $${values.length}::bigint`);
+      }
+      if (isRead !== undefined) {
+        values.push(isRead);
+        clauses.push(`n.is_read = $${values.length}::boolean`);
+      }
+      return {
+        notifications: await selectNotificationsDirect({
+          whereSql: clauses.length ? clauses.join(" AND ") : "TRUE",
+          values,
+          orderBy: "n.created_at DESC, n.id DESC",
+        }),
+      };
+    }
+    case "GetNotificationDetail": {
+      const id = toPositiveIntOrNull(variables.id);
+      return {
+        notifications_by_pk: id
+          ? (await selectNotificationsDirect({
+              whereSql: "n.id = $1::bigint",
+              values: [id],
+              orderBy: "n.created_at DESC, n.id DESC",
+              limit: 1,
+            }))[0] || null
+          : null,
+      };
+    }
+    case "GetAdminNotifications": {
+      const where = variables.where || {};
+      const limit = toPositiveIntOrNull(variables.limit) || 200;
+      const clauses = [];
+      const values = [];
+      const andNodes = Array.isArray(where?._and) ? where._and : [];
+      for (const node of andNodes) {
+        if (node?.is_read?._eq !== undefined) {
+          values.push(node.is_read._eq);
+          clauses.push(`n.is_read = $${values.length}::boolean`);
+        }
+        const orNodes = Array.isArray(node?._or) ? node._or : [];
+        const searchTerm = orNodes
+          .map((entry) => entry?.title?._ilike || entry?.body?._ilike || "")
+          .find((text) => text);
+        if (searchTerm) {
+          values.push(searchTerm);
+          clauses.push(`(n.title ILIKE $${values.length} OR n.body ILIKE $${values.length})`);
+        }
+      }
+      return {
+        notifications: await selectNotificationsDirect({
+          whereSql: clauses.length ? clauses.join(" AND ") : "TRUE",
+          values,
+          orderBy: "n.created_at DESC, n.id DESC",
+          limit,
+          includeUser: true,
+        }),
+      };
+    }
+    case "UpdateNotificationRead": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_notifications_by_pk: null };
+      const rows = await directUpdateByPk({
+        tableName: "notifications",
+        id,
+        object: { is_read: toBool(variables.is_read) },
+        returning: "id::bigint AS id",
+      });
+      return { update_notifications_by_pk: rows[0] || null };
+    }
+    case "DeleteNotification": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "notifications",
+            id,
+            returning: "id::bigint AS id",
+          })
+        : [];
+      return { delete_notifications_by_pk: rows[0] || null };
+    }
+    case "LogError": {
+      const input = variables.input || {};
+      const rows = await homePostgresQuery(
+        `
+          INSERT INTO public.app_error_logs (
+            service,
+            operation,
+            message,
+            stack_trace,
+            payload
+          ) VALUES ($1::text, $2::text, $3::text, $4::text, $5::jsonb)
+          RETURNING id
+        `,
+        [
+          input.service || "Client",
+          input.operation || "logError",
+          input.message || "Unknown error",
+          input.stack_trace || null,
+          input.payload ? JSON.stringify(input.payload) : null,
+        ]
+      );
+      return { insert_app_error_logs_one: rows[0] || null };
+    }
+    case "GetUserAccess":
+    case "GetUserAccessAll":
+    case "GetExportAccess": {
+      const userIds = op === "GetExportAccess" ? (variables.user_ids || []) : [variables.user_id];
+      if (!Array.isArray(userIds) || !userIds.length) {
+        return { user_content_access: [] };
+      }
+      const normalizedIds = userIds
+        .map((value) => Number.parseInt(value, 10))
+        .filter((value) => Number.isInteger(value) && value > 0);
+      if (!normalizedIds.length) return { user_content_access: [] };
+      const includeManual = true;
+      const access = await selectUserContentAccessDirect({
+        whereSql: op === "GetUserAccess"
+          ? "user_id = $1::bigint AND is_active = TRUE"
+          : op === "GetUserAccessAll"
+            ? "user_id = $1::bigint"
+            : "user_id = ANY($1::bigint[]) AND is_active = TRUE",
+        values: op === "GetExportAccess" ? [normalizedIds] : [normalizedIds[0]],
+        orderBy: "started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC",
+        includeManual,
+      });
+      return { user_content_access: access };
+    }
+    case "GetManualNewspaperAccess": {
+      const userId = toPositiveIntOrNull(variables.user_id);
+      if (!userId) return { manual_newspaper_users: [] };
+      const rows = await homePostgresQuery(
+        `
+          SELECT
+            id::bigint AS id,
+            user_id::bigint AS user_id,
+            starts_at,
+            ends_at,
+            is_active,
+            COALESCE(status, 'new') AS status,
+            note,
+            created_at,
+            updated_at
+          FROM public.manual_newspaper_users
+          WHERE user_id = $1::bigint
+          ORDER BY is_active DESC, ends_at ASC NULLS LAST, id DESC
+        `,
+        [userId]
+      );
+      return { manual_newspaper_users: rows };
+    }
+    case "GetManualNewspaperAccessForUsers": {
+      const userIds = (variables.user_ids || [])
+        .map((value) => Number.parseInt(value, 10))
+        .filter((value) => Number.isInteger(value) && value > 0);
+      if (!userIds.length) return { manual_newspaper_users: [] };
+      const rows = await homePostgresQuery(
+        `
+          SELECT
+            id::bigint AS id,
+            user_id::bigint AS user_id,
+            starts_at,
+            ends_at,
+            is_active,
+            COALESCE(status, 'new') AS status,
+            note,
+            created_at,
+            updated_at
+          FROM public.manual_newspaper_users
+          WHERE user_id = ANY($1::bigint[])
+          ORDER BY user_id ASC, ends_at DESC NULLS LAST, id DESC
+        `,
+        [userIds]
+      );
+      return { manual_newspaper_users: rows };
+    }
+    case "ListManualNewspaperUsers": {
+      const rows = await homePostgresQuery(
+        `
+          SELECT
+            id::bigint AS id,
+            user_id::bigint AS user_id,
+            starts_at,
+            ends_at,
+            is_active,
+            COALESCE(status, 'new') AS status,
+            note,
+            created_at,
+            updated_at
+          FROM public.manual_newspaper_users
+          ORDER BY is_active DESC, ends_at ASC NULLS LAST, id DESC
+        `
+      );
+      return { manual_newspaper_users: rows };
+    }
+    case "SearchManualUsers":
+    case "SearchManualUsersFallback": {
+      const limit = toPositiveIntOrNull(variables.limit) || 20;
+      const keyword = String(variables.keyword || "").trim();
+      const sql = keyword
+        ? `
+          SELECT
+            id::bigint AS id,
+            name,
+            email
+          FROM public.users
+          WHERE name ILIKE $1::text OR email ILIKE $1::text
+          ORDER BY id DESC
+          LIMIT $2::int
+        `
+        : `
+          SELECT
+            id::bigint AS id,
+            name,
+            email
+          FROM public.users
+          ORDER BY id DESC
+          LIMIT $1::int
+        `;
+      const rows = await homePostgresQuery(
+        sql,
+        keyword ? [keyword, limit] : [limit]
+      );
+      return { users: rows };
+    }
+    case "GetManualNewspaperUsersByIds": {
+      const ids = (variables.ids || [])
+        .map((value) => Number.parseInt(value, 10))
+        .filter((value) => Number.isInteger(value) && value > 0);
+      if (!ids.length) return { users: [] };
+      return {
+        users: await selectUsersDirect({
+          whereSql: "u.id = ANY($1::bigint[])",
+          values: [ids],
+          includeRole: false,
+          orderBy: "u.id ASC",
+        }),
+      };
+    }
+    case "UpsertManualNewspaperUser": {
+      const object = variables.object || {};
+      const rows = await homePostgresQuery(
+        `
+          INSERT INTO public.manual_newspaper_users (
+            user_id,
+            starts_at,
+            ends_at,
+            is_active,
+            status,
+            note,
+            updated_at
+          ) VALUES ($1::bigint, $2::timestamptz, $3::timestamptz, $4::boolean, $5::text, $6::text, $7::timestamptz)
+          ON CONFLICT (user_id) DO UPDATE SET
+            starts_at = EXCLUDED.starts_at,
+            ends_at = EXCLUDED.ends_at,
+            is_active = EXCLUDED.is_active,
+            status = EXCLUDED.status,
+            note = EXCLUDED.note,
+            updated_at = EXCLUDED.updated_at
+          RETURNING id::bigint AS id
+        `,
+        [
+          object.user_id,
+          object.starts_at,
+          object.ends_at,
+          object.is_active,
+          object.status || "new",
+          object.note ?? null,
+          object.updated_at || new Date().toISOString(),
+        ]
+      );
+      return { insert_manual_newspaper_users_one: rows[0] || null };
+    }
+    case "UpdateManualNewspaperUser": {
+      const id = toPositiveIntOrNull(variables.id);
+      if (!id) return { update_manual_newspaper_users_by_pk: null };
+      const set = variables._set || {};
+      const rows = await homePostgresQuery(
+        `
+          UPDATE public.manual_newspaper_users
+          SET starts_at = COALESCE($2::timestamptz, starts_at),
+              ends_at = COALESCE($3::timestamptz, ends_at),
+              is_active = COALESCE($4::boolean, is_active),
+              status = COALESCE($5::text, status),
+              note = COALESCE($6::text, note),
+              updated_at = COALESCE($7::timestamptz, NOW())
+          WHERE id = $1::bigint
+          RETURNING id::bigint AS id
+        `,
+        [
+          id,
+          set.starts_at || null,
+          set.ends_at || null,
+          set.is_active ?? null,
+          set.status || null,
+          set.note ?? null,
+          set.updated_at || new Date().toISOString(),
+        ]
+      );
+      return { update_manual_newspaper_users_by_pk: rows[0] || null };
+    }
+    case "DeleteManualNewspaperUser": {
+      const id = toPositiveIntOrNull(variables.id);
+      const rows = id
+        ? await directDeleteByPk({
+            tableName: "manual_newspaper_users",
+            id,
+            returning: "id::bigint AS id",
+          })
+        : [];
+      return { delete_manual_newspaper_users_by_pk: rows[0] || null };
+    }
+    case "InsertUserAccessAuditLog": {
+      const object = variables.object || {};
+      const rows = await homePostgresQuery(
+        `
+          INSERT INTO public.user_access_audit_log (
+            user_id,
+            actor_user_id,
+            action,
+            item_type,
+            item_id,
+            item_title,
+            access_source,
+            previous_expires_at,
+            new_expires_at,
+            note
+          ) VALUES ($1::bigint, $2::bigint, $3::text, $4::text, $5::bigint, $6::text, $7::text, $8::timestamptz, $9::timestamptz, $10::text)
+          RETURNING id::bigint AS id
+        `,
+        [
+          object.user_id,
+          object.actor_user_id ?? null,
+          object.action,
+          object.item_type,
+          object.item_id ?? null,
+          object.item_title ?? null,
+          object.access_source ?? null,
+          object.previous_expires_at ?? null,
+          object.new_expires_at ?? null,
+          object.note ?? null,
+        ]
+      );
+      return { insert_user_access_audit_log_one: rows[0] || null };
+    }
+    case "GetUserAccessAuditLog": {
+      const userId = toPositiveIntOrNull(variables.user_id);
+      const limit = toPositiveIntOrNull(variables.limit) || 20;
+      return {
+        user_access_audit_log: userId
+          ? await selectUserAccessAuditLogsDirect({
+              userId,
+              limit,
+              includeActors: true,
+            })
+          : [],
+      };
+    }
+    case "GetAuditActors": {
+      const ids = (variables.ids || [])
+        .map((value) => Number.parseInt(value, 10))
+        .filter((value) => Number.isInteger(value) && value > 0);
+      return {
+        users: ids.length
+          ? await selectUsersDirect({
+              whereSql: "u.id = ANY($1::bigint[])",
+              values: [ids],
+              includeRole: false,
+              orderBy: "u.id ASC",
+            })
+          : [],
+      };
+    }
+    default:
+      break;
+  }
+
+  throw new Error(`Direct GraphQL operation not implemented: ${op}`);
 };
 
 const setUserPasswordHash = async (userId, passwordHash) => {
-  await hasuraRequest(
+  await homePostgresQuery(
     `
-      mutation UpdateUserPassword($id: bigint!, $password: String!) {
-        update_users_by_pk(pk_columns: {id: $id}, _set: {password: $password}) {
-          id
-        }
-      }
+      UPDATE public.users
+      SET password = $2::text
+      WHERE id = $1::bigint
     `,
-    { id: userId, password: passwordHash }
+    [userId, passwordHash]
   );
 };
 
@@ -4963,25 +7706,45 @@ app.post("/auth/register", async (req, res) => {
       );
     }
 
-    const createUser = async () =>
-      hasuraRequest(
+    const createUser = async () => {
+      const rows = await homePostgresQuery(
         `
-          mutation CreateUser($object: users_insert_input!) {
-            insert_users_one(object: $object) {
-              id
-              name
-              email
-              phone
-              avatar_url
-              payUniqe
-              role_id
-            }
-          }
+          INSERT INTO public.users (
+            name,
+            email,
+            phone,
+            password,
+            payUniqe,
+            is_active,
+            email_verified_at
+          ) VALUES (
+            $1::text,
+            $2::text,
+            $3::text,
+            $4::text,
+            $5::text,
+            TRUE,
+            NOW()
+          )
+          RETURNING
+            id::bigint AS id,
+            name,
+            email,
+            phone,
+            avatar_url,
+            payUniqe,
+            role_id::bigint AS role_id
         `,
-        {
-          object: createPayload,
-        }
+        [
+          createPayload.name,
+          createPayload.email,
+          createPayload.phone,
+          createPayload.password,
+          createPayload.payUniqe,
+        ]
       );
+      return { insert_users_one: rows[0] || null };
+    };
 
     try {
       const created = await createUser();
@@ -5176,33 +7939,38 @@ app.post("/auth/social-login", async (req, res) => {
       );
       const payUniqe = crypto.randomUUID();
       const verifiedAt = new Date().toISOString();
-      const created = await hasuraRequest(
+      const created = await homePostgresQuery(
         `
-          mutation CreateSocialLoginUser($object: users_insert_input!) {
-            insert_users_one(object: $object) {
-              id
-              name
-              email
-              phone
-              avatar_url
-              payUniqe
-              role_id
-              email_verified_at
-            }
-          }
-        `,
-        {
-          object: {
-            name: socialName,
+          INSERT INTO public.users (
+            name,
             email,
             phone,
-            password: passwordHash,
+            password,
             payUniqe,
-            email_verified_at: verifiedAt,
-          },
-        }
+            is_active,
+            email_verified_at
+          ) VALUES (
+            $1::text,
+            $2::text,
+            $3::text,
+            $4::text,
+            $5::text,
+            TRUE,
+            $6::timestamptz
+          )
+          RETURNING
+            id::bigint AS id,
+            name,
+            email,
+            phone,
+            avatar_url,
+            payUniqe,
+            role_id::bigint AS role_id,
+            email_verified_at
+        `,
+        [socialName, email, phone, passwordHash, payUniqe, verifiedAt]
       );
-      user = created?.insert_users_one;
+      user = created?.[0] || null;
       if (!user) {
         throw new Error("Social login user creation failed.");
       }
@@ -5289,33 +8057,40 @@ app.post("/auth/social-register", async (req, res) => {
     );
     const payUniqe = crypto.randomUUID();
     const verifiedAt = new Date().toISOString();
-    const createSocialUser = async () =>
-      hasuraRequest(
+    const createSocialUser = async () => {
+      const rows = await homePostgresQuery(
         `
-          mutation CreateSocialUser($object: users_insert_input!) {
-            insert_users_one(object: $object) {
-              id
-              name
-              email
-              phone
-              avatar_url
-              payUniqe
-              role_id
-              email_verified_at
-            }
-          }
-        `,
-        {
-          object: {
+          INSERT INTO public.users (
             name,
             email,
             phone,
-            password: passwordHash,
+            password,
             payUniqe,
-            email_verified_at: verifiedAt,
-          },
-        }
+            is_active,
+            email_verified_at
+          ) VALUES (
+            $1::text,
+            $2::text,
+            $3::text,
+            $4::text,
+            $5::text,
+            TRUE,
+            $6::timestamptz
+          )
+          RETURNING
+            id::bigint AS id,
+            name,
+            email,
+            phone,
+            avatar_url,
+            payUniqe,
+            role_id::bigint AS role_id,
+            email_verified_at
+        `,
+        [name, email, phone, passwordHash, payUniqe, verifiedAt]
       );
+      return { insert_users_one: rows[0] || null };
+    };
 
     try {
       const created = await createSocialUser();
@@ -6101,23 +8876,26 @@ app.post("/hasura", requireJwt, proxyHasuraRequest);
 app.post("/internal/hasura", requireJwtOrServiceAuth, proxyHasuraRequest);
 
 const findUserById = async (userId) => {
-  const data = await hasuraRequest(
+  const normalizedUserId = toPositiveIntOrNull(userId);
+  if (!normalizedUserId) return null;
+
+  const rows = await homePostgresQuery(
     `
-      query GetUserById($id: bigint!) {
-        users_by_pk(id: $id) {
-          id
-          name
-          email
-          phone
-          avatar_url
-          role_id
-          payUniqe
-        }
-      }
+      SELECT
+        id::bigint AS id,
+        name,
+        email,
+        phone,
+        avatar_url,
+        role_id::bigint AS role_id,
+        payUniqe
+      FROM public.users
+      WHERE id = $1::bigint
+      LIMIT 1
     `,
-    { id: userId }
+    [normalizedUserId]
   );
-  return data?.users_by_pk || null;
+  return rows[0] || null;
 };
 
 const ensureAdminJwtActor = async (req) => {
@@ -6185,55 +8963,22 @@ const findUserByPayUniqe = async (payUniqe) => {
 };
 
 const setUserPayUniqe = async (userId, payUniqe) => {
-  try {
-    const normalizedValue = normalizeRevenueCatAppUserId(payUniqe);
-    if (!normalizedValue) {
-      return null;
-    }
-    const rows = await homePostgresQuery(
-      `
-        UPDATE public.users
-        SET payUniqe = $2::text
-        WHERE id = $1::bigint
-        RETURNING
-          id::bigint AS id,
-          payUniqe
-      `,
-      [userId, normalizedValue]
-    );
-    return rows[0] || null;
-  } catch (err) {
-    // Fall back to Hasura if the direct Postgres path is unavailable.
-    const runUpdate = async (value, gqlType) => {
-      const data = await hasuraRequest(
-        `
-          mutation UpdateUserPayUniqe($id: bigint!, $payUniqe: ${gqlType}) {
-            update_users_by_pk(pk_columns: {id: $id}, _set: {payUniqe: $payUniqe}) {
-              id
-              payUniqe
-            }
-          }
-        `,
-        { id: userId, payUniqe: value }
-      );
-      return data?.update_users_by_pk || null;
-    };
-
-    try {
-      return await runUpdate(payUniqe, "String!");
-    } catch (fallbackErr) {
-      if (!isHasuraVariableTypeMismatch(fallbackErr, "payUniqe", "bigint")) {
-        throw fallbackErr;
-      }
-      const asBigint = toPositiveIntOrNull(payUniqe);
-      if (!asBigint) {
-        const mismatchErr = new Error("payUniqe must be numeric for current schema.");
-        mismatchErr.statusCode = 400;
-        throw mismatchErr;
-      }
-      return runUpdate(asBigint, "bigint!");
-    }
+  const normalizedValue = normalizeRevenueCatAppUserId(payUniqe);
+  if (!normalizedValue) {
+    return null;
   }
+  const rows = await homePostgresQuery(
+    `
+      UPDATE public.users
+      SET payUniqe = $2::text
+      WHERE id = $1::bigint
+      RETURNING
+        id::bigint AS id,
+        payUniqe
+    `,
+    [userId, normalizedValue]
+  );
+  return rows[0] || null;
 };
 
 const resolveRevenueCatUser = async ({
@@ -7424,20 +10169,86 @@ const syncRevenueCatAccessByEntitlement = async ({
 let revenueCatAuditLogEnabled = true;
 const writeRevenueCatAuditLog = async (entry) => {
   if (!revenueCatAuditLogEnabled) return;
-  const object = Object.fromEntries(
-    Object.entries(entry || {}).filter(([, value]) => value !== undefined)
-  );
   try {
-    await hasuraRequest(
+    const rows = await homePostgresQuery(
       `
-        mutation InsertRevenueCatSyncLog($object: revenuecat_sync_logs_insert_input!) {
-          insert_revenuecat_sync_logs_one(object: $object) {
-            id
-          }
-        }
+        INSERT INTO public.revenuecat_sync_logs (
+          request_id,
+          endpoint,
+          source,
+          event_type,
+          result,
+          success,
+          auth_mode,
+          user_id,
+          app_user_id,
+          expected_app_user_id,
+          identity_payload_matched,
+          identity_server_matched,
+          identity_effective_matched,
+          entitlement_id,
+          is_active,
+          expiration_date,
+          verification_source,
+          verification_reason,
+          access_action,
+          error,
+          payload,
+          created_at
+        ) VALUES (
+          $1::text,
+          $2::text,
+          $3::text,
+          $4::text,
+          $5::text,
+          $6::boolean,
+          $7::text,
+          $8::bigint,
+          $9::text,
+          $10::text,
+          $11::boolean,
+          $12::boolean,
+          $13::boolean,
+          $14::text,
+          $15::boolean,
+          $16::timestamptz,
+          $17::text,
+          $18::text,
+          $19::text,
+          $20::text,
+          $21::jsonb,
+          COALESCE($22::timestamptz, NOW())
+        )
+        RETURNING id
       `,
-      { object }
+      [
+        entry.request_id || null,
+        entry.endpoint || null,
+        entry.source || null,
+        entry.event_type || null,
+        entry.result || null,
+        entry.success ?? true,
+        entry.auth_mode || null,
+        entry.user_id || null,
+        entry.app_user_id || null,
+        entry.expected_app_user_id || null,
+        entry.identity_payload_matched ?? null,
+        entry.identity_server_matched ?? null,
+        entry.identity_effective_matched ?? null,
+        entry.entitlement_id || null,
+        entry.is_active ?? null,
+        entry.expiration_date || null,
+        entry.verification_source || null,
+        entry.verification_reason || null,
+        entry.access_action || null,
+        entry.error || null,
+        entry.payload ? JSON.stringify(entry.payload) : null,
+        entry.created_at || null,
+      ]
     );
+    if (!rows[0]?.id) {
+      throw new Error("RevenueCat sync log insert failed.");
+    }
   } catch (err) {
     const message = String(err?.message || "");
     if (
