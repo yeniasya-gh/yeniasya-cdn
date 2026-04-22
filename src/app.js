@@ -5190,7 +5190,7 @@ const selectMagazineIssuesDirect = async ({
     ", mi.description",
     ", mi.added_at",
     ", mi.added_at::date::text AS publish_date",
-    ", mi.created_at",
+    ", NULL::timestamptz AS created_at",
     ", NULL::timestamptz AS updated_at",
     ", COALESCE(mi.is_published, TRUE) AS is_published",
     includeMagazine
