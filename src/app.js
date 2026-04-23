@@ -5614,8 +5614,8 @@ const selectUserAddressesDirect = async ({
 }) => homePostgresQuery(
   [
     "SELECT",
-    "id::bigint AS id",
-    ", user_id::bigint AS user_id",
+    "id::int AS id",
+    ", user_id::int AS user_id",
     ", address_name",
     ", address_type",
     ", country",
@@ -7033,7 +7033,7 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
           tax_address: variables.tax_address ?? null,
           company_name: variables.company_name ?? null,
         },
-        returning: "id::bigint AS id",
+        returning: "id::int AS id",
       });
       return { insert_user_addresses_one: rows[0] || null };
     }
@@ -7055,7 +7055,7 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
           tax_address: variables.tax_address ?? null,
           company_name: variables.company_name ?? null,
         },
-        returning: "id::bigint AS id",
+        returning: "id::int AS id",
       });
       return { update_user_addresses_by_pk: rows[0] || null };
     }
@@ -7065,7 +7065,7 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
         ? await directDeleteByPk({
             tableName: "user_addresses",
             id,
-            returning: "id::bigint AS id",
+            returning: "id::int AS id",
           })
         : [];
       return { delete_user_addresses_by_pk: rows[0] || null };
