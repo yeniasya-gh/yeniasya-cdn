@@ -13426,6 +13426,16 @@ function normalizeQueryCardResponse(payload) {
     "empty",
   ];
   const combined = `${String(payload.errorMsg ?? "")} ${responseMsg}`.toLowerCase();
+  if (cardList.length > 0) {
+    return {
+      ...payload,
+      responseCode: "00",
+      responseMsg: responseMsg || "Kayıtlı kartlar alındı.",
+      errorMsg: "",
+      cardList,
+    };
+  }
+
   const looksEmpty =
     cardList.length === 0 &&
     (emptyCardMarkers.some((marker) => combined.includes(marker)) ||
