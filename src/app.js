@@ -13276,9 +13276,14 @@ app.post("/payment/query-card", requireJwt, async (req, res, next) => {
 
     const status = Number.isInteger(response.status) ? response.status : 502;
     const contentType = response.headers?.["content-type"];
+    const parsedResponse = normalizeParatikaJsonPayload(response.data);
+    if (parsedResponse && typeof parsedResponse === "object") {
+      const normalized = normalizeQueryCardResponse(parsedResponse);
+      return res.status(status).json(normalized);
+    }
 
     if (response.data && typeof response.data === "object") {
-      return res.status(status).json(response.data);
+      return res.status(status).json(normalizeQueryCardResponse(response.data));
     }
 
     if (typeof response.data === "string") {
@@ -13380,6 +13385,67 @@ app.post("/payment/delete-card", requireJwt, async (req, res, next) => {
     next(err);
   }
 });
+
+function normalizeParatikaJsonPayload(data) {
+  if (!data) return null;
+  if (typeof data === "object") return data;
+  if (typeof data !== "string") return null;
+  const trimmed = data.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeQueryCardResponse(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return payload;
+  }
+
+  const cardList = Array.isArray(payload.cardList) ? payload.cardList : [];
+  const responseCode = String(
+    payload.responseCode ?? payload.responsecode ?? "",
+  ).trim();
+  const responseMsg = String(
+    payload.responseMsg ?? payload.responsemsg ?? payload.message ?? "",
+  ).trim();
+
+  const emptyCardMarkers = [
+    "kart bulunamadı",
+    "kayıtlı kart bulunamadı",
+    "kayıtlı kart yok",
+    "no card",
+    "no cards",
+    "card not found",
+    "customer not found",
+    "no record",
+    "no records",
+    "not found",
+    "empty",
+  ];
+  const combined = `${String(payload.errorMsg ?? "")} ${responseMsg}`.toLowerCase();
+  const looksEmpty =
+    cardList.length === 0 &&
+    (emptyCardMarkers.some((marker) => combined.includes(marker)) ||
+      responseCode === "" ||
+      responseCode === "99" ||
+      responseCode === "404" ||
+      responseCode === "204");
+
+  if (!looksEmpty) {
+    return payload;
+  }
+
+  return {
+    ...payload,
+    responseCode: "00",
+    responseMsg: responseMsg || "Kayıtlı kart bulunamadı.",
+    errorMsg: "",
+    cardList: [],
+  };
+}
 
 app.post("/payment/pay", requireJwt, async (req, res, next) => {
   try {
