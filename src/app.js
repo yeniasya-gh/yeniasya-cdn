@@ -4947,15 +4947,17 @@ const selectNotificationsDirect = async ({
   includeUser = false,
 }) => {
   const selectParts = [
-    "n.id::bigint AS id",
-    "n.user_id::bigint AS user_id",
+    "n.id::int AS id",
+    "n.user_id::int AS user_id",
     "n.title",
     "n.body",
     "n.created_at",
     "n.is_read",
   ];
   if (includeUser) {
-    selectParts.push("jsonb_build_object('id', u.id, 'name', u.name, 'email', u.email) AS user");
+    selectParts.push(
+      "CASE WHEN u.id IS NULL THEN NULL ELSE jsonb_build_object('id', u.id::int, 'name', u.name, 'email', u.email) END AS user"
+    );
   }
   const sql = [
     `SELECT ${selectParts.join(", ")}`,
@@ -7577,7 +7579,7 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
         tableName: "notifications",
         id,
         object: { is_read: toBool(variables.is_read) },
-        returning: "id::bigint AS id",
+        returning: "id::int AS id",
       });
       return { update_notifications_by_pk: rows[0] || null };
     }
@@ -7587,7 +7589,7 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
         ? await directDeleteByPk({
             tableName: "notifications",
             id,
-            returning: "id::bigint AS id",
+            returning: "id::int AS id",
           })
         : [];
       return { delete_notifications_by_pk: rows[0] || null };
