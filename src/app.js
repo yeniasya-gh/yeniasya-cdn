@@ -13234,7 +13234,10 @@ app.post("/payment/query-card", requireJwt, async (req, res, next) => {
     const merchantPassword =
       PARATIKA_MERCHANTPASSWORD || pick("MERCHANTPASSWORD", "merchantPassword");
     const merchant = PARATIKA_MERCHANT || pick("MERCHANT", "merchant");
-    const customer = pick("CUSTOMER", "customer");
+    const customer = await resolvePaymentCustomerId({
+      customer: pick("CUSTOMER", "customer"),
+      jwt: req.jwt,
+    });
 
     const missing = [];
     if (!PARATIKA_BASE_URL) missing.push("PARATIKA_BASE_URL");
@@ -13385,6 +13388,22 @@ app.post("/payment/delete-card", requireJwt, async (req, res, next) => {
     next(err);
   }
 });
+
+async function resolvePaymentCustomerId({ customer, jwt }) {
+  const directCustomer = String(customer || "").trim();
+  if (directCustomer) return directCustomer;
+
+  const jwtUserId = extractJwtUserId(jwt);
+  if (!jwtUserId) return null;
+
+  const user = await findUserById(jwtUserId);
+  if (!user) return null;
+
+  const payUniqe = String(user.payUniqe || "").trim();
+  if (payUniqe) return payUniqe;
+
+  return `Customer-${user.id}`;
+}
 
 function normalizeParatikaJsonPayload(data) {
   if (!data) return null;
