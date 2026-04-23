@@ -7240,7 +7240,7 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
             $17::text
           )
           RETURNING
-            id::bigint AS id,
+            id::int AS id,
             total_paid,
             created_at,
             promo_code,
