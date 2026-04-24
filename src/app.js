@@ -2712,6 +2712,342 @@ const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
   };
 };
 
+const parseOrderItemMetadata = (metadata) => {
+  if (!metadata) return {};
+  if (typeof metadata === "object") {
+    return metadata;
+  }
+  const raw = String(metadata).trim();
+  if (!raw) return {};
+  try {
+    const decoded = JSON.parse(raw);
+    if (decoded && typeof decoded === "object") {
+      return decoded;
+    }
+  } catch (err) {
+    return {};
+  }
+  return {};
+};
+
+const computeOrderItemExpiryFromMetadata = (metadata) => {
+  const parsed = parseOrderItemMetadata(metadata);
+  const durationMonths = toPositiveIntOrNull(
+    parsed.durationMonths ||
+      parsed.periodMonths ||
+      parsed.period_months ||
+      parsed.period
+  );
+  if (!durationMonths) {
+    return null;
+  }
+  const expiration = new Date();
+  expiration.setMonth(expiration.getMonth() + durationMonths);
+  return expiration.toISOString();
+};
+
+const buildOrderAccessItemsFromRows = (orderItems) => {
+  const nowIso = new Date().toISOString();
+  const accessItems = [];
+  for (const item of Array.isArray(orderItems) ? orderItems : []) {
+    const productType = String(item.product_type || "").trim().toLowerCase();
+    if (!productType) continue;
+
+    let itemType = null;
+    let itemId = null;
+    let expiresAt = null;
+
+    switch (productType) {
+      case "book":
+      case "magazine":
+      case "magazine_issue":
+        itemType = productType;
+        itemId = toPositiveIntOrNull(item.product_id);
+        if (itemType === "magazine") {
+          expiresAt = computeOrderItemExpiryFromMetadata(item.metadata);
+        }
+        break;
+      case "ek":
+        itemType = "ek";
+        itemId = toPositiveIntOrNull(item.ek_id ?? item.product_id);
+        break;
+      case "newspaper_subscription":
+        itemType = "newspaper_subscription";
+        itemId = toPositiveIntOrNull(item.product_id);
+        expiresAt = computeOrderItemExpiryFromMetadata(item.metadata);
+        break;
+      default:
+        continue;
+    }
+
+    const quantity = Math.max(1, toPositiveIntOrNull(item.quantity) || 1);
+    for (let index = 0; index < quantity; index += 1) {
+      accessItems.push({
+        item_type: itemType,
+        item_id: itemId,
+        started_at: nowIso,
+        expires_at: expiresAt,
+        purchase_price: item.unit_price ?? item.line_total ?? null,
+      });
+    }
+  }
+  return accessItems;
+};
+
+const insertOrderAccessRowIfMissing = async ({
+  userId,
+  item,
+}) => {
+  const itemType = String(item?.item_type || "").trim();
+  if (!itemType) return { inserted: false, reason: "missing_item_type" };
+
+  const itemId = item?.item_id === null || item?.item_id === undefined
+    ? null
+    : toPositiveIntOrNull(item.item_id);
+  const rows = await homePostgresQuery(
+    itemId === null
+      ? `
+        SELECT id::bigint AS id
+        FROM public.user_content_access
+        WHERE user_id = $1::bigint
+          AND item_type = $2::access_item_type
+          AND item_id IS NULL
+          AND is_active = TRUE
+        LIMIT 1
+      `
+      : `
+        SELECT id::bigint AS id
+        FROM public.user_content_access
+        WHERE user_id = $1::bigint
+          AND item_type = $2::access_item_type
+          AND item_id = $3::bigint
+          AND is_active = TRUE
+        LIMIT 1
+      `,
+    itemId === null ? [userId, itemType] : [userId, itemType, itemId]
+  );
+
+  if (rows.length) {
+    return { inserted: false, reason: "exists", accessId: rows[0].id || null };
+  }
+
+  const columns = [
+    "user_id",
+    "item_type",
+    "item_id",
+    "started_at",
+    "expires_at",
+    "purchase_price",
+    "is_active",
+    "grant_source",
+    "purchase_platform",
+  ];
+  const values = [
+    userId,
+    itemType,
+    itemId,
+    item.started_at || new Date().toISOString(),
+    item.expires_at || null,
+    item.purchase_price ?? null,
+    true,
+    "order_payment",
+    "paratika",
+  ];
+
+  const insertRows = await homePostgresQuery(
+    `
+      INSERT INTO public.user_content_access (
+        ${columns.join(", ")}
+      ) VALUES (
+        $1::bigint,
+        $2::access_item_type,
+        $3::bigint,
+        $4::timestamptz,
+        $5::timestamptz,
+        $6::numeric,
+        $7::boolean,
+        $8::text,
+        $9::text
+      )
+      RETURNING id::int AS id
+    `,
+    values
+  );
+
+  return { inserted: true, accessId: insertRows[0]?.id || null };
+};
+
+const settleApprovedPaymentOrder = async ({
+  merchantPaymentId,
+  paymentSessionToken = null,
+  responseCode = "00",
+  responseMsg = "Approved",
+  errorCode = null,
+  errorMsg = null,
+}) => {
+  const normalizedMerchantPaymentId = String(merchantPaymentId || "").trim();
+  const normalizedSessionToken = String(paymentSessionToken || "").trim();
+  if (!normalizedMerchantPaymentId && !normalizedSessionToken) {
+    return { ok: false, reason: "missing_payment_identity" };
+  }
+
+  const whereClauses = [];
+  const whereValues = [];
+  if (normalizedMerchantPaymentId) {
+    whereValues.push(normalizedMerchantPaymentId);
+    whereClauses.push(`o.merchant_payment_id = $${whereValues.length}::text`);
+  }
+  if (normalizedSessionToken) {
+    whereValues.push(normalizedSessionToken);
+    whereClauses.push(`o.payment_session_token = $${whereValues.length}::text`);
+  }
+
+  const rows = await homePostgresQuery(
+    `
+      SELECT
+        o.id::bigint AS id,
+        o.user_id::bigint AS user_id,
+        o.status::text AS status,
+        o.payment_approved,
+        o.merchant_payment_id,
+        o.payment_session_token,
+        o.payment_provider,
+        o.payment_response_code,
+        o.payment_response_msg,
+        o.payment_error_code,
+        o.payment_error_msg,
+        jsonb_build_object(
+          'id', u.id::bigint,
+          'name', u.name,
+          'email', u.email,
+          'payUniqe', u."payUniqe"
+        ) AS user
+      FROM public.orders o
+      LEFT JOIN public.users u ON u.id = o.user_id
+      WHERE ${whereClauses.map((clause) => `(${clause})`).join(" OR ")}
+      ORDER BY o.created_at DESC, o.id DESC
+      LIMIT 1
+    `,
+    whereValues
+  );
+
+  const order = rows[0] || null;
+  if (!order) {
+    return { ok: false, reason: "order_not_found" };
+  }
+
+  const orderId = toPositiveIntOrNull(order.id);
+  const userId = toPositiveIntOrNull(order.user_id);
+  if (!orderId || !userId) {
+    return { ok: false, reason: "invalid_order_identity" };
+  }
+
+  await directUpdateByPk({
+    tableName: "orders",
+    id: orderId,
+    object: {
+      status: "paid",
+      payment_approved: true,
+      payment_response_code: responseCode || "00",
+      payment_response_msg: responseMsg || "Approved",
+      payment_error_code: errorCode ?? null,
+      payment_error_msg: errorMsg ?? null,
+    },
+    returning: "id::bigint AS id",
+  });
+
+  const itemRows = await homePostgresQuery(
+    `
+      SELECT
+        id::bigint AS id,
+        order_id::bigint AS order_id,
+        product_id::bigint AS product_id,
+        ek_id::bigint AS ek_id,
+        title,
+        quantity::int AS quantity,
+        unit_price,
+        line_total,
+        product_type,
+        metadata,
+        created_at
+      FROM public.order_items
+      WHERE order_id = $1::bigint
+      ORDER BY id ASC
+    `,
+    [orderId]
+  );
+
+  const accessItems = buildOrderAccessItemsFromRows(itemRows);
+  const directItems = accessItems.filter(
+    (item) => item.item_type !== "newspaper_subscription"
+  );
+  const newspaperItems = accessItems.filter(
+    (item) => item.item_type === "newspaper_subscription"
+  );
+
+  let directInserted = 0;
+  for (const item of directItems) {
+    try {
+      const result = await insertOrderAccessRowIfMissing({
+        userId,
+        item,
+      });
+      if (result.inserted) {
+        directInserted += 1;
+      }
+    } catch (err) {
+      console.error(
+        `[payment][settle][access][direct][error] orderId=${orderId} userId=${userId} itemType=${item.item_type} itemId=${item.item_id ?? "-"} msg=${err.message}`
+      );
+    }
+  }
+
+  let newspaperSettled = 0;
+  if (newspaperItems.length) {
+    const user = order.user?.id
+      ? {
+          id: order.user.id,
+          payUniqe: order.user.payUniqe || null,
+        }
+      : await getUserByIdForAuth(userId);
+    const revenueCatAppUserId =
+      normalizeRevenueCatAppUserId(user?.payUniqe) || String(userId);
+
+    for (const item of newspaperItems) {
+      try {
+        const accessResult = await syncRevenueCatAccessByEntitlement({
+          userId,
+          entitlementId: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+          isActive: true,
+          expirationDate: item.expires_at || null,
+          appUserId: revenueCatAppUserId,
+          originalAppUserId: revenueCatAppUserId,
+          purchasePlatform: "paratika",
+        });
+        if (accessResult?.mapped) {
+          newspaperSettled += 1;
+        }
+      } catch (err) {
+        console.error(
+          `[payment][settle][access][newspaper][error] orderId=${orderId} userId=${userId} msg=${err.message}`
+        );
+      }
+    }
+  }
+
+  console.log(
+    `[payment][settle][success] orderId=${orderId} userId=${userId} merchantPaymentId=${normalizedMerchantPaymentId || "-"} directInserted=${directInserted} newspaperSettled=${newspaperSettled}`
+  );
+
+  return {
+    ok: true,
+    orderId,
+    userId,
+    directInserted,
+    newspaperSettled,
+  };
+};
+
 const buildJwt = (user, options = {}) => {
   const userId = String(user.id);
   const defaultRole = String(options.defaultRole || JWT_DEFAULT_ROLE).trim() || JWT_DEFAULT_ROLE;
@@ -13515,7 +13851,7 @@ app.post("/payment/pay/redirect", requireJwt, async (req, res, next) => {
   }
 });
 
-app.all("/payment/return", (req, res) => {
+app.all("/payment/return", async (req, res) => {
   const payload = { ...req.query, ...req.body };
   const safeLog = {
     responseCode: payload.responseCode ?? payload.responsecode,
@@ -13596,6 +13932,21 @@ app.all("/payment/return", (req, res) => {
   const redirectTarget = appReturnBase
     ? new URL(`${redirectPath}?${params.toString()}`, `${appReturnBase}/`).toString()
     : `${redirectPath}?${params.toString()}`;
+
+  if (isApproved) {
+    await settleApprovedPaymentOrder({
+      merchantPaymentId: normalized.merchantPaymentId,
+      paymentSessionToken: normalized.sessionToken,
+      responseCode: normalized.responseCode || "00",
+      responseMsg: normalized.responseMsg || "Approved",
+      errorCode: normalized.errorCode || null,
+      errorMsg: normalized.errorMsg || null,
+    }).catch((err) => {
+      console.error(
+        `[payment][settle][error] merchantPaymentId=${normalized.merchantPaymentId || "-"} pgOrderId=${normalized.pgOrderId || "-"} msg=${err.message}`
+      );
+    });
+  }
 
   return res.redirect(redirectTarget);
 });
