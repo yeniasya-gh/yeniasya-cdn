@@ -7538,6 +7538,44 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
       };
     }
     case "CreateOrder": {
+      const merchantPaymentId = String(variables.merchant_payment_id || "").trim();
+      const paymentSessionToken = String(variables.payment_session_token || "").trim();
+      if (merchantPaymentId || paymentSessionToken) {
+        const existingWhere = [];
+        const existingValues = [];
+        if (merchantPaymentId) {
+          existingValues.push(merchantPaymentId);
+          existingWhere.push(`merchant_payment_id = $${existingValues.length}::text`);
+        }
+        if (paymentSessionToken) {
+          existingValues.push(paymentSessionToken);
+          existingWhere.push(`payment_session_token = $${existingValues.length}::text`);
+        }
+        const existingRows = await homePostgresQuery(
+          `
+            SELECT
+              id::int AS id,
+              total_paid,
+              created_at,
+              promo_code,
+              promo_discount_percent,
+              promo_discount_amount,
+              payment_provider
+            FROM public.orders
+            WHERE ${existingWhere.map((clause) => `(${clause})`).join(" OR ")}
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+          `,
+          existingValues
+        );
+        if (existingRows.length) {
+          console.log(
+            `[orders][create][idempotent] reused orderId=${existingRows[0].id || "-"} merchantPaymentId=${merchantPaymentId || "-"} sessionToken=${paymentSessionToken || "-"}`
+          );
+          return { insert_orders_one: existingRows[0] };
+        }
+      }
+
       const rows = await homePostgresQuery(
         `
           INSERT INTO public.orders (
@@ -7622,6 +7660,24 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
         product_type: item.product_type,
         metadata: item.metadata ?? null,
       }));
+      const firstOrderId = toPositiveIntOrNull(normalizedItems[0]?.order_id);
+      if (firstOrderId) {
+        const existing = await homePostgresQuery(
+          `
+            SELECT id::bigint AS id
+            FROM public.order_items
+            WHERE order_id = $1::bigint
+            LIMIT 1
+          `,
+          [firstOrderId]
+        );
+        if (existing.length) {
+          console.log(
+            `[order_items][insert][idempotent] skipped orderId=${firstOrderId} existingItems=true count=${normalizedItems.length}`
+          );
+          return { insert_order_items: { affected_rows: 0 } };
+        }
+      }
       for (const item of normalizedItems) {
         await directInsert({
           tableName: "order_items",
