@@ -9869,9 +9869,17 @@ const fetchRevenueCatEntitlementState = async ({ appUserId, entitlementId }) => 
   }
 
   if (response.status < 200 || response.status >= 300) {
-    const err = new Error(`RevenueCat subscriber lookup failed (${response.status}).`);
-    err.statusCode = 502;
-    throw err;
+    const transientStatus = [429, 500, 502, 503, 504].includes(response.status);
+    return {
+      checked: false,
+      source: "revenuecat",
+      reason: transientStatus
+        ? `subscriber_lookup_failed_${response.status}`
+        : "subscriber_lookup_failed",
+      statusCode: response.status,
+      isActive: false,
+      expirationDate: null,
+    };
   }
 
   const subscriberEntitlements = response.data?.subscriber?.entitlements || {};
@@ -10203,11 +10211,12 @@ const resolveEntitlementStateWithFallback = async ({
   }
 
   if (!fallbackProvided) {
-    const err = new Error(
-      "RevenueCat verification unavailable and no fallback entitlement state was provided."
-    );
-    err.statusCode = 503;
-    throw err;
+    return {
+      verification,
+      isActive: verification.isActive === true,
+      expirationDate: verification.expirationDate || null,
+      usedFallback: false,
+    };
   }
 
   return {
@@ -10221,6 +10230,12 @@ const resolveEntitlementStateWithFallback = async ({
 const isMissingRevenueCatOwnershipLockError = (err) =>
   String(err?.code || "") === "42P01" &&
   String(err?.message || "").toLowerCase().includes("revenuecat_subscription_locks");
+
+const isRevenueCatOwnershipLockUniqueError = (err) =>
+  String(err?.code || "") === "23505" &&
+  String(err?.message || "")
+    .toLowerCase()
+    .includes("revenuecat_subscription_locks");
 
 const upsertRevenueCatOwnershipLock = async ({
   client,
@@ -10387,16 +10402,106 @@ const upsertRevenueCatOwnershipLock = async ({
     }
   }
 
-  const rows = await homePostgresQueryWithClient(client, query, [
-    normalizedEntitlementId,
-    userId,
-    normalizedAppUserId,
-    ownershipKey,
-    normalizedProductIdentifier,
-    isActive === true,
-    expiresAt,
-    nowIso,
-  ]);
+  let rows = [];
+  try {
+    rows = await homePostgresQueryWithClient(client, query, [
+      normalizedEntitlementId,
+      userId,
+      normalizedAppUserId,
+      ownershipKey,
+      normalizedProductIdentifier,
+      isActive === true,
+      expiresAt,
+      nowIso,
+    ]);
+  } catch (err) {
+    if (!isRevenueCatOwnershipLockUniqueError(err)) {
+      throw err;
+    }
+
+    const existingLockRows = await homePostgresQueryWithClient(
+      client,
+      `
+        SELECT
+          id::int AS id,
+          entitlement_id,
+          owner_user_id::int AS owner_user_id,
+          owner_app_user_id,
+          owner_original_app_user_id,
+          product_identifier,
+          is_active,
+          expires_at,
+          locked_at,
+          updated_at,
+          last_seen_at
+        FROM public.revenuecat_subscription_locks
+        WHERE entitlement_id = $1::text
+          AND (
+            owner_original_app_user_id = $2::text
+            OR owner_app_user_id = $3::text
+            OR owner_user_id = $4::bigint
+          )
+        ORDER BY updated_at DESC NULLS LAST, id DESC
+        LIMIT 1
+      `,
+      [normalizedEntitlementId, ownershipKey, normalizedAppUserId, Number(userId)]
+    );
+
+    const existingLock = existingLockRows[0] || null;
+    if (!existingLock) {
+      throw err;
+    }
+
+    if (Number(existingLock.owner_user_id) !== Number(userId)) {
+      return { mapped: false, reason: "locked_to_other_user", entitlementId: normalizedEntitlementId };
+    }
+
+    const mergedRows = await homePostgresQueryWithClient(
+      client,
+      `
+        UPDATE public.revenuecat_subscription_locks
+        SET
+          owner_app_user_id = $2::text,
+          owner_original_app_user_id = COALESCE($3::text, owner_original_app_user_id),
+          product_identifier = COALESCE($4::text, product_identifier),
+          is_active = $5::boolean,
+          expires_at = $6::timestamptz,
+          updated_at = now(),
+          last_seen_at = now()
+        WHERE id = $1::bigint
+        RETURNING
+          id::int AS id,
+          entitlement_id,
+          owner_user_id::int AS owner_user_id,
+          owner_app_user_id,
+          owner_original_app_user_id,
+          product_identifier,
+          is_active,
+          expires_at,
+          locked_at,
+          updated_at,
+          last_seen_at
+      `,
+      [
+        existingLock.id,
+        normalizedAppUserId,
+        normalizedOriginalAppUserId,
+        normalizedProductIdentifier,
+        isActive === true,
+        expiresAt,
+      ]
+    );
+
+    if (mergedRows[0]) {
+      return {
+        mapped: true,
+        action: "upserted_after_duplicate",
+        lock: mergedRows[0],
+      };
+    }
+
+    return { mapped: false, reason: "duplicate_lock_update_failed" };
+  }
 
   if (rows[0]) {
     return { mapped: true, action: "upserted", lock: rows[0] };
@@ -11524,9 +11629,53 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       allowFallbackOverride: false,
     });
     if (!state.verification.checked && body.isActive === undefined) {
-      return res.status(400).json({
-        ok: false,
-        error: "isActive is required when RevenueCat verification is unavailable.",
+      const transientLookupFailure = String(state.verification.reason || "").startsWith(
+        "subscriber_lookup_failed"
+      );
+      if (!transientLookupFailure) {
+        return res.status(400).json({
+          ok: false,
+          error: "isActive is required when RevenueCat verification is unavailable.",
+        });
+      }
+      await writeRevenueCatAuditLog({
+        ...baseAudit,
+        source: state.verification.source,
+        user_id: resolved.userId,
+        app_user_id: resolved.appUserId,
+        expected_app_user_id: identity.expectedAppUserId,
+        identity_payload_matched: identity.payloadIdentityMatched,
+        identity_server_matched: identity.serverIdentityMatched,
+        identity_effective_matched: identity.identityMatched,
+        entitlement_id: entitlementId,
+        is_active: false,
+        expiration_date: null,
+        verification_source: state.verification.source,
+        verification_reason: state.verification.reason || null,
+        access_action: "skipped_lookup_unavailable",
+        success: true,
+        payload: body,
+      });
+      return res.json({
+        ok: true,
+        requestId,
+        skipped: true,
+        reason: state.verification.reason || "subscriber_lookup_failed",
+        userId: resolved.userId,
+        appUserId: resolved.appUserId,
+        expectedAppUserId: identity.expectedAppUserId,
+        identityMatched: identity.identityMatched,
+        identityServerMatched: identity.serverIdentityMatched,
+        identityPayloadMatched: identity.payloadIdentityMatched,
+        entitlementId,
+        isActive: false,
+        expirationDate: null,
+        verification: state.verification,
+        accessSync: {
+          mapped: false,
+          reason: "subscriber_lookup_unavailable",
+          entitlementId,
+        },
       });
     }
 
