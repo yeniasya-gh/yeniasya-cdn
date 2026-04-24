@@ -2611,7 +2611,18 @@ const getUserOrdersFromPostgres = async ({ userId, includeItems = false }) => {
   }));
 };
 
-const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
+const getOrderDetailFromPostgres = async ({ userId = null, orderId }) => {
+  const normalizedOrderId = toPositiveIntOrNull(orderId);
+  if (!normalizedOrderId) return null;
+
+  const normalizedUserId = toPositiveIntOrNull(userId);
+  const whereClauseParts = ["id = $1::bigint"];
+  const whereValues = [normalizedOrderId];
+  if (normalizedUserId) {
+    whereClauseParts.push(`user_id = $${whereValues.length + 1}::bigint`);
+    whereValues.push(normalizedUserId);
+  }
+
   const rows = await (async () => {
     try {
       return await homePostgresQuery(
@@ -2640,11 +2651,10 @@ const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
             promo_discount_percent,
             promo_discount_amount
           FROM public.orders
-          WHERE id = $1::bigint
-            AND user_id = $2::bigint
+          WHERE ${whereClauseParts.join(" AND ")}
           LIMIT 1
         `,
-        [orderId, userId]
+        whereValues
       );
     } catch (err) {
       if (!isMissingOrderPaymentMetadataError(err)) {
@@ -2675,11 +2685,10 @@ const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
             promo_discount_percent,
             promo_discount_amount
           FROM public.orders
-          WHERE id = $1::bigint
-            AND user_id = $2::bigint
+          WHERE ${whereClauseParts.join(" AND ")}
           LIMIT 1
         `,
-        [orderId, userId]
+        whereValues
       );
     }
   })();
@@ -2711,6 +2720,9 @@ const getUserOrderDetailFromPostgres = async ({ userId, orderId }) => {
     order_items: items.map((item) => ({ ...item })),
   };
 };
+
+const getUserOrderDetailFromPostgres = async ({ userId, orderId }) =>
+  getOrderDetailFromPostgres({ userId, orderId });
 
 const parseOrderItemMetadata = (metadata) => {
   if (!metadata) return {};
@@ -7449,7 +7461,13 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
         return { orders_by_pk: null, order_items: [] };
       }
       const userId = extractJwtUserId(req?.jwt);
-      const order = await getUserOrderDetailFromPostgres({ userId, orderId: id });
+      const isAdminRequest =
+        req?.hasuraAuthMode === "service" ||
+        hasAdminRoleInBearerToken(req?.jwtToken || "");
+      const order = await getOrderDetailFromPostgres({
+        userId: isAdminRequest ? null : userId,
+        orderId: id,
+      });
       if (!order) {
         return { orders_by_pk: null, order_items: [] };
       }
