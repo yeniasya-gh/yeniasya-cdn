@@ -5888,7 +5888,7 @@ const selectReviewsDirect = async ({
 const selectContactMessagesDirect = async ({
   whereSql = "TRUE",
   values = [],
-  orderBy = "created_at DESC, id DESC",
+  orderBy = "cm.created_at DESC, cm.id DESC",
   limit = null,
   includeUser = false,
 }) => {
@@ -5900,11 +5900,17 @@ const selectContactMessagesDirect = async ({
     ", cm.email",
     ", cm.user_id::bigint AS user_id",
     ", cm.created_at",
+    ", cm.reply_message",
+    ", cm.reply_at",
+    ", cm.reply_admin_user_id::bigint AS reply_admin_user_id",
     includeUser
       ? ", CASE WHEN u.id IS NULL THEN NULL ELSE jsonb_build_object('id', u.id, 'name', u.name, 'email', u.email, 'phone', u.phone, 'role', jsonb_build_object('id', r.id, 'name', r.name)) END AS user"
       : "",
+    ", CASE WHEN ru.id IS NULL THEN NULL ELSE jsonb_build_object('id', ru.id, 'name', ru.name, 'email', ru.email, 'phone', ru.phone, 'role', jsonb_build_object('id', rr.id, 'name', rr.name)) END AS reply_user",
     "FROM public.contact_messages cm",
     includeUser ? "LEFT JOIN public.users u ON u.id = cm.user_id LEFT JOIN public.roles r ON r.id = u.role_id" : "",
+    "LEFT JOIN public.users ru ON ru.id = cm.reply_admin_user_id",
+    "LEFT JOIN public.roles rr ON rr.id = ru.role_id",
     `WHERE ${whereSql}`,
     `ORDER BY ${orderBy}`,
     limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
@@ -7235,8 +7241,24 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
     case "AdminContactMessagesFallback": {
       return {
         contact_messages: await selectContactMessagesDirect({
-          orderBy: op === "AdminContactMessagesFallback" ? "id DESC" : "created_at DESC, id DESC",
+          orderBy: op === "AdminContactMessagesFallback" ? "cm.id DESC" : "cm.created_at DESC, cm.id DESC",
           includeUser: true,
+        }),
+      };
+    }
+    case "MyContactMessages": {
+      const userId = extractJwtUserId(req?.jwt);
+      if (!userId) {
+        return { contact_messages: [] };
+      }
+      const currentUser = await getUserByIdForAuth(userId);
+      const email = String(currentUser?.email || "").trim();
+      return {
+        contact_messages: await selectContactMessagesDirect({
+          whereSql:
+            "(cm.user_id = $1::bigint OR (cm.email IS NOT NULL AND LOWER(cm.email) = LOWER($2::text)))",
+          values: [userId, email],
+          orderBy: "cm.created_at DESC, cm.id DESC",
         }),
       };
     }
@@ -7263,6 +7285,32 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
           })
         : [];
       return { delete_contact_messages_by_pk: rows[0] || null };
+    }
+    case "UpdateContactMessageReply": {
+      const id = toPositiveIntOrNull(variables.id);
+      const replyMessage = String(variables.reply_message || "").trim();
+      if (!id) {
+        return { update_contact_messages_by_pk: null };
+      }
+      if (!replyMessage) {
+        throw new Error("Yanıt boş olamaz.");
+      }
+      const actor = req.hasuraAuthMode === "jwt" ? await ensureAdminJwtActor(req) : null;
+      if (!actor) {
+        throw new Error("Yetkisiz erişim.");
+      }
+      const rows = await directUpdateByPk({
+        tableName: "contact_messages",
+        id,
+        object: {
+          reply_message: replyMessage,
+          reply_at: new Date().toISOString(),
+          reply_admin_user_id: actor.id,
+        },
+        returning:
+          "id::bigint AS id, reply_message, reply_at, reply_admin_user_id::bigint AS reply_admin_user_id",
+      });
+      return { update_contact_messages_by_pk: rows[0] || null };
     }
     case "AdminStats": {
       const today = new Date();
