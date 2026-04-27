@@ -5785,6 +5785,47 @@ const selectMagazineTypePricesDirect = async ({
   return homePostgresQuery(sql, values);
 };
 
+const PROMO_SCOPE_CATEGORIES = ["book", "magazine", "subscription", "supplement"];
+
+function normalizePromoScopeCategories(rawCategories) {
+  if (!Array.isArray(rawCategories)) return [];
+  return [...new Set(
+    rawCategories
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter((value) => PROMO_SCOPE_CATEGORIES.includes(value)),
+  )];
+}
+
+function promoCategoryFromProductType(productType) {
+  const normalized = String(productType || "").trim().toLowerCase();
+  switch (normalized) {
+    case "book":
+      return "book";
+    case "magazine":
+    case "magazine_issue":
+    case "magazine_one":
+      return "magazine";
+    case "newspaper":
+    case "newspaper_subscription":
+      return "subscription";
+    case "supplement":
+    case "ek":
+      return "supplement";
+    default:
+      return null;
+  }
+}
+
+function promoScopeAppliesToItems(scopeCategories, items) {
+  const allowed = new Set(normalizePromoScopeCategories(scopeCategories));
+  if (!allowed.size) return true;
+  const itemCategories = (Array.isArray(items) ? items : [])
+    .map((item) => promoCategoryFromProductType(item?.product_type))
+    .filter(Boolean);
+  if (!itemCategories.length) return false;
+  return itemCategories.every((category) => allowed.has(category));
+}
+
 const selectPromoCodesDirect = async ({
   whereSql = "TRUE",
   values = [],
@@ -5801,6 +5842,7 @@ const selectPromoCodesDirect = async ({
     ", COALESCE(is_active, TRUE) AS is_active",
     ", usage_limit",
     ", usage_count",
+    ", COALESCE(applicable_categories, ARRAY[]::text[]) AS applicable_categories",
     ", created_at",
     ", NULL::timestamptz AS updated_at",
     "FROM public.promo_codes",
@@ -7035,6 +7077,9 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
           ends_at: variables.ends_at,
           is_active: variables.is_active,
           usage_limit: variables.usage_limit ?? null,
+          applicable_categories: Array.isArray(variables.applicable_categories)
+            ? variables.applicable_categories
+            : [],
           usage_count: 0,
         },
         returning: "id::bigint AS id",
@@ -7694,6 +7739,64 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
             `[order_items][insert][idempotent] skipped orderId=${firstOrderId} existingItems=true count=${normalizedItems.length}`
           );
           return { insert_order_items: { affected_rows: 0 } };
+        }
+
+        const orderRows = await homePostgresQuery(
+          `
+            SELECT
+              id::bigint AS id,
+              promo_code_id,
+              promo_code
+            FROM public.orders
+            WHERE id = $1::bigint
+            LIMIT 1
+          `,
+          [firstOrderId]
+        );
+        const orderRow = orderRows[0] || null;
+        const promoCodeId = toPositiveIntOrNull(orderRow?.promo_code_id);
+        const promoCodeText = String(orderRow?.promo_code || "").trim();
+        if (promoCodeId || promoCodeText) {
+          const promoRows = promoCodeId
+            ? await homePostgresQuery(
+                `
+                  SELECT
+                    id::bigint AS id,
+                    code,
+                    COALESCE(applicable_categories, ARRAY[]::text[]) AS applicable_categories
+                  FROM public.promo_codes
+                  WHERE id = $1::bigint
+                  LIMIT 1
+                `,
+                [promoCodeId]
+              )
+            : await homePostgresQuery(
+                `
+                  SELECT
+                    id::bigint AS id,
+                    code,
+                    COALESCE(applicable_categories, ARRAY[]::text[]) AS applicable_categories
+                  FROM public.promo_codes
+                  WHERE LOWER(code) = LOWER($1::text)
+                  LIMIT 1
+                `,
+                [promoCodeText]
+              );
+          const promoRow = promoRows[0] || null;
+          if (!promoRow) {
+            await homePostgresQuery(
+              `DELETE FROM public.orders WHERE id = $1::bigint`,
+              [firstOrderId]
+            ).catch(() => {});
+            throw new Error("Promosyon kodu bulunamadı.");
+          }
+          if (!promoScopeAppliesToItems(promoRow.applicable_categories, normalizedItems)) {
+            await homePostgresQuery(
+              `DELETE FROM public.orders WHERE id = $1::bigint`,
+              [firstOrderId]
+            ).catch(() => {});
+            throw new Error("Promosyon kodu seçili ürünler için geçerli değil.");
+          }
         }
       }
       for (const item of normalizedItems) {
