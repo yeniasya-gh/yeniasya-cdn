@@ -5826,6 +5826,12 @@ function promoScopeAppliesToItems(scopeCategories, items) {
   return itemCategories.every((category) => allowed.has(category));
 }
 
+function createPromoCodeError(message, code) {
+  const err = new Error(message);
+  if (code) err.code = code;
+  return err;
+}
+
 const selectPromoCodesDirect = async ({
   whereSql = "TRUE",
   values = [],
@@ -7836,14 +7842,20 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
               `DELETE FROM public.orders WHERE id = $1::bigint`,
               [firstOrderId]
             ).catch(() => {});
-            throw new Error("Promosyon kodu bulunamadı.");
+            throw createPromoCodeError(
+              "Promosyon kodu bulunamadı. Bu kod zaten kayıtlı değil.",
+              "PROMO_CODE_NOT_FOUND",
+            );
           }
           if (!promoScopeAppliesToItems(promoRow.applicable_categories, normalizedItems)) {
             await homePostgresQuery(
               `DELETE FROM public.orders WHERE id = $1::bigint`,
               [firstOrderId]
             ).catch(() => {});
-            throw new Error("Promosyon kodu seçili ürünler için geçerli değil.");
+            throw createPromoCodeError(
+              "Promosyon kodu seçili ürünler için geçerli değil. Bu kod zaten kayıtlı ürün kategorisi için tanımlı.",
+              "PROMO_CODE_NOT_APPLICABLE",
+            );
           }
         }
       }
