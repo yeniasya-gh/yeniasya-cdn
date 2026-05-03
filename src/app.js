@@ -3045,6 +3045,33 @@ const settleApprovedPaymentOrder = async ({
         );
       }
     }
+
+    if (newspaperSettled === 0) {
+      for (const item of newspaperItems) {
+        try {
+          const result = await insertOrderAccessRowIfMissing({
+            userId,
+            item: {
+              item_type: item.item_type,
+              item_id: item.item_id,
+              started_at: item.started_at || nowIso,
+              expires_at: item.expires_at || null,
+              purchase_price: item.purchase_price ?? null,
+            },
+          });
+          if (result.inserted) {
+            newspaperSettled += 1;
+            console.log(
+              `[payment][settle][access][newspaper][fallback] orderId=${orderId} userId=${userId} itemType=${item.item_type} itemId=${item.item_id ?? "-"} accessId=${result.accessId || "-"}`
+            );
+          }
+        } catch (err) {
+          console.error(
+            `[payment][settle][access][newspaper][fallback][error] orderId=${orderId} userId=${userId} itemType=${item.item_type} itemId=${item.item_id ?? "-"} msg=${err.message}`
+          );
+        }
+      }
+    }
   }
 
   console.log(
