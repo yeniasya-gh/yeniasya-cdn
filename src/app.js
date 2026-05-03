@@ -3488,8 +3488,20 @@ const sendFirebaseMessageToToken = async ({
       token,
       notification: { title, body },
       ...(data ? { data } : {}),
-      android: { priority: "HIGH" },
-      apns: { headers: { "apns-priority": "10" } },
+      android: {
+        priority: "HIGH",
+        notification: {
+          sound: "default",
+        },
+      },
+      apns: {
+        headers: { "apns-priority": "10" },
+        payload: {
+          aps: {
+            sound: "default",
+          },
+        },
+      },
     },
     validate_only: !!dryRun,
   };
