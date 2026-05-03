@@ -306,7 +306,13 @@ const HOME_POSTGRES_QUERY_TIMEOUT_MS =
     ? HOME_POSTGRES_QUERY_TIMEOUT_MS_RAW
     : 10000;
 const JWT_SECRET = process.env.JWT_SECRET || "";
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "1d";
+const JWT_EXPIRES_IN = (() => {
+  const configured = String(process.env.JWT_EXPIRES_IN || "").trim();
+  if (!configured || configured === "1d") {
+    return "90d";
+  }
+  return configured;
+})();
 const JWT_ISSUER = process.env.JWT_ISSUER || "yeniasya";
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "yeniasya-app";
 const JWT_DEFAULT_ROLE = process.env.JWT_DEFAULT_ROLE || "user";
@@ -3277,23 +3283,12 @@ const validateJwtSession = async (payload) => {
     };
   }
 
-  const tokenSessionId = extractJwtSessionId(payload);
-  const activeSessionId = normalizeAuthSessionId(user.auth_session_id);
-  if (activeSessionId && tokenSessionId !== activeSessionId) {
-    return {
-      ok: false,
-      statusCode: 401,
-      code: "SESSION_REVOKED",
-      error: "Oturumunuz sonlandırıldı. Lütfen tekrar giriş yapın.",
-    };
-  }
-
   return {
     ok: true,
     userId,
     user,
-    tokenSessionId,
-    activeSessionId,
+    tokenSessionId: extractJwtSessionId(payload),
+    activeSessionId: normalizeAuthSessionId(user.auth_session_id),
   };
 };
 const isHasuraVariableTypeMismatch = (err, variableName, expectedType) => {
