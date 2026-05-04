@@ -717,6 +717,36 @@ const isRetryableBunnyError = (err) => {
   ].includes(code);
 };
 
+const isTransientRevenueCatServiceError = (err) => {
+  const status = err?.response?.status;
+  if (Number.isInteger(status) && [429, 500, 502, 503, 504].includes(status)) {
+    return true;
+  }
+
+  const code = String(err?.code || "").trim().toUpperCase();
+  if (
+    [
+      "ECONNABORTED",
+      "ECONNRESET",
+      "EAI_AGAIN",
+      "ENOTFOUND",
+      "ETIMEDOUT",
+      "ECONNREFUSED",
+    ].includes(code)
+  ) {
+    return true;
+  }
+
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    message.includes("timeout") ||
+    message.includes("getaddrinfo") ||
+    message.includes("eai_again") ||
+    message.includes("connection refused") ||
+    message.includes("socket hang up")
+  );
+};
+
 const bunnyRequest = async (config, { retries = BUNNY_HTTP_RETRIES } = {}) => {
   let attempt = 0;
   for (;;) {
@@ -11956,6 +11986,14 @@ app.post("/revenuecat/subscription/sync", requireRevenueCatAuth, async (req, res
       payload: req.body || {},
     });
     console.error(`[revenuecat][sync][error] id=${requestId} msg=${err.message}`);
+    if (isTransientRevenueCatServiceError(err)) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "revenuecat_unavailable",
+        requestId,
+      });
+    }
     return res.status(status).json({ ok: false, error: err.message || "Sync failed." });
   }
 });
@@ -12126,6 +12164,14 @@ app.post("/revenuecat/subscription/event", requireRevenueCatAuth, async (req, re
       payload: req.body || {},
     });
     console.error(`[revenuecat][event][error] id=${requestId} msg=${err.message}`);
+    if (isTransientRevenueCatServiceError(err)) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "revenuecat_unavailable",
+        requestId,
+      });
+    }
     return res.status(status).json({ ok: false, error: err.message || "Event failed." });
   }
 });
@@ -12278,6 +12324,14 @@ app.post("/revenuecat/subscription/refresh", requireRevenueCatAuth, async (req, 
       payload: req.body || {},
     });
     console.error(`[revenuecat][refresh][error] id=${requestId} msg=${err.message}`);
+    if (isTransientRevenueCatServiceError(err)) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "revenuecat_unavailable",
+        requestId,
+      });
+    }
     return res.status(status).json({ ok: false, error: err.message || "Refresh failed." });
   }
 });
