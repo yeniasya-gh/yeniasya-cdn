@@ -2468,6 +2468,7 @@ const getManualNewspaperAccessRows = async ({ userId }) => {
 
     return rows.map((row) => ({
       id: `manual_${row.id}`,
+      user_id: userId,
       item_id: null,
       item_type: "newspaper_subscription",
       started_at: row.starts_at,
@@ -2486,12 +2487,114 @@ const getManualNewspaperAccessRows = async ({ userId }) => {
   }
 };
 
-const getUserAccessEntriesFromPostgres = async ({ userId, itemType = null }) => {
+const mergeAccessEntries = (entries) => {
+  const sorted = sortUserAccessEntries(
+    (Array.isArray(entries) ? entries : []).map((entry) => ({ ...entry }))
+  );
+  const seen = new Set();
+  const merged = [];
+
+  for (const entry of sorted) {
+    const userId = entry?.user_id === null || entry?.user_id === undefined
+      ? "null"
+      : String(entry.user_id);
+    const itemType = String(entry?.item_type || "").trim();
+    const itemId = entry?.item_id === null || entry?.item_id === undefined
+      ? "null"
+      : String(entry.item_id);
+    const key = `${userId}:${itemType}:${itemId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(entry);
+  }
+
+  return sortUserAccessEntries(merged);
+};
+
+const getPaidOrderAccessRows = async ({
+  userId,
+  itemType = null,
+  itemId = undefined,
+}) => {
+  const orders = await getUserOrdersFromPostgres({
+    userId,
+    includeItems: true,
+  });
+  if (!orders.length) return [];
+
+  const now = Date.now();
+  const rows = [];
+
+  for (const order of orders) {
+    const status = String(order.status || "").trim().toLowerCase();
+    const paymentApproved = order.payment_approved === true;
+    if (status !== "paid" && !paymentApproved) continue;
+
+    const orderItems = Array.isArray(order.order_items) ? order.order_items : [];
+    const accessItems = buildOrderAccessItemsFromRows(orderItems);
+    const startedAt = order.created_at || null;
+    const orderSortId = Number(order.id);
+    const derivedId = Number.isFinite(orderSortId)
+      ? -Math.abs(orderSortId)
+      : -Date.now();
+
+    for (const item of accessItems) {
+      if (itemType && item.item_type !== itemType) continue;
+      if (itemId !== undefined) {
+        const normalizedItemId = item.item_id === null || item.item_id === undefined
+          ? null
+          : toPositiveIntOrNull(item.item_id);
+        if (itemId === null) {
+          if (normalizedItemId !== null) continue;
+        } else if (normalizedItemId !== itemId) {
+          continue;
+        }
+      }
+
+      const expiresAt = item.expires_at || null;
+      if (expiresAt) {
+        const expMs = new Date(expiresAt).getTime();
+        if (Number.isFinite(expMs) && expMs <= now) {
+          continue;
+        }
+      }
+
+      rows.push({
+        id: derivedId,
+        user_id: userId,
+        item_id: item.item_id ?? null,
+        item_type: item.item_type,
+        started_at: startedAt || item.started_at || null,
+        expires_at: expiresAt,
+        is_active: true,
+        source: "order_payment",
+        grant_source: "order_payment",
+        purchase_platform: normalizePurchasePlatform(order.payment_provider) || "paratika",
+      });
+    }
+  }
+
+  return rows;
+};
+
+const getUserAccessEntriesFromPostgres = async ({
+  userId,
+  itemType = null,
+  itemId = undefined,
+}) => {
   const values = [userId];
   let itemTypeWhere = "";
   if (itemType) {
     values.push(itemType);
     itemTypeWhere = ` AND item_type = $${values.length}::public.access_item_type`;
+  }
+  if (itemId !== undefined) {
+    if (itemId === null) {
+      itemTypeWhere += " AND item_id IS NULL";
+    } else {
+      values.push(itemId);
+      itemTypeWhere += ` AND item_id = $${values.length}::bigint`;
+    }
   }
 
   const rows = await (async () => {
@@ -2544,6 +2647,7 @@ const getUserAccessEntriesFromPostgres = async ({ userId, itemType = null }) => 
 
   const entries = rows.map((row) => ({
     ...row,
+    user_id: userId,
     source: "user_content_access",
   }));
 
@@ -2551,7 +2655,15 @@ const getUserAccessEntriesFromPostgres = async ({ userId, itemType = null }) => 
     entries.push(...(await getManualNewspaperAccessRows({ userId })));
   }
 
-  return sortUserAccessEntries(entries);
+  entries.push(
+    ...(await getPaidOrderAccessRows({
+      userId,
+      itemType,
+      itemId,
+    }))
+  );
+
+  return mergeAccessEntries(entries);
 };
 
 const getUserOrdersFromPostgres = async ({ userId, includeItems = false }) => {
@@ -7641,27 +7753,18 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
       const userId = toPositiveIntOrNull(variables.user_id);
       const itemType = String(variables.item_type || "").trim();
       if (!userId || !itemType) return { user_content_access: [] };
-      const entries = await selectUserContentAccessDirect({
-        whereSql:
-          "user_id = $1::bigint AND item_type = $2::public.access_item_type AND is_active = TRUE",
-        values: [userId, itemType],
-        orderBy: "started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC",
-      });
-      if (itemType === "newspaper_subscription") {
-        entries.push(...await getManualNewspaperAccessRows({ userId }));
-      }
-      return { user_content_access: sortUserAccessEntries(entries) };
+      return {
+        user_content_access: await getUserAccessEntriesFromPostgres({
+          userId,
+          itemType,
+        }),
+      };
     }
     case "GetAccessAll": {
       const userId = toPositiveIntOrNull(variables.user_id);
       if (!userId) return { user_content_access: [] };
       return {
-        user_content_access: await selectUserContentAccessDirect({
-          whereSql: "user_id = $1::bigint AND is_active = TRUE",
-          values: [userId],
-          orderBy: "started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC",
-          includeManual: true,
-        }),
+        user_content_access: await getUserAccessEntriesFromPostgres({ userId }),
       };
     }
     case "GetLatestAccess": {
@@ -7669,29 +7772,12 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
       const itemType = String(variables.item_type || "").trim();
       const itemId = toPositiveIntOrNull(variables.item_id);
       if (!userId || !itemType) return { user_content_access: [] };
-      const conditions = [
-        "user_id = $1::bigint",
-        "item_type = $2::public.access_item_type",
-        "is_active = TRUE",
-      ];
-      const values = [userId, itemType];
-      if (itemId == null) {
-        conditions.push("item_id IS NULL");
-      } else {
-        values.push(itemId);
-        conditions.push(`item_id = $${values.length}::bigint`);
-      }
-      const accessRows = await selectUserContentAccessDirect({
-        whereSql: conditions.join(" AND "),
-        values,
-        orderBy: "expires_at DESC NULLS LAST, started_at DESC NULLS LAST, id DESC",
-        limit: 1,
+      const accessRows = await getUserAccessEntriesFromPostgres({
+        userId,
+        itemType,
+        itemId: itemId == null ? null : itemId,
       });
-      if (itemType !== "newspaper_subscription" || itemId != null) {
-        return { user_content_access: accessRows };
-      }
-      const manualRows = await getManualNewspaperAccessRows({ userId });
-      return { user_content_access: sortUserAccessEntries([...accessRows, ...manualRows]).slice(0, 1) };
+      return { user_content_access: accessRows.slice(0, 1) };
     }
     case "GetLatestManualNewspaperAccess": {
       const userId = toPositiveIntOrNull(variables.user_id);
@@ -8265,18 +8351,17 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
         .map((value) => Number.parseInt(value, 10))
         .filter((value) => Number.isInteger(value) && value > 0);
       if (!normalizedIds.length) return { user_content_access: [] };
-      const includeManual = true;
-      const access = await selectUserContentAccessDirect({
-        whereSql: op === "GetUserAccess"
-          ? "user_id = $1::bigint AND is_active = TRUE"
-          : op === "GetUserAccessAll"
-            ? "user_id = $1::bigint"
-            : "user_id = ANY($1::bigint[]) AND is_active = TRUE",
-        values: op === "GetExportAccess" ? [normalizedIds] : [normalizedIds[0]],
-        orderBy: "started_at DESC NULLS LAST, expires_at DESC NULLS LAST, id DESC",
-        includeManual,
-      });
-      return { user_content_access: access };
+      if (op === "GetExportAccess") {
+        const access = await Promise.all(
+          normalizedIds.map((userId) => getUserAccessEntriesFromPostgres({ userId }))
+        );
+        return { user_content_access: mergeAccessEntries(access.flat()) };
+      }
+      return {
+        user_content_access: await getUserAccessEntriesFromPostgres({
+          userId: normalizedIds[0],
+        }),
+      };
     }
     case "GetManualNewspaperAccess": {
       const userId = toPositiveIntOrNull(variables.user_id);
