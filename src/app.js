@@ -6163,6 +6163,7 @@ const selectReviewsDirect = async ({
   values = [],
   orderBy = "created_at DESC, id DESC",
   limit = null,
+  offset = null,
 }) => homePostgresQuery(
   [
     "SELECT",
@@ -6181,6 +6182,7 @@ const selectReviewsDirect = async ({
     "FROM public.product_reviews",
     `WHERE ${whereSql}`,
     `ORDER BY ${orderBy}`,
+    offset !== null && offset !== undefined ? `OFFSET ${Number(offset)}` : "",
     limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
   ]
     .filter(Boolean)
@@ -7440,6 +7442,57 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
     }
     case "AdminAllReviews":
       return { product_reviews: await selectReviewsDirect({ orderBy: "created_at DESC, id DESC" }) };
+    case "ListReviewsPage": {
+      const keyword = String(variables.keyword || "").trim();
+      const status = String(variables.status || "all").trim().toLowerCase();
+      const sort = String(variables.sort || "created_desc").trim().toLowerCase();
+      const limit = Math.min(Math.max(toPositiveIntOrNull(variables.limit) || 20, 1), 100);
+      const offset = Math.max(0, Number.parseInt(variables.offset, 10) || 0);
+      const whereParts = [];
+      const values = [];
+      if (status && status !== "all") {
+        values.push(status);
+        whereParts.push(`status = $${values.length}::text`);
+      }
+      if (keyword) {
+        values.push(`%${keyword}%`);
+        const v = `$${values.length}::text`;
+        whereParts.push(
+          `(
+            COALESCE(product_title, '') ILIKE ${v}
+            OR COALESCE(user_name, '') ILIKE ${v}
+            OR COALESCE(user_email, '') ILIKE ${v}
+            OR COALESCE(comment, '') ILIKE ${v}
+            OR COALESCE(product_type, '') ILIKE ${v}
+          )`
+        );
+      }
+      const whereSql = whereParts.length ? whereParts.join(" AND ") : "TRUE";
+      const orderMap = {
+        created_desc: "created_at DESC, id DESC",
+        created_asc: "created_at ASC, id ASC",
+        rating_desc: "rating DESC, created_at DESC, id DESC",
+        rating_asc: "rating ASC, created_at ASC, id ASC",
+      };
+      const orderBy = orderMap[sort] || orderMap.created_desc;
+      const rows = await selectReviewsDirect({
+        whereSql,
+        values,
+        orderBy,
+        limit,
+        offset,
+      });
+      const countRows = await homePostgresQuery(
+        `SELECT COUNT(*)::int AS count FROM public.product_reviews WHERE ${whereSql}`,
+        values
+      );
+      return {
+        product_reviews: rows,
+        product_reviews_aggregate: {
+          aggregate: { count: Number(countRows[0]?.count || 0) },
+        },
+      };
+    }
     case "AdminProductReviews": {
       const productType = String(variables.product_type || "").trim();
       const productId = toPositiveIntOrNull(variables.product_id);
