@@ -5622,6 +5622,7 @@ const selectOrdersDirect = async ({
   values = [],
   orderBy = "created_at DESC, id DESC",
   limit = null,
+  offset = null,
   includeItems = false,
   includeUser = false,
 }) => {
@@ -5651,6 +5652,7 @@ const selectOrdersDirect = async ({
       includeUser ? "LEFT JOIN public.users u ON u.id = o.user_id" : "",
       `WHERE ${whereSql}`,
       `ORDER BY ${orderBy}`,
+      offset !== null && offset !== undefined ? `OFFSET ${Number(offset)}` : "",
       limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
     ]
       .filter(Boolean)
@@ -5693,6 +5695,58 @@ const selectOrdersDirect = async ({
     ...order,
     order_items: itemsByOrderId.get(Number(order.id)) || [],
   }));
+};
+
+const buildOrdersFilter = ({
+  keyword = "",
+  status = "all",
+  startDate = "",
+  endDate = "",
+}) => {
+  const whereParts = [];
+  const values = [];
+  const normalizedStatus = String(status || "all").trim().toLowerCase();
+  const normalizedKeyword = String(keyword || "").trim();
+  const normalizedStartDate = String(startDate || "").trim();
+  const normalizedEndDate = String(endDate || "").trim();
+
+  if (normalizedStatus && normalizedStatus !== "all") {
+    values.push(normalizedStatus);
+    whereParts.push(`o.status::text = $${values.length}::text`);
+  }
+
+  if (normalizedKeyword) {
+    values.push(`%${normalizedKeyword}%`);
+    const placeholder = `$${values.length}::text`;
+    whereParts.push(
+      `(
+        CAST(o.id AS text) ILIKE ${placeholder}
+        OR COALESCE(u.name, '') ILIKE ${placeholder}
+        OR COALESCE(u.email, '') ILIKE ${placeholder}
+        OR COALESCE(o.merchant_payment_id, '') ILIKE ${placeholder}
+        OR COALESCE(o.payment_session_token, '') ILIKE ${placeholder}
+        OR COALESCE(o.promo_code, '') ILIKE ${placeholder}
+        OR COALESCE(o.payment_provider, '') ILIKE ${placeholder}
+      )`
+    );
+  }
+
+  if (normalizedStartDate && normalizedEndDate) {
+    values.push(normalizedStartDate);
+    values.push(normalizedEndDate);
+    whereParts.push(`o.created_at::date BETWEEN $${values.length - 1}::date AND $${values.length}::date`);
+  } else if (normalizedStartDate) {
+    values.push(normalizedStartDate);
+    whereParts.push(`o.created_at::date = $${values.length}::date`);
+  } else if (normalizedEndDate) {
+    values.push(normalizedEndDate);
+    whereParts.push(`o.created_at::date = $${values.length}::date`);
+  }
+
+  return {
+    whereSql: whereParts.length ? whereParts.join(" AND ") : "TRUE",
+    values,
+  };
 };
 
 const selectUserContentAccessDirect = async ({
@@ -8236,6 +8290,50 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
           orderBy: "o.created_at DESC, o.id DESC",
           includeUser: true,
         }),
+      };
+    }
+    case "ListOrdersPage": {
+      const page = Math.max(1, toPositiveIntOrNull(variables.page) || 1);
+      const pageSize = Math.min(Math.max(toPositiveIntOrNull(variables.page_size) || 20, 1), 100);
+      const offset = (page - 1) * pageSize;
+      const { whereSql, values } = buildOrdersFilter({
+        keyword: variables.keyword || "",
+        status: variables.status || "all",
+        startDate: variables.start_date || "",
+        endDate: variables.end_date || "",
+      });
+      const sort = String(variables.sort || "created_desc").trim().toLowerCase();
+      const orderMap = {
+        created_desc: "o.created_at DESC, o.id DESC",
+        created_asc: "o.created_at ASC, o.id ASC",
+        total_desc: "o.total_paid DESC NULLS LAST, o.created_at DESC, o.id DESC",
+        total_asc: "o.total_paid ASC NULLS LAST, o.created_at ASC, o.id ASC",
+      };
+      const orderBy = orderMap[sort] || orderMap.created_desc;
+      const orders = await selectOrdersDirect({
+        whereSql,
+        values,
+        orderBy,
+        limit: pageSize,
+        offset,
+        includeUser: true,
+      });
+      const countRows = await homePostgresQuery(
+        `
+          SELECT COUNT(*)::int AS count
+          FROM public.orders o
+          LEFT JOIN public.users u ON u.id = o.user_id
+          WHERE ${whereSql}
+        `,
+        values
+      );
+      return {
+        orders,
+        orders_aggregate: {
+          aggregate: {
+            count: Number(countRows[0]?.count || 0),
+          },
+        },
       };
     }
     case "InsertAccess": {
