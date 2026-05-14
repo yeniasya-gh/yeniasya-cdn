@@ -16,6 +16,7 @@ const bcrypt = require("bcryptjs");
 const helmet = require("helmet");
 const { Pool } = require("pg");
 const rateLimit = require("express-rate-limit");
+const ExcelJS = require("exceljs");
 
 const PORT = process.env.PORT || 3001;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
@@ -24,6 +25,8 @@ const STORAGE_ROOT = path.resolve(
   process.env.STORAGE_ROOT || path.join(__dirname, "..", "storage")
 );
 const TMP_DIR = path.join(STORAGE_ROOT, "_tmp");
+const ADMIN_EXPORTS_DIR = path.join(STORAGE_ROOT, "admin_exports");
+const ADMIN_USERS_EXPORT_JOB_TYPE = "users_excel";
 const ALLOWED_ORIGINS = (() => {
   const origins = (process.env.ALLOWED_ORIGINS || "*")
     .split(",")
@@ -1156,6 +1159,7 @@ function ensureDirs() {
     });
   });
   fs.mkdirSync(TMP_DIR, { recursive: true });
+  fs.mkdirSync(ADMIN_EXPORTS_DIR, { recursive: true });
 }
 
 ensureDirs();
@@ -6066,6 +6070,741 @@ const selectEklerDirect = async ({
     .filter(Boolean)
     .join(" ");
   return homePostgresQuery(query, values);
+};
+
+const ADMIN_EXPORT_JOB_DEFAULT_NAME = "kullanicilar";
+let adminUsersExportSchemaEnsured = false;
+let adminUsersExportSchemaPromise = null;
+let adminUsersExportWorkerRunning = false;
+let adminUsersExportWorkerTimer = null;
+
+const ensureAdminUsersExportJobsSchema = async () => {
+  if (adminUsersExportSchemaEnsured) return;
+
+  if (!adminUsersExportSchemaPromise) {
+    adminUsersExportSchemaPromise = (async () => {
+      await homePostgresQuery(`
+        CREATE TABLE IF NOT EXISTS public.admin_export_jobs (
+          id text PRIMARY KEY,
+          export_type text NOT NULL,
+          status text NOT NULL DEFAULT 'queued',
+          requested_by_user_id bigint NULL REFERENCES public.users(id) ON DELETE SET NULL,
+          requested_by_user_name text NULL,
+          requested_by_user_email text NULL,
+          filters jsonb NOT NULL DEFAULT '{}'::jsonb,
+          file_name text NULL,
+          file_path text NULL,
+          file_size_bytes bigint NULL,
+          total_count int NOT NULL DEFAULT 0,
+          access_count int NOT NULL DEFAULT 0,
+          order_count int NOT NULL DEFAULT 0,
+          error_message text NULL,
+          created_at timestamptz NOT NULL DEFAULT NOW(),
+          updated_at timestamptz NOT NULL DEFAULT NOW(),
+          started_at timestamptz NULL,
+          completed_at timestamptz NULL
+        )
+      `);
+      await homePostgresQuery(
+        `CREATE INDEX IF NOT EXISTS admin_export_jobs_status_created_idx ON public.admin_export_jobs(status, created_at DESC)`
+      );
+      await homePostgresQuery(
+        `CREATE INDEX IF NOT EXISTS admin_export_jobs_requested_by_idx ON public.admin_export_jobs(requested_by_user_id, created_at DESC)`
+      );
+      adminUsersExportSchemaEnsured = true;
+    })().finally(() => {
+      adminUsersExportSchemaPromise = null;
+    });
+  }
+
+  await adminUsersExportSchemaPromise;
+};
+
+const adminExportText = (value, fallback = "-") => {
+  const text = value === null || value === undefined ? "" : String(value).trim();
+  return text || fallback;
+};
+
+const adminExportDateTime = (value, { dateOnly = false } = {}) => {
+  const raw = value === null || value === undefined ? "" : String(value).trim();
+  if (!raw) return "-";
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return raw;
+  const day = String(date.getDate()).padStart(2, "0");
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const year = date.getFullYear();
+  if (dateOnly) {
+    return `${day}.${month}.${year}`;
+  }
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${day}.${month}.${year} ${hours}:${minutes}`;
+};
+
+const adminExportPrice = (value) => {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "-";
+  return new Intl.NumberFormat("tr-TR", {
+    style: "currency",
+    currency: "TRY",
+    maximumFractionDigits: 2,
+  }).format(amount);
+};
+
+const adminExportItemTypeLabel = (type) => {
+  switch (String(type || "").trim().toLowerCase()) {
+    case "book":
+      return "Kitap";
+    case "magazine":
+      return "E-Dergi";
+    case "magazine_issue":
+      return "Dergi Sayısı";
+    case "newspaper_subscription":
+      return "E-Gazete";
+    case "ek":
+      return "Ek";
+    default:
+      return String(type || "-");
+  }
+};
+
+const adminExportChannelLabel = (row) => {
+  const source = String(row?.grant_source || row?.source || "").trim().toLowerCase();
+  const platform = String(row?.purchase_platform || "").trim().toLowerCase();
+
+  if (source === "manual_newspaper") {
+    return "Manuel";
+  }
+  if (source === "revenuecat") {
+    return "RevenueCat";
+  }
+  if (source === "order_payment") {
+    if (platform === "web") return "Web";
+    if (platform === "ios") return "iOS";
+    if (platform === "android") return "Android";
+    return "Sanal Pos";
+  }
+  if (platform) {
+    return platform.charAt(0).toUpperCase() + platform.slice(1);
+  }
+  return source ? source.replace(/_/g, " ") : "-";
+};
+
+const adminExportGroupByUserId = (rows) => {
+  const grouped = new Map();
+  for (const row of rows || []) {
+    const userId = toPositiveIntOrNull(row?.user_id);
+    if (!userId) continue;
+    if (!grouped.has(userId)) {
+      grouped.set(userId, []);
+    }
+    grouped.get(userId).push({ ...row });
+  }
+  return grouped;
+};
+
+const adminExportCollectIds = (rows, type) =>
+  [
+    ...new Set(
+      (rows || [])
+        .filter((row) => String(row?.item_type || "") === type)
+        .map((row) => toPositiveIntOrNull(row?.item_id))
+        .filter(Boolean)
+    ),
+  ];
+
+const adminExportLatestDate = (values) => {
+  let latest = null;
+  for (const value of values || []) {
+    const date = value ? new Date(value) : null;
+    if (!date || Number.isNaN(date.getTime())) continue;
+    if (!latest || date.getTime() > latest.getTime()) {
+      latest = date;
+    }
+  }
+  return latest;
+};
+
+const adminExportLatestChannel = (accessRows, orderRows) => {
+  const orderedAccess = [...(accessRows || [])].sort((a, b) => {
+    const aDate = new Date(a?.started_at || a?.created_at || 0).getTime();
+    const bDate = new Date(b?.started_at || b?.created_at || 0).getTime();
+    return bDate - aDate;
+  });
+  const latestAccess = orderedAccess[0];
+  if (latestAccess) {
+    const channel = adminExportChannelLabel(latestAccess);
+    if (channel && channel !== "-") return channel;
+  }
+
+  const latestOrder = [...(orderRows || [])].sort((a, b) => {
+    const aDate = new Date(a?.created_at || 0).getTime();
+    const bDate = new Date(b?.created_at || 0).getTime();
+    return bDate - aDate;
+  })[0];
+  if (latestOrder) {
+    const channel = adminExportChannelLabel(latestOrder);
+    if (channel && channel !== "-") return channel;
+  }
+
+  return "-";
+};
+
+const adminExportSummarizeAccessRows = (rows) =>
+  (rows || [])
+    .slice(0, 3)
+    .map((row) => {
+      const title = adminExportText(row?.item_title, "");
+      if (!title) return "";
+      const expiresAt = adminExportDateTime(row?.expires_at, { dateOnly: true });
+      return expiresAt !== "-" ? `${title} (${expiresAt})` : title;
+    })
+    .filter(Boolean)
+    .join(" | ");
+
+const adminExportMapById = (rows) => {
+  const map = new Map();
+  for (const row of rows || []) {
+    const id = toPositiveIntOrNull(row?.id);
+    if (!id) continue;
+    map.set(id, row);
+  }
+  return map;
+};
+
+const selectBooksByIdsDirect = async (ids) => {
+  const normalized = [
+    ...new Set((ids || []).map((id) => toPositiveIntOrNull(id)).filter(Boolean)),
+  ];
+  if (!normalized.length) return [];
+  return selectBooksDirect({
+    whereSql: "b.id = ANY($1::int[])",
+    values: [normalized],
+    orderBy: "b.id ASC",
+  });
+};
+
+const selectMagazinesByIdsDirect = async (ids) => {
+  const normalized = [
+    ...new Set((ids || []).map((id) => toPositiveIntOrNull(id)).filter(Boolean)),
+  ];
+  if (!normalized.length) return [];
+  return selectMagazinesDirect({
+    whereSql: "m.id = ANY($1::int[])",
+    values: [normalized],
+    orderBy: "m.id ASC",
+  });
+};
+
+const selectMagazineIssuesByIdsDirect = async (ids) => {
+  const normalized = [
+    ...new Set((ids || []).map((id) => toPositiveIntOrNull(id)).filter(Boolean)),
+  ];
+  if (!normalized.length) return [];
+  return selectMagazineIssuesDirect({
+    whereSql: "mi.id = ANY($1::int[])",
+    values: [normalized],
+    orderBy: "mi.id ASC",
+    includeMagazine: true,
+  });
+};
+
+const selectNewspaperTypesByIdsDirect = async (ids) => {
+  const normalized = [
+    ...new Set((ids || []).map((id) => toPositiveIntOrNull(id)).filter(Boolean)),
+  ];
+  if (!normalized.length) return [];
+  return selectNewspaperSubscriptionTypesDirect({
+    whereSql: "id = ANY($1::bigint[])",
+    values: [normalized.map((id) => id.toString())],
+    orderBy: "id ASC",
+  });
+};
+
+const selectEklerByIdsDirect = async (ids) => {
+  const normalized = [
+    ...new Set((ids || []).map((id) => toPositiveIntOrNull(id)).filter(Boolean)),
+  ];
+  if (!normalized.length) return [];
+  return selectEklerDirect({
+    whereSql: "e.id = ANY($1::bigint[])",
+    values: [normalized.map((id) => id.toString())],
+    orderBy: "e.id ASC",
+  });
+};
+
+const buildAdminUsersExportWorkbook = async ({ filePath }) => {
+  const users = await selectUsersDirect({
+    whereSql: "u.is_active = TRUE",
+    orderBy: "u.id ASC",
+    includeRole: true,
+  });
+  const userIds = users.map((user) => toPositiveIntOrNull(user?.id)).filter(Boolean);
+  const userIdSet = new Set(userIds);
+
+  const accessRows = userIds.length
+    ? await selectUserContentAccessDirect({
+        whereSql: "user_id = ANY($1::bigint[]) AND is_active = TRUE",
+        values: [userIds.map((id) => id.toString())],
+        orderBy: "user_id ASC, started_at DESC NULLS LAST, id DESC",
+        includeManual: true,
+      })
+    : [];
+  const orders = userIds.length
+    ? await selectOrdersDirect({
+        whereSql: "o.user_id = ANY($1::bigint[])",
+        values: [userIds.map((id) => id.toString())],
+        orderBy: "o.created_at DESC, o.id DESC",
+        includeUser: false,
+      })
+    : [];
+  const filteredOrders = orders.filter((order) => userIdSet.has(toPositiveIntOrNull(order?.user_id)));
+
+  const booksById = adminExportMapById(await selectBooksByIdsDirect(adminExportCollectIds(accessRows, "book")));
+  const magazinesById = adminExportMapById(await selectMagazinesByIdsDirect(adminExportCollectIds(accessRows, "magazine")));
+  const issuesById = adminExportMapById(await selectMagazineIssuesByIdsDirect(adminExportCollectIds(accessRows, "magazine_issue")));
+  const newspaperTypesById = adminExportMapById(await selectNewspaperTypesByIdsDirect(adminExportCollectIds(accessRows, "newspaper_subscription")));
+  const eklerById = adminExportMapById(await selectEklerByIdsDirect(adminExportCollectIds(accessRows, "ek")));
+
+  const enrichedAccessRows = accessRows
+    .map((row) => {
+      const itemType = String(row?.item_type || "").trim().toLowerCase();
+      const itemId = toPositiveIntOrNull(row?.item_id);
+      const normalized = { ...row };
+
+      switch (itemType) {
+        case "book": {
+          const book = itemId ? booksById.get(itemId) : null;
+          normalized.item_title = book?.title || "Kitap";
+          normalized.item_subtitle = book?.author_rel?.name || null;
+          break;
+        }
+        case "magazine": {
+          const magazine = itemId ? magazinesById.get(itemId) : null;
+          normalized.item_title = magazine?.name || "E-Dergi";
+          normalized.item_subtitle = magazine?.category || null;
+          break;
+        }
+        case "magazine_issue": {
+          const issue = itemId ? issuesById.get(itemId) : null;
+          const magazineName = issue?.magazine?.name?.toString().trim() || "";
+          const issueNumber = issue?.issue_number?.toString().trim() || "";
+          normalized.item_title = [
+            magazineName,
+            issueNumber ? `Sayı ${issueNumber}` : "Dergi Sayısı",
+          ]
+            .filter(Boolean)
+            .join(" • ");
+          normalized.item_subtitle =
+            issue?.added_at?.toString?.() ||
+            issue?.created_at?.toString?.() ||
+            null;
+          break;
+        }
+        case "newspaper_subscription": {
+          const subscriptionType = itemId ? newspaperTypesById.get(itemId) : null;
+          normalized.item_title =
+            subscriptionType?.title ||
+            (String(normalized.source || "") === "manual_newspaper"
+              ? "Manuel E-Gazete Aboneliği"
+              : "E-Gazete Aboneliği");
+          normalized.item_subtitle = normalized.note?.toString?.() || null;
+          break;
+        }
+        case "ek": {
+          const ek = itemId ? eklerById.get(itemId) : null;
+          normalized.item_title = ek?.ad || "Ek";
+          normalized.item_subtitle = ek?.aciklama || null;
+          break;
+        }
+        default:
+          normalized.item_title = adminExportItemTypeLabel(itemType);
+          normalized.item_subtitle = null;
+      }
+
+      normalized.item_type_label = adminExportItemTypeLabel(itemType);
+      normalized.access_channel_label = adminExportChannelLabel(normalized);
+      return normalized;
+    })
+    .sort((a, b) => {
+      const aStart = new Date(a?.started_at || a?.created_at || 0).getTime();
+      const bStart = new Date(b?.started_at || b?.created_at || 0).getTime();
+      if (bStart !== aStart) return bStart - aStart;
+      const aExp = new Date(a?.expires_at || 0).getTime();
+      const bExp = new Date(b?.expires_at || 0).getTime();
+      return bExp - aExp;
+    });
+
+  const accessByUser = adminExportGroupByUserId(enrichedAccessRows);
+  const ordersByUser = adminExportGroupByUserId(filteredOrders);
+
+  const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({
+    filename: filePath,
+    useStyles: true,
+    useSharedStrings: true,
+  });
+  workbook.creator = "Yeni Asya CDN";
+  workbook.created = new Date();
+  workbook.modified = new Date();
+
+  const writeSheet = (name, headers, rows, widths) => {
+    const sheet = workbook.addWorksheet(name);
+    sheet.views = [{ state: "frozen", ySplit: 1 }];
+    widths.forEach((width, index) => {
+      sheet.getColumn(index + 1).width = width;
+    });
+    const headerRow = sheet.addRow(headers);
+    headerRow.font = { bold: true };
+    headerRow.commit();
+    rows.forEach((row) => {
+      sheet.addRow(row).commit();
+    });
+    sheet.commit();
+  };
+
+  const usersRows = users.map((user) => {
+    const userId = toPositiveIntOrNull(user?.id);
+    const userAccessRows = userId ? accessByUser.get(userId) || [] : [];
+    const userOrderRows = userId ? ordersByUser.get(userId) || [] : [];
+    const latestExpiry = adminExportLatestDate(
+      userAccessRows.map((row) => row?.expires_at).filter(Boolean)
+    );
+    const latestPurchase = adminExportLatestDate([
+      ...userAccessRows.map((row) => row?.started_at),
+      ...userOrderRows.map((row) => row?.created_at),
+    ].filter(Boolean));
+
+    return [
+      userId?.toString() || "-",
+      adminExportText(user?.name),
+      adminExportText(user?.email),
+      adminExportText(user?.phone),
+      adminExportText(user?.role?.name || user?.role || "User"),
+      String(userAccessRows.length),
+      String(userOrderRows.length),
+      adminExportDateTime(latestExpiry, { dateOnly: true }),
+      adminExportDateTime(latestPurchase),
+      adminExportLatestChannel(userAccessRows, userOrderRows),
+      adminExportSummarizeAccessRows(userAccessRows),
+    ];
+  });
+
+  const usersById = new Map(
+    users.map((user) => [toPositiveIntOrNull(user?.id), user]).filter(([id]) => !!id)
+  );
+
+  const accessSheetRows = enrichedAccessRows.map((row) => {
+    const user = usersById.get(toPositiveIntOrNull(row?.user_id)) || null;
+    return [
+      adminExportText(row?.user_id),
+      adminExportText(user?.name),
+      adminExportText(user?.email),
+      adminExportText(user?.phone),
+      adminExportText(row?.item_type_label),
+      adminExportText(row?.item_title),
+      adminExportText(row?.item_subtitle),
+      adminExportDateTime(row?.started_at),
+      adminExportDateTime(row?.expires_at, { dateOnly: true }),
+      adminExportPrice(row?.purchase_price),
+      adminExportText(row?.source || row?.grant_source),
+      adminExportText(row?.access_channel_label),
+      row?.is_active === true ? "Aktif" : "Pasif",
+      adminExportText(row?.note),
+    ];
+  });
+
+  const ordersSheetRows = filteredOrders.map((order) => {
+    const user = usersById.get(toPositiveIntOrNull(order?.user_id)) || null;
+    return [
+      adminExportText(order?.id),
+      adminExportText(order?.user_id),
+      adminExportText(user?.name),
+      adminExportText(user?.email),
+      adminExportPrice(order?.total_paid),
+      adminExportText(order?.status),
+      adminExportChannelLabel(order),
+      adminExportDateTime(order?.created_at),
+    ];
+  });
+
+  writeSheet(
+    "Kullanicilar",
+    [
+      "ID",
+      "Ad Soyad",
+      "E-posta",
+      "Telefon",
+      "Rol",
+      "Aktif Abonelik Sayısı",
+      "Sipariş Sayısı",
+      "Son Abonelik Bitişi",
+      "Son Satın Alma Tarihi",
+      "Son Satın Alma Kanalı",
+      "Aktif Satın Alma Özeti",
+    ],
+    usersRows,
+    [10, 24, 28, 18, 16, 18, 14, 20, 20, 18, 44]
+  );
+
+  writeSheet(
+    "Abonelikler",
+    [
+      "Kullanıcı ID",
+      "Ad Soyad",
+      "E-posta",
+      "Telefon",
+      "Tür",
+      "Ürün",
+      "Alt Bilgi",
+      "Başlangıç",
+      "Bitiş",
+      "Fiyat",
+      "Kaynak",
+      "Kanal",
+      "Durum",
+      "Not",
+    ],
+    accessSheetRows,
+    [12, 24, 28, 18, 18, 30, 24, 20, 20, 14, 18, 18, 12, 28]
+  );
+
+  writeSheet(
+    "Siparisler",
+    [
+      "Sipariş ID",
+      "Kullanıcı ID",
+      "Ad Soyad",
+      "E-posta",
+      "Tutar",
+      "Durum",
+      "Ödeme Kanalı",
+      "Tarih",
+    ],
+    ordersSheetRows,
+    [12, 12, 24, 28, 14, 16, 18, 20]
+  );
+
+  await workbook.commit();
+
+  return {
+    userCount: usersRows.length,
+    accessCount: accessSheetRows.length,
+    orderCount: ordersSheetRows.length,
+  };
+};
+
+const formatAdminUsersExportJobRow = (row) => {
+  if (!row) return null;
+  return {
+    id: row.id,
+    export_type: row.export_type,
+    status: row.status,
+    requested_by_user_id: row.requested_by_user_id,
+    requested_by_user_name: row.requested_by_user_name,
+    requested_by_user_email: row.requested_by_user_email,
+    file_name: row.file_name,
+    file_path: row.file_path,
+    file_size_bytes: row.file_size_bytes,
+    total_count: row.total_count,
+    access_count: row.access_count,
+    order_count: row.order_count,
+    error_message: row.error_message,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    started_at: row.started_at,
+    completed_at: row.completed_at,
+    download_url:
+      row.status === "completed" && row.file_name
+        ? `/admin/users/export-jobs/${encodeURIComponent(row.id)}/download`
+        : null,
+  };
+};
+
+const getAdminUsersExportJobById = async (id) => {
+  const normalizedId = String(id || "").trim();
+  if (!normalizedId) return null;
+  const rows = await homePostgresQuery(
+    `
+      SELECT
+        id,
+        export_type,
+        status,
+        requested_by_user_id,
+        requested_by_user_name,
+        requested_by_user_email,
+        filters,
+        file_name,
+        file_path,
+        file_size_bytes,
+        total_count,
+        access_count,
+        order_count,
+        error_message,
+        created_at,
+        updated_at,
+        started_at,
+        completed_at
+      FROM public.admin_export_jobs
+      WHERE id = $1::text
+      LIMIT 1
+    `,
+    [normalizedId]
+  );
+  return rows[0] || null;
+};
+
+const claimNextAdminUsersExportJob = async () => {
+  const rows = await homePostgresQuery(
+    `
+      WITH next_job AS (
+        SELECT id
+        FROM public.admin_export_jobs
+        WHERE export_type = $1::text
+          AND status = 'queued'
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE public.admin_export_jobs j
+      SET status = 'running',
+          started_at = COALESCE(started_at, NOW()),
+          updated_at = NOW()
+      FROM next_job
+      WHERE j.id = next_job.id
+      RETURNING
+        j.id,
+        j.export_type,
+        j.status,
+        j.requested_by_user_id,
+        j.requested_by_user_name,
+        j.requested_by_user_email,
+        j.filters,
+        j.file_name,
+        j.file_path,
+        j.file_size_bytes,
+        j.total_count,
+        j.access_count,
+        j.order_count,
+        j.error_message,
+        j.created_at,
+        j.updated_at,
+        j.started_at,
+        j.completed_at
+    `,
+    [ADMIN_USERS_EXPORT_JOB_TYPE]
+  );
+  return rows[0] || null;
+};
+
+const updateAdminUsersExportJob = async (jobId, patch) => {
+  const payload = compactObject(patch);
+  const keys = Object.keys(payload);
+  if (!keys.length) return null;
+  const setSql = keys
+    .map((key, index) => `${quoteSqlIdentifier(key)} = $${index + 2}`)
+    .join(", ");
+  const values = [jobId, ...keys.map((key) => payload[key])];
+  const rows = await homePostgresQuery(
+    `
+      UPDATE public.admin_export_jobs
+      SET ${setSql}
+      WHERE id = $1::text
+      RETURNING
+        id,
+        export_type,
+        status,
+        requested_by_user_id,
+        requested_by_user_name,
+        requested_by_user_email,
+        filters,
+        file_name,
+        file_path,
+        file_size_bytes,
+        total_count,
+        access_count,
+        order_count,
+        error_message,
+        created_at,
+        updated_at,
+        started_at,
+        completed_at
+    `,
+    values
+  );
+  return rows[0] || null;
+};
+
+const runAdminUsersExportJob = async (job) => {
+  const jobId = String(job?.id || "").trim();
+  if (!jobId) return;
+
+  const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+  const fileName = `${ADMIN_EXPORT_JOB_DEFAULT_NAME}_export_${timestamp}_${jobId.slice(0, 8)}.xlsx`;
+  const filePath = path.join(ADMIN_EXPORTS_DIR, fileName);
+
+  try {
+    const counts = await buildAdminUsersExportWorkbook({ filePath });
+    const stat = await fs.promises.stat(filePath);
+    await updateAdminUsersExportJob(jobId, {
+      status: "completed",
+      file_name: fileName,
+      file_path: filePath,
+      file_size_bytes: stat.size,
+      total_count: counts.userCount,
+      access_count: counts.accessCount,
+      order_count: counts.orderCount,
+      error_message: null,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    console.log(
+      `[admin][exports][users][completed] jobId=${jobId} users=${counts.userCount} access=${counts.accessCount} orders=${counts.orderCount} file=${fileName}`
+    );
+  } catch (err) {
+    await fs.promises.unlink(filePath).catch(() => {});
+    const message = String(err?.message || "Excel export failed.");
+    await updateAdminUsersExportJob(jobId, {
+      status: "failed",
+      error_message: message.slice(0, 2000),
+      updated_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    }).catch(() => {});
+    console.error(`[admin][exports][users][failed] jobId=${jobId} msg=${message}`);
+  }
+};
+
+const processAdminUsersExportJobs = async () => {
+  if (adminUsersExportWorkerRunning) return;
+  adminUsersExportWorkerRunning = true;
+  try {
+    await ensureAdminUsersExportJobsSchema();
+    while (true) {
+      const job = await claimNextAdminUsersExportJob();
+      if (!job) break;
+      await runAdminUsersExportJob(job);
+    }
+  } finally {
+    adminUsersExportWorkerRunning = false;
+  }
+};
+
+const startAdminUsersExportWorker = () => {
+  if (!adminUsersExportWorkerTimer) {
+    adminUsersExportWorkerTimer = setInterval(() => {
+      void processAdminUsersExportJobs().catch((err) => {
+        console.error(
+          `[admin][exports][users][worker-error] ${err?.message || err}`
+        );
+      });
+    }, 10000);
+    if (typeof adminUsersExportWorkerTimer.unref === "function") {
+      adminUsersExportWorkerTimer.unref();
+    }
+  }
+
+  void processAdminUsersExportJobs().catch((err) => {
+    console.error(`[admin][exports][users][startup-error] ${err?.message || err}`);
+  });
 };
 
 const selectSlidersDirect = async ({
@@ -15196,6 +15935,150 @@ app.post("/admin/users/revenuecat/reconcile", requireJwtOrServiceAuth, async (re
   }
 });
 
+app.post("/admin/users/export-jobs", requireJwtOrServiceAuth, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  try {
+    const actor = req.hasuraAuthMode === "jwt" ? await ensureAdminJwtActor(req) : null;
+    await ensureAdminUsersExportJobsSchema();
+
+    const jobId = crypto.randomUUID();
+    const requestedByUserId = actor?.id || null;
+    const requestedByUserName = actor?.name || null;
+    const requestedByUserEmail = actor?.email || null;
+    const filters = req.body?.filters && typeof req.body.filters === "object"
+      ? req.body.filters
+      : {};
+
+    const rows = await homePostgresQuery(
+      `
+        INSERT INTO public.admin_export_jobs (
+          id,
+          export_type,
+          status,
+          requested_by_user_id,
+          requested_by_user_name,
+          requested_by_user_email,
+          filters,
+          created_at,
+          updated_at
+        ) VALUES (
+          $1::text,
+          $2::text,
+          'queued',
+          $3::bigint,
+          $4::text,
+          $5::text,
+          $6::jsonb,
+          NOW(),
+          NOW()
+        )
+        RETURNING
+          id,
+          export_type,
+          status,
+          requested_by_user_id,
+          requested_by_user_name,
+          requested_by_user_email,
+          filters,
+          file_name,
+          file_path,
+          file_size_bytes,
+          total_count,
+          access_count,
+          order_count,
+          error_message,
+          created_at,
+          updated_at,
+          started_at,
+          completed_at
+      `,
+      [
+        jobId,
+        ADMIN_USERS_EXPORT_JOB_TYPE,
+        requestedByUserId,
+        requestedByUserName,
+        requestedByUserEmail,
+        JSON.stringify(filters),
+      ]
+    );
+
+    startAdminUsersExportWorker();
+    const job = formatAdminUsersExportJobRow(rows[0]);
+    console.log(
+      `[admin][exports][users][queued] id=${requestId} jobId=${jobId} actor=${requestedByUserId || "-"}`
+    );
+    return res.json({ ok: true, job });
+  } catch (err) {
+    console.error(
+      `[admin][exports][users][queue-error] id=${requestId} msg=${err.message}`
+    );
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: err.message || "Excel export kuyruklanamadı.",
+    });
+  }
+});
+
+app.get("/admin/users/export-jobs/:id", requireJwtOrServiceAuth, async (req, res) => {
+  try {
+    if (req.hasuraAuthMode === "jwt") {
+      await ensureAdminJwtActor(req);
+    }
+    await ensureAdminUsersExportJobsSchema();
+    const job = await getAdminUsersExportJobById(req.params.id);
+    if (!job) {
+      return res.status(404).json({ ok: false, error: "Export işi bulunamadı." });
+    }
+    return res.json({ ok: true, job: formatAdminUsersExportJobRow(job) });
+  } catch (err) {
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: err.message || "Export işi okunamadı.",
+    });
+  }
+});
+
+app.get(
+  "/admin/users/export-jobs/:id/download",
+  requireJwtOrServiceAuth,
+  async (req, res) => {
+    try {
+      if (req.hasuraAuthMode === "jwt") {
+        await ensureAdminJwtActor(req);
+      }
+      await ensureAdminUsersExportJobsSchema();
+      const job = await getAdminUsersExportJobById(req.params.id);
+      if (!job) {
+        return res.status(404).json({ ok: false, error: "Export işi bulunamadı." });
+      }
+      if (String(job.status || "") !== "completed") {
+        return res.status(409).json({
+          ok: false,
+          error: "Export henüz hazır değil.",
+          job: formatAdminUsersExportJobRow(job),
+        });
+      }
+      if (!job.file_path || !fs.existsSync(job.file_path)) {
+        return res.status(404).json({
+          ok: false,
+          error: "Export dosyası bulunamadı.",
+        });
+      }
+
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
+      return res.download(job.file_path, job.file_name || path.basename(job.file_path));
+    } catch (err) {
+      return res.status(err.statusCode || 500).json({
+        ok: false,
+        error: err.message || "Export indirilemedi.",
+      });
+    }
+  }
+);
+
 app.post("/admin/notifications/send", requireJwtOrServiceAuth, async (req, res) => {
   const requestId = crypto.randomUUID();
   try {
@@ -15549,4 +16432,5 @@ app.use(async (err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`File API listening on http://localhost:${PORT}`);
   startRevenueCatReconcileJob();
+  startAdminUsersExportWorker();
 });
