@@ -6448,8 +6448,9 @@ const buildAdminUsersExportWorkbook = async ({ filePath }) => {
   workbook.modified = new Date();
 
   const writeSheet = (name, headers, rows, widths) => {
-    const sheet = workbook.addWorksheet(name);
-    sheet.views = [{ state: "frozen", ySplit: 1 }];
+    const sheet = workbook.addWorksheet(name, {
+      views: [{ state: "frozen", ySplit: 1 }],
+    });
     widths.forEach((width, index) => {
       sheet.getColumn(index + 1).width = width;
     });
