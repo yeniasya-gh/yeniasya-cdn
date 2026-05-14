@@ -5589,6 +5589,7 @@ const selectNotificationsDirect = async ({
   values = [],
   orderBy = "created_at DESC, id DESC",
   limit = null,
+  offset = null,
   includeUser = false,
 }) => {
   const selectParts = [
@@ -5610,11 +5611,52 @@ const selectNotificationsDirect = async ({
     includeUser ? "LEFT JOIN public.users u ON u.id = n.user_id" : "",
     `WHERE ${whereSql}`,
     `ORDER BY ${orderBy}`,
+    offset !== null && offset !== undefined ? `OFFSET ${Number(offset)}` : "",
     limit !== null && limit !== undefined ? `LIMIT ${Number(limit)}` : "",
   ]
     .filter(Boolean)
     .join(" ");
   return homePostgresQuery(sql, values);
+};
+
+const buildNotificationsSearchFilter = ({ keyword = "", isRead = null }) => {
+  const clauses = [];
+  const values = [];
+  const normalizedKeyword = String(keyword || "").trim();
+  const hasIsRead = isRead !== undefined && isRead !== null && String(isRead).trim() !== "";
+
+  if (hasIsRead) {
+    values.push(toBool(isRead));
+    clauses.push(`n.is_read = $${values.length}::boolean`);
+  }
+
+  if (normalizedKeyword) {
+    values.push(`%${normalizedKeyword}%`);
+    const placeholder = `$${values.length}::text`;
+    clauses.push(
+      `(
+        n.title ILIKE ${placeholder}
+        OR n.body ILIKE ${placeholder}
+        OR CAST(n.id AS text) ILIKE ${placeholder}
+        OR CAST(n.user_id AS text) ILIKE ${placeholder}
+        OR EXISTS (
+          SELECT 1
+          FROM public.users u
+          WHERE u.id = n.user_id
+            AND (
+              u.name ILIKE ${placeholder}
+              OR u.email ILIKE ${placeholder}
+              OR CAST(u.id AS text) ILIKE ${placeholder}
+            )
+        )
+      )`
+    );
+  }
+
+  return {
+    whereSql: clauses.length ? clauses.join(" AND ") : "TRUE",
+    values,
+  };
 };
 
 const selectOrdersDirect = async ({
@@ -8679,6 +8721,43 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
           limit,
           includeUser: true,
         }),
+      };
+    }
+    case "ListAdminNotificationsPage": {
+      const keyword = String(variables.keyword || "").trim();
+      const isRead = Object.prototype.hasOwnProperty.call(variables, "is_read")
+        ? variables.is_read
+        : null;
+      const page = Math.max(1, toPositiveIntOrNull(variables.page) || 1);
+      const pageSize = Math.min(
+        Math.max(toPositiveIntOrNull(variables.page_size) || 20, 1),
+        100
+      );
+      const offset = (page - 1) * pageSize;
+      const { whereSql, values } = buildNotificationsSearchFilter({
+        keyword,
+        isRead,
+      });
+      const notifications = await selectNotificationsDirect({
+        whereSql,
+        values,
+        orderBy: "n.created_at DESC, n.id DESC",
+        limit: pageSize,
+        offset,
+        includeUser: true,
+      });
+      const countRows = await homePostgresQuery(
+        `SELECT COUNT(*)::int AS count FROM public.notifications n WHERE ${whereSql}`,
+        values
+      );
+      const count = toPositiveIntOrNull(countRows[0]?.count) || 0;
+      return {
+        notifications,
+        notifications_aggregate: {
+          aggregate: {
+            count,
+          },
+        },
       };
     }
     case "UpdateNotificationRead": {
