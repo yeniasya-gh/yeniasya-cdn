@@ -2487,6 +2487,127 @@ const getManualNewspaperAccessRows = async ({ userId }) => {
   }
 };
 
+const buildManualNewspaperUsersFilter = ({
+  keyword = "",
+  status = "all",
+  activeState = "all",
+} = {}) => {
+  const clauses = [];
+  const values = [];
+
+  const normalizedKeyword = String(keyword || "").trim();
+  if (normalizedKeyword) {
+    values.push(`%${normalizedKeyword}%`);
+    clauses.push(
+      `(
+        COALESCE(u.name, '') ILIKE $${values.length}::text
+        OR COALESCE(u.email, '') ILIKE $${values.length}::text
+        OR COALESCE(u.phone, '') ILIKE $${values.length}::text
+        OR COALESCE(m.note, '') ILIKE $${values.length}::text
+        OR CAST(m.id AS text) ILIKE $${values.length}::text
+        OR CAST(m.user_id AS text) ILIKE $${values.length}::text
+      )`
+        .replace(/\s+/g, " ")
+        .trim()
+    );
+  }
+
+  const normalizedStatus = String(status || "all").trim().toLowerCase();
+  if (normalizedStatus === "new" || normalizedStatus === "old") {
+    values.push(normalizedStatus);
+    clauses.push(`COALESCE(m.status, 'new') = $${values.length}::text`);
+  }
+
+  const normalizedActiveState = String(activeState || "all").trim().toLowerCase();
+  switch (normalizedActiveState) {
+    case "active":
+      clauses.push(
+        "m.is_active = TRUE AND (m.ends_at IS NULL OR m.ends_at > now())"
+      );
+      break;
+    case "inactive":
+      clauses.push("m.is_active = FALSE");
+      break;
+    case "expired":
+      clauses.push("m.is_active = TRUE AND m.ends_at IS NOT NULL AND m.ends_at <= now()");
+      break;
+    default:
+      break;
+  }
+
+  return {
+    whereSql: clauses.length ? clauses.join(" AND ") : "TRUE",
+    values,
+  };
+};
+
+const getManualNewspaperUsersPageFromPostgres = async ({
+  keyword = "",
+  status = "all",
+  activeState = "all",
+  limit = 20,
+  offset = 0,
+}) => {
+  const safeLimit = Math.max(1, Math.min(200, Number(limit) || 20));
+  const safeOffset = Math.max(0, Number(offset) || 0);
+  const filter = buildManualNewspaperUsersFilter({
+    keyword,
+    status,
+    activeState,
+  });
+
+  const rows = await homePostgresQuery(
+    `
+      SELECT
+        m.id::bigint AS id,
+        m.user_id::bigint AS user_id,
+        m.starts_at,
+        m.ends_at,
+        m.is_active,
+        COALESCE(m.status, 'new') AS status,
+        m.note,
+        m.created_at,
+        m.updated_at,
+        CASE
+          WHEN u.id IS NULL THEN NULL
+          ELSE jsonb_build_object(
+            'id', u.id::bigint,
+            'name', u.name,
+            'email', u.email,
+            'phone', u.phone
+          )
+        END AS user
+      FROM public.manual_newspaper_users m
+      LEFT JOIN public.users u ON u.id = m.user_id
+      WHERE ${filter.whereSql}
+      ORDER BY m.is_active DESC, m.ends_at ASC NULLS LAST, m.id DESC
+      LIMIT $${filter.values.length + 1}::int
+      OFFSET $${filter.values.length + 2}::int
+    `,
+    [...filter.values, safeLimit, safeOffset]
+  );
+
+  const countRows = await homePostgresQuery(
+    `
+      SELECT COUNT(*)::bigint AS total_count
+      FROM public.manual_newspaper_users m
+      LEFT JOIN public.users u ON u.id = m.user_id
+      WHERE ${filter.whereSql}
+    `,
+    filter.values
+  );
+
+  const totalCount = Number(countRows[0]?.total_count || 0) || 0;
+  return {
+    manual_newspaper_users: rows,
+    manual_newspaper_users_aggregate: {
+      aggregate: {
+        count: totalCount,
+      },
+    },
+  };
+};
+
 const mergeAccessEntries = (entries) => {
   const sorted = sortUserAccessEntries(
     (Array.isArray(entries) ? entries : []).map((entry) => ({ ...entry }))
@@ -8429,6 +8550,17 @@ const executeDirectGraphqlRequest = async ({ query, variables = {}, operationNam
         `
       );
       return { manual_newspaper_users: rows };
+    }
+    case "ListManualNewspaperUsersPage": {
+      const limit = toPositiveIntOrNull(variables.limit) || 20;
+      const offset = Math.max(0, Number.parseInt(variables.offset, 10) || 0);
+      return getManualNewspaperUsersPageFromPostgres({
+        keyword: variables.keyword || "",
+        status: variables.status || "all",
+        activeState: variables.active_state || "all",
+        limit,
+        offset,
+      });
     }
     case "SearchManualUsers":
     case "SearchManualUsersFallback": {
