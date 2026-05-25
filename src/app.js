@@ -350,6 +350,21 @@ const REVENUECAT_DEFAULT_ENTITLEMENT_ID =
 const REVENUECAT_WEB_CHECKOUT_PLATFORM =
   process.env.REVENUECAT_WEB_CHECKOUT_PLATFORM || "paratika";
 const REVENUECAT_ACCESS_SOURCE = "revenuecat";
+const getRevenueCatEntitlementIdsToCheck = (preferredEntitlementId = null) => {
+  const ids = [
+    preferredEntitlementId,
+    REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+    ...Object.keys(REVENUECAT_ENTITLEMENT_ACCESS),
+  ];
+  const seen = new Set();
+  return ids
+    .map((value) => normalizeRevenueCatAppUserId(value))
+    .filter((value) => {
+      if (!value || seen.has(value)) return false;
+      seen.add(value);
+      return true;
+    });
+};
 const REVENUECAT_RECONCILE_ENABLED =
   (process.env.REVENUECAT_RECONCILE_ENABLED || "true").toLowerCase() === "true";
 const REVENUECAT_RECONCILE_INTERVAL_MINUTES_RAW = Number(
@@ -11305,10 +11320,18 @@ const getRevenueCatLockFallbackAppUserId = async (
   userId,
   entitlementId = REVENUECAT_DEFAULT_ENTITLEMENT_ID
 ) => {
+  const ids = await getRevenueCatLockFallbackAppUserIds(userId, entitlementId);
+  return ids[0] || null;
+};
+
+const getRevenueCatLockFallbackAppUserIds = async (
+  userId,
+  entitlementId = REVENUECAT_DEFAULT_ENTITLEMENT_ID
+) => {
   const normalizedUserId = toPositiveIntOrNull(userId);
   const normalizedEntitlementId = normalizeRevenueCatAppUserId(entitlementId);
   if (!normalizedUserId || !normalizedEntitlementId) {
-    return null;
+    return [];
   }
 
   const rows = await homePostgresQuery(
@@ -11333,19 +11356,22 @@ const getRevenueCatLockFallbackAppUserId = async (
   );
 
   const currentUserId = normalizedUserId.toString();
+  const fallbackIds = [];
+  const seen = new Set();
   for (const lock of rows || []) {
     const candidates = [
-      normalizeRevenueCatAppUserId(lock.owner_original_app_user_id),
       normalizeRevenueCatAppUserId(lock.owner_app_user_id),
+      normalizeRevenueCatAppUserId(lock.owner_original_app_user_id),
     ];
     for (const candidate of candidates) {
-      if (candidate && candidate !== currentUserId) {
-        return candidate;
+      if (candidate && candidate !== currentUserId && !seen.has(candidate)) {
+        seen.add(candidate);
+        fallbackIds.push(candidate);
       }
     }
   }
 
-  return null;
+  return fallbackIds;
 };
 
 const getEntitlementFromSubscriber = (subscriberEntitlements, entitlementId) => {
@@ -12810,12 +12836,25 @@ const runRevenueCatReconcileJob = async () => {
           continue;
         }
 
-        const verification = await fetchRevenueCatEntitlementState({
-          appUserId,
-          entitlementId: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
-        });
+        const entitlementIdsToCheck = getRevenueCatEntitlementIdsToCheck();
+        let verification = null;
+        let matchedEntitlementId = entitlementIdsToCheck[0] || null;
+        for (const entitlementIdToCheck of entitlementIdsToCheck) {
+          const candidateVerification = await fetchRevenueCatEntitlementState({
+            appUserId,
+            entitlementId: entitlementIdToCheck,
+          });
+          verification = candidateVerification;
+          matchedEntitlementId = entitlementIdToCheck;
+          if (
+            candidateVerification.checked &&
+            candidateVerification.isActive === true
+          ) {
+            break;
+          }
+        }
 
-        if (!verification.checked) {
+        if (!verification || !verification.checked) {
           stats.skipped += 1;
           await writeRevenueCatAuditLog({
             request_id: requestId,
@@ -12824,10 +12863,10 @@ const runRevenueCatReconcileJob = async () => {
             success: false,
             user_id: candidate.user_id,
             app_user_id: appUserId,
-            entitlement_id: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+            entitlement_id: matchedEntitlementId,
             access_action: "skipped_unverified",
-            verification_source: verification.source || null,
-            verification_reason: verification.reason || null,
+            verification_source: verification?.source || null,
+            verification_reason: verification?.reason || null,
             error: "RevenueCat verification unavailable during reconcile.",
           });
           continue;
@@ -12835,7 +12874,7 @@ const runRevenueCatReconcileJob = async () => {
 
         const accessSync = await syncRevenueCatAccessByEntitlement({
           userId: candidate.user_id,
-          entitlementId: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+          entitlementId: matchedEntitlementId,
           isActive: verification.isActive,
           expirationDate: verification.expirationDate,
           appUserId,
@@ -12865,7 +12904,7 @@ const runRevenueCatReconcileJob = async () => {
           success: true,
           user_id: candidate.user_id,
           app_user_id: appUserId,
-          entitlement_id: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+          entitlement_id: matchedEntitlementId,
           is_active: verification.isActive,
           expiration_date: toIsoTimestampOrNull(verification.expirationDate),
           verification_source: verification.source || null,
@@ -12881,7 +12920,7 @@ const runRevenueCatReconcileJob = async () => {
           success: false,
           user_id: candidate.user_id,
           app_user_id: normalizeRevenueCatAppUserId(candidate.app_user_id),
-          entitlement_id: REVENUECAT_DEFAULT_ENTITLEMENT_ID,
+          entitlement_id: getRevenueCatEntitlementIdsToCheck()[0] || null,
           error: err.message || "Reconcile failed.",
         });
         console.error(
@@ -12936,9 +12975,8 @@ const inspectAndRepairRevenueCatSubscriptionForUser = async ({
   entitlementId = REVENUECAT_DEFAULT_ENTITLEMENT_ID,
 }) => {
   const normalizedUserId = toPositiveIntOrNull(userId);
-  const normalizedEntitlementId =
-    normalizeRevenueCatAppUserId(entitlementId) ||
-    normalizeRevenueCatAppUserId(REVENUECAT_DEFAULT_ENTITLEMENT_ID);
+  const entitlementIdsToCheck = getRevenueCatEntitlementIdsToCheck(entitlementId);
+  const normalizedEntitlementId = entitlementIdsToCheck[0];
   if (!normalizedUserId) {
     const err = new Error("userId is required.");
     err.statusCode = 400;
@@ -12971,34 +13009,48 @@ const inspectAndRepairRevenueCatSubscriptionForUser = async ({
 
   addCandidate(user.payUniqe, "payUniqe");
   addCandidate(String(user.id), "userId");
-  addCandidate(
-    await getRevenueCatLockFallbackAppUserId(normalizedUserId, normalizedEntitlementId),
-    "lockFallback"
-  );
+
+  for (const entitlementIdToCheck of entitlementIdsToCheck) {
+    const fallbackIds = await getRevenueCatLockFallbackAppUserIds(
+      normalizedUserId,
+      entitlementIdToCheck
+    );
+    for (const fallbackId of fallbackIds) {
+      addCandidate(fallbackId, "lockFallback");
+    }
+  }
 
   const verifications = [];
   let matchedCandidate = null;
   let matchedVerification = null;
 
-  for (const candidate of candidates) {
-    const verification = await fetchRevenueCatEntitlementState({
-      appUserId: candidate.appUserId,
-      entitlementId: normalizedEntitlementId,
-    });
-    verifications.push({
-      source: candidate.source,
-      appUserId: candidate.appUserId,
-      checked: verification.checked,
-      sourceType: verification.source || null,
-      reason: verification.reason || null,
-      isActive: verification.isActive === true,
-      expirationDate: verification.expirationDate || null,
-      purchasePlatform: verification.purchasePlatform || null,
-    });
+  let matchedEntitlementId = null;
+  for (const entitlementIdToCheck of entitlementIdsToCheck) {
+    for (const candidate of candidates) {
+      const verification = await fetchRevenueCatEntitlementState({
+        appUserId: candidate.appUserId,
+        entitlementId: entitlementIdToCheck,
+      });
+      verifications.push({
+        entitlementId: entitlementIdToCheck,
+        source: candidate.source,
+        appUserId: candidate.appUserId,
+        checked: verification.checked,
+        sourceType: verification.source || null,
+        reason: verification.reason || null,
+        isActive: verification.isActive === true,
+        expirationDate: verification.expirationDate || null,
+        purchasePlatform: verification.purchasePlatform || null,
+      });
 
-    if (verification.checked && verification.isActive === true) {
-      matchedCandidate = candidate;
-      matchedVerification = verification;
+      if (verification.checked && verification.isActive === true) {
+        matchedCandidate = candidate;
+        matchedVerification = verification;
+        matchedEntitlementId = entitlementIdToCheck;
+        break;
+      }
+    }
+    if (matchedCandidate && matchedVerification) {
       break;
     }
   }
@@ -13016,6 +13068,7 @@ const inspectAndRepairRevenueCatSubscriptionForUser = async ({
       matchedAppUserId: null,
       matchedSource: null,
       entitlementId: normalizedEntitlementId,
+      checkedEntitlementIds: entitlementIdsToCheck,
       verifications,
       message: healthy
         ? "Abonelik tarafında kullanıcının sorunu bulunmamaktadır."
@@ -13025,7 +13078,7 @@ const inspectAndRepairRevenueCatSubscriptionForUser = async ({
 
   const syncResult = await syncRevenueCatAccessByEntitlement({
     userId: normalizedUserId,
-    entitlementId: normalizedEntitlementId,
+    entitlementId: matchedEntitlementId || normalizedEntitlementId,
     isActive: true,
     expirationDate: matchedVerification.expirationDate,
     appUserId: matchedCandidate.appUserId,
@@ -13064,7 +13117,8 @@ const inspectAndRepairRevenueCatSubscriptionForUser = async ({
     payUniqeUpdated,
     matchedAppUserId: matchedCandidate.appUserId,
     matchedSource: matchedCandidate.source,
-    entitlementId: normalizedEntitlementId,
+    entitlementId: matchedEntitlementId || normalizedEntitlementId,
+    checkedEntitlementIds: entitlementIdsToCheck,
     verification: {
       ...matchedVerification,
       productIdentifier: matchedVerification.productIdentifier || null,
