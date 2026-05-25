@@ -15894,6 +15894,68 @@ app.post("/admin/users/purge", requireJwtOrServiceAuth, async (req, res) => {
   }
 });
 
+app.post("/admin/users/password", requireJwtOrServiceAuth, async (req, res) => {
+  const requestId = crypto.randomUUID();
+  try {
+    const actor =
+      req.hasuraAuthMode === "jwt" ? await ensureAdminJwtActor(req) : null;
+    const userId = toPositiveIntOrNull(req.body?.userId);
+    const password = String(req.body?.password || "");
+
+    if (!userId) {
+      return res.status(400).json({
+        ok: false,
+        error: "userId zorunludur.",
+      });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({
+        ok: false,
+        error: "Şifre en az 8 karakter olmalıdır.",
+      });
+    }
+    if (
+      !/[A-Z]/.test(password) ||
+      !/[a-z]/.test(password) ||
+      !/[0-9]/.test(password)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "Şifre en az 1 büyük harf, 1 küçük harf ve 1 rakam içermelidir.",
+      });
+    }
+
+    const user = await findUserById(userId);
+    if (!user) {
+      return res.status(404).json({
+        ok: false,
+        error: "Kullanıcı bulunamadı.",
+      });
+    }
+
+    await setUserPasswordHash(userId, await hashPassword(password));
+    await issueUserAuthSession(userId);
+
+    console.log(
+      `[admin][users][password][success] id=${requestId} actor=${actor?.id || "-"} userId=${userId}`
+    );
+    return res.json({
+      ok: true,
+      requestId,
+      actorUserId: actor?.id || null,
+      userId,
+    });
+  } catch (err) {
+    console.error(
+      `[admin][users][password][error] id=${requestId} msg=${err.message}`
+    );
+    return res.status(err.statusCode || 500).json({
+      ok: false,
+      error: err.message || "Şifre güncellenemedi.",
+    });
+  }
+});
+
 app.post("/admin/users/revenuecat/reconcile", requireJwtOrServiceAuth, async (req, res) => {
   const requestId = crypto.randomUUID();
   try {
