@@ -65,7 +65,6 @@ const main = async () => {
         o.id::bigint AS order_id,
         o.user_id::bigint AS user_id,
         o.created_at AS order_created_at,
-        o.updated_at AS order_updated_at,
         o.status::text AS order_status,
         o.payment_approved,
         o.total_paid,
