@@ -2467,6 +2467,7 @@ const sortUserAccessEntries = (entries) => {
 };
 
 const getManualNewspaperAccessRows = async ({ userId }) => {
+  const nowIso = new Date().toISOString();
   try {
     const rows = await homePostgresQuery(
       `
@@ -2480,9 +2481,10 @@ const getManualNewspaperAccessRows = async ({ userId }) => {
         FROM public.manual_newspaper_users
         WHERE user_id = $1
           AND is_active = TRUE
+          AND (ends_at IS NULL OR ends_at > $2::timestamptz)
         ORDER BY ends_at DESC NULLS LAST, starts_at DESC NULLS LAST, id DESC
       `,
-      [userId]
+      [userId, nowIso]
     );
 
     return rows.map((row) => ({

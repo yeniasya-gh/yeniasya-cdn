@@ -144,8 +144,74 @@ const main = async () => {
     });
   }
 
+  const staleManualRows = (
+    await client.query(
+      `
+        SELECT
+          m.id::bigint AS manual_access_id,
+          m.user_id::bigint AS user_id,
+          m.starts_at AS manual_starts_at,
+          m.ends_at AS manual_ends_at,
+          COALESCE(m.status, 'new') AS manual_status,
+          latest_access.id::bigint AS content_access_id,
+          latest_access.started_at AS content_started_at,
+          latest_access.expires_at AS content_expires_at
+        FROM public.manual_newspaper_users m
+        JOIN LATERAL (
+          SELECT id, started_at, expires_at
+          FROM public.user_content_access uca
+          WHERE uca.user_id = m.user_id
+            AND uca.item_type = 'newspaper_subscription'::public.access_item_type
+            AND uca.item_id IS NULL
+            AND uca.is_active = TRUE
+            AND uca.expires_at IS NOT NULL
+            AND uca.expires_at > now()
+          ORDER BY uca.expires_at DESC NULLS LAST, uca.started_at DESC NULLS LAST, uca.id DESC
+          LIMIT 1
+        ) latest_access ON TRUE
+        WHERE m.is_active = TRUE
+          AND (
+            m.ends_at IS NULL
+            OR m.ends_at <= now()
+            OR m.ends_at < latest_access.expires_at
+            OR COALESCE(m.status, 'old') <> 'new'
+          )
+        ORDER BY m.user_id ASC, m.id ASC
+      `
+    )
+  ).rows;
+
+  const expiredManualRows = (
+    await client.query(
+      `
+        SELECT
+          m.id::bigint AS manual_access_id,
+          m.user_id::bigint AS user_id,
+          m.starts_at AS manual_starts_at,
+          m.ends_at AS manual_ends_at,
+          COALESCE(m.status, 'new') AS manual_status
+        FROM public.manual_newspaper_users m
+        WHERE m.is_active = TRUE
+          AND m.ends_at IS NOT NULL
+          AND m.ends_at <= now()
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.user_content_access uca
+            WHERE uca.user_id = m.user_id
+              AND uca.item_type = 'newspaper_subscription'::public.access_item_type
+              AND uca.item_id IS NULL
+              AND uca.is_active = TRUE
+              AND (uca.expires_at IS NULL OR uca.expires_at > now())
+          )
+        ORDER BY m.user_id ASC, m.id ASC
+      `
+    )
+  ).rows;
+
   const repaired = [];
-  if (apply && candidates.length) {
+  const syncedManualRows = [];
+  const deactivatedManualRows = [];
+  if (apply && (candidates.length || staleManualRows.length || expiredManualRows.length)) {
     await client.query("BEGIN");
     try {
       for (const candidate of candidates) {
@@ -188,6 +254,56 @@ const main = async () => {
         );
         repaired.push({ ...candidate, manual_access: insert.rows[0] || null });
       }
+
+      for (const row of staleManualRows) {
+        const updated = await client.query(
+          `
+            UPDATE public.manual_newspaper_users
+            SET starts_at = COALESCE($2::timestamptz, starts_at),
+                ends_at = $3::timestamptz,
+                is_active = TRUE,
+                status = 'new',
+                note = $4::text,
+                updated_at = now()
+            WHERE id = $1::bigint
+            RETURNING id::bigint AS id, user_id::bigint AS user_id, starts_at, ends_at, is_active, status
+          `,
+          [
+            row.manual_access_id,
+            row.content_started_at,
+            row.content_expires_at,
+            `Otomatik onarım: aktif ödeme erişimiyle manuel e-gazete kaydı eşitlendi. access_id=${row.content_access_id}`,
+          ]
+        );
+        syncedManualRows.push({
+          manual_access_id: row.manual_access_id,
+          user_id: row.user_id,
+          content_access_id: row.content_access_id,
+          manual_access: updated.rows[0] || null,
+        });
+      }
+
+      for (const row of expiredManualRows) {
+        const updated = await client.query(
+          `
+            UPDATE public.manual_newspaper_users
+            SET is_active = FALSE,
+                note = $2::text,
+                updated_at = now()
+            WHERE id = $1::bigint
+            RETURNING id::bigint AS id, user_id::bigint AS user_id, starts_at, ends_at, is_active, status
+          `,
+          [
+            row.manual_access_id,
+            "Otomatik onarım: süresi dolmuş ve aktif ödeme erişimi olmayan manuel e-gazete kaydı pasife alındı.",
+          ]
+        );
+        deactivatedManualRows.push({
+          manual_access_id: row.manual_access_id,
+          user_id: row.user_id,
+          manual_access: updated.rows[0] || null,
+        });
+      }
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK");
@@ -204,9 +320,17 @@ const main = async () => {
         scanned: rows.length,
         candidates: candidates.length,
         repaired: repaired.length,
+        stale_manual_candidates: staleManualRows.length,
+        synced_manual_rows: syncedManualRows.length,
+        expired_manual_candidates: expiredManualRows.length,
+        deactivated_manual_rows: deactivatedManualRows.length,
         skipped: skipped.length,
         candidate_rows: candidates,
         repaired_rows: repaired,
+        stale_manual_rows: staleManualRows,
+        synced_manual_result_rows: syncedManualRows,
+        expired_manual_rows: expiredManualRows,
+        deactivated_manual_result_rows: deactivatedManualRows,
         skipped_rows: skipped,
       },
       null,
