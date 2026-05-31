@@ -173,7 +173,7 @@ const main = async () => {
           AND (
             m.ends_at IS NULL
             OR m.ends_at <= now()
-            OR m.ends_at < latest_access.expires_at
+            OR m.ends_at < latest_access.expires_at - interval '1 second'
             OR COALESCE(m.status, 'old') <> 'new'
           )
         ORDER BY m.user_id ASC, m.id ASC
