@@ -3591,6 +3591,10 @@ const isHasuraVariableTypeMismatch = (err, variableName, expectedType) => {
 const FCM_OAUTH_AUDIENCE = "https://oauth2.googleapis.com/token";
 const FCM_OAUTH_SCOPE = "https://www.googleapis.com/auth/firebase.messaging";
 const FCM_INVALID_TOKEN_CODES = new Set(["UNREGISTERED", "INVALID_ARGUMENT"]);
+const FCM_SEND_CONCURRENCY = Math.max(
+  1,
+  Math.min(100, Number(process.env.FCM_SEND_CONCURRENCY || "40") || 40)
+);
 
 let firebaseServiceAccountCache = null;
 let firebaseAccessTokenCache = {
@@ -3757,6 +3761,25 @@ const extractFcmErrorCode = (errorPayload) => {
   return "";
 };
 
+const mapWithConcurrency = async (items, concurrency, worker) => {
+  const list = Array.isArray(items) ? items : [];
+  const limit = Math.max(1, Math.min(Number(concurrency) || 1, list.length || 1));
+  const results = new Array(list.length);
+  let nextIndex = 0;
+
+  const runners = Array.from({ length: limit }, async () => {
+    while (nextIndex < list.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      // eslint-disable-next-line no-await-in-loop
+      results[currentIndex] = await worker(list[currentIndex], currentIndex);
+    }
+  });
+
+  await Promise.all(runners);
+  return results;
+};
+
 const sendFirebaseMessageToToken = async ({
   token,
   title,
@@ -3889,27 +3912,15 @@ const persistNotifications = async ({ title, body, userIds }) => {
   }
   const uniqueIds = [...new Set(userIds.map((id) => toPositiveIntOrNull(id)).filter(Boolean))];
   if (!uniqueIds.length) return 0;
-  const rows = await withHomePostgresClient(async (client) => {
-    const inserted = [];
-    for (const userId of uniqueIds) {
-      const object = {
-        title,
-        body,
-        user_id: userId,
-      };
-      const result = await homePostgresQueryWithClient(
-        client,
-        `
-          INSERT INTO public.notifications (title, body, user_id)
-          VALUES ($1::text, $2::text, $3::bigint)
-          RETURNING id
-        `,
-        [object.title, object.body, object.user_id]
-      );
-      inserted.push(...result);
-    }
-    return inserted;
-  });
+  const rows = await homePostgresQuery(
+    `
+      INSERT INTO public.notifications (title, body, user_id)
+      SELECT $1::text, $2::text, ids.user_id
+      FROM unnest($3::bigint[]) AS ids(user_id)
+      RETURNING id
+    `,
+    [title, body, uniqueIds]
+  );
   return Number(rows.length || 0);
 };
 
@@ -16266,45 +16277,67 @@ app.post("/admin/notifications/send", requireJwtOrServiceAuth, async (req, res) 
       });
     }
 
-    let sentCount = 0;
-    let failedCount = 0;
+    await getFirebaseAccessToken();
+    resolveFirebaseProjectId();
+
     const successfulUserIds = new Set();
     const invalidTokenUserIds = new Set();
-    const failedResults = [];
+    const startedAtMs = Date.now();
+    const sendResults = await mapWithConcurrency(
+      [...tokenMap.entries()],
+      FCM_SEND_CONCURRENCY,
+      async ([token, linkedUserIds]) => {
+        try {
+          const result = await sendFirebaseMessageToToken({
+            token,
+            title,
+            body,
+            data,
+            dryRun,
+          });
 
-    for (const [token, linkedUserIds] of tokenMap.entries()) {
-      // eslint-disable-next-line no-await-in-loop
-      const result = await sendFirebaseMessageToToken({
-        token,
-        title,
-        body,
-        data,
-        dryRun,
-      });
+          return { token, linkedUserIds, result };
+        } catch (err) {
+          return {
+            token,
+            linkedUserIds,
+            result: {
+              ok: false,
+              statusCode: err?.response?.status || null,
+              errorCode: err?.code || null,
+              errorMessage: err?.message || "FCM send failed.",
+            },
+          };
+        }
+      }
+    );
 
+    for (const { token, linkedUserIds, result } of sendResults) {
       if (result.ok) {
-        sentCount += 1;
         for (const uid of linkedUserIds) {
           successfulUserIds.add(uid);
         }
         continue;
       }
 
-      failedCount += 1;
       if (FCM_INVALID_TOKEN_CODES.has(String(result.errorCode || "").toUpperCase())) {
         for (const uid of linkedUserIds) {
           invalidTokenUserIds.add(uid);
         }
       }
+    }
 
-      failedResults.push({
+    const sentCount = sendResults.filter((item) => item?.result?.ok).length;
+    const failedResults = sendResults
+      .filter((item) => item && !item.result?.ok)
+      .map(({ token, linkedUserIds, result }) => ({
         token: maskDeviceToken(token),
         userIds: linkedUserIds,
         statusCode: result.statusCode,
         errorCode: result.errorCode || null,
         errorMessage: result.errorMessage || "Unknown FCM error.",
-      });
-    }
+      }));
+    const failedCount = failedResults.length;
 
     let persistedCount = 0;
     if (persist && !dryRun && successfulUserIds.size) {
@@ -16321,7 +16354,7 @@ app.post("/admin/notifications/send", requireJwtOrServiceAuth, async (req, res) 
     }
 
     console.log(
-      `[notifications][send] id=${requestId} targets=${tokenMap.size} sent=${sentCount} failed=${failedCount} persist=${persistedCount} cleared=${clearedTokenCount} dryRun=${dryRun}`
+      `[notifications][send] id=${requestId} targets=${tokenMap.size} sent=${sentCount} failed=${failedCount} persist=${persistedCount} cleared=${clearedTokenCount} concurrency=${FCM_SEND_CONCURRENCY} elapsedMs=${Date.now() - startedAtMs} dryRun=${dryRun}`
     );
 
     return res.json({
@@ -16334,6 +16367,8 @@ app.post("/admin/notifications/send", requireJwtOrServiceAuth, async (req, res) 
         failed: failedCount,
         persisted: persistedCount,
         clearedInvalidTokens: clearedTokenCount,
+        concurrency: FCM_SEND_CONCURRENCY,
+        elapsedMs: Date.now() - startedAtMs,
         dryRun,
       },
       failed: failedResults.slice(0, 100),
