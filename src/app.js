@@ -943,24 +943,28 @@ const logPdfRequest = ({
   outcome,
   message,
   error,
+  extra,
 }) => {
   const header = (key) =>
     req && typeof req.get === "function" ? req.get(key) : undefined;
-  const payload = {
-    ts: new Date().toISOString(),
-    scope,
-    route,
-    action,
-    method: req?.method,
-    path: sanitizeUrlForLog(req?.originalUrl || req?.url),
-    status,
-    type,
-    filename,
-    ip: req?.ip,
-    referer: header("referer") || header("origin"),
-    ua: header("user-agent"),
-    message: message || error?.message,
-  };
+  const payload = Object.fromEntries(
+    Object.entries({
+      ts: new Date().toISOString(),
+      scope,
+      route,
+      action,
+      method: req?.method,
+      path: sanitizeUrlForLog(req?.originalUrl || req?.url),
+      status,
+      type,
+      filename,
+      ip: req?.ip,
+      referer: header("referer") || header("origin"),
+      ua: header("user-agent"),
+      message: message || error?.message,
+      ...(extra && typeof extra === "object" ? extra : {}),
+    }).filter(([, value]) => value !== undefined)
+  );
   const line = `[pdf] ${JSON.stringify(payload)}`;
   if (outcome === "error") {
     if (error?.stack) {
@@ -14441,13 +14445,14 @@ const fetchFromBunny = async (type, scope, filename) => {
   }
 };
 
-const fetchStreamFromBunny = async (type, scope, filename) => {
+const fetchStreamFromBunny = async (type, scope, filename, extraHeaders = {}) => {
   const url = `/${type}/${scope}/${filename}`;
   try {
     return await bunnyRequest({
       method: "GET",
       url,
       responseType: "stream",
+      headers: extraHeaders,
     });
   } catch (err) {
     const errorMsg = err.response?.data?.Message || err.response?.data || err.message;
@@ -14470,6 +14475,7 @@ const pipeBunnyStreamToResponse = async ({
   const upstream = bunnyResponse.data;
   let finished = false;
   let idleTimer = null;
+  const requestRange = req.get("range");
   const firstByteTimeoutMs =
     Number.isFinite(BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS) && BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS > 0
       ? BUNNY_STREAM_FIRST_BYTE_TIMEOUT_MS
@@ -14504,6 +14510,12 @@ const pipeBunnyStreamToResponse = async ({
       outcome: "error",
       message,
       error: err,
+      extra: {
+        requestRange,
+        upstreamStatus: bunnyResponse.status,
+        upstreamContentLength: bunnyResponse.headers?.["content-length"],
+        upstreamContentRange: bunnyResponse.headers?.["content-range"],
+      },
     });
     if (!res.headersSent) {
       const corsHeaders = buildCorsHeaders(req);
@@ -14523,6 +14535,10 @@ const pipeBunnyStreamToResponse = async ({
       status: 499,
       outcome: "error",
       message: "Client aborted.",
+      extra: {
+        requestRange,
+        upstreamStatus: bunnyResponse.status,
+      },
     });
   });
 
@@ -14575,9 +14591,17 @@ const pipeBunnyStreamToResponse = async ({
   }
 
   const corsHeaders = buildCorsHeaders(req);
+  const responseStatus = bunnyResponse.status === 206 ? 206 : 200;
+  res.status(responseStatus);
   res.set({ ...corsHeaders, ...headers });
   if (bunnyResponse.headers?.["content-length"]) {
     res.set("Content-Length", bunnyResponse.headers["content-length"]);
+  }
+  if (bunnyResponse.headers?.["content-range"]) {
+    res.set("Content-Range", bunnyResponse.headers["content-range"]);
+  }
+  if (bunnyResponse.headers?.["accept-ranges"]) {
+    res.set("Accept-Ranges", bunnyResponse.headers["accept-ranges"]);
   }
 
   upstream.on("error", (streamErr) => {
@@ -14593,9 +14617,18 @@ const pipeBunnyStreamToResponse = async ({
     finishOnce();
     logPdfRequest({
       ...logBase,
-      status: 200,
+      status: responseStatus,
       outcome: "success",
       message: Number.isFinite(ttfbMs) ? `${successMessage} (ttfb ${ttfbMs.toFixed(1)}ms)` : successMessage,
+      extra: {
+        requestRange,
+        responseStatus,
+        upstreamStatus: bunnyResponse.status,
+        contentLength: bunnyResponse.headers?.["content-length"],
+        contentRange: bunnyResponse.headers?.["content-range"],
+        acceptRanges: bunnyResponse.headers?.["accept-ranges"],
+        ttfbMs: Number.isFinite(ttfbMs) ? Number(ttfbMs.toFixed(1)) : undefined,
+      },
     });
   });
 
@@ -14737,6 +14770,7 @@ app.get("/public/:type/:filename", (req, res) => {
 const buildPrivatePdfHeaders = (filename, options = {}) => {
   const headers = {
     "Content-Type": "application/pdf",
+    "Accept-Ranges": "bytes",
     "Cache-Control": "no-store, no-cache, must-revalidate, private",
     Pragma: "no-cache",
     "X-Content-Type-Options": "nosniff",
@@ -14791,7 +14825,13 @@ const streamPrivatePdfFromPath = async ({
   };
 
   try {
-    const bunnyResponse = await fetchStreamFromBunny(parsed.type, "private", parsed.filename);
+    const rangeHeader = req.get("range");
+    const bunnyResponse = await fetchStreamFromBunny(
+      parsed.type,
+      "private",
+      parsed.filename,
+      rangeHeader ? { Range: rangeHeader } : {}
+    );
     await pipeBunnyStreamToResponse({
       req,
       res,
@@ -14840,7 +14880,13 @@ app.get("/private/:type/:filename", requireJwtOrServiceAuth, async (req, res) =>
   };
 
   try {
-    const bunnyResponse = await fetchStreamFromBunny(type, "private", req.params.filename);
+    const rangeHeader = req.get("range");
+    const bunnyResponse = await fetchStreamFromBunny(
+      type,
+      "private",
+      req.params.filename,
+      rangeHeader ? { Range: rangeHeader } : {}
+    );
     const ext = path.extname(req.params.filename).toLowerCase();
     const contentType = ext === ".pdf" ? "application/pdf" : "application/octet-stream";
     await pipeBunnyStreamToResponse({
@@ -15020,7 +15066,7 @@ app.post("/private/view-token", requireJwt, (req, res) => {
   });
 });
 
-app.get("/private/view-secure", requireJwt, async (req, res) => {
+app.get("/private/view-secure", async (req, res) => {
   const token = req.query?.token;
   const validation = verifyViewToken(token);
   if (!validation.ok) {
@@ -15116,7 +15162,14 @@ app.get("/private/view-secure", requireJwt, async (req, res) => {
     async function init() {
       try {
         showStatus("Yükleniyor...");
-        const loadingTask = pdfjsLib.getDocument({ url: rawUrl, cMapUrl: "/pdfjs/cmaps/", cMapPacked: true });
+        const loadingTask = pdfjsLib.getDocument({
+          url: rawUrl,
+          cMapUrl: "/pdfjs/cmaps/",
+          cMapPacked: true,
+          disableAutoFetch: true,
+          disableStream: false,
+          rangeChunkSize: 65536
+        });
         pdfDoc = await loadingTask.promise;
         document.getElementById("page-count").textContent = pdfDoc.numPages;
         hideStatus();
@@ -15144,8 +15197,11 @@ app.get("/private/view-secure", requireJwt, async (req, res) => {
       
       try {
         const page = await pdfDoc.getPage(num);
-        const pixelRatio = window.devicePixelRatio || 1;
+        const maxCanvasPixels = 8_000_000;
+        const devicePixelRatio = Math.min(window.devicePixelRatio || 1, 2);
         const viewport = page.getViewport({ scale: scale, rotation: currentRotation });
+        const viewportPixels = viewport.width * viewport.height;
+        const pixelRatio = Math.min(devicePixelRatio, Math.sqrt(maxCanvasPixels / Math.max(viewportPixels, 1)));
 
         canvas.height = viewport.height * pixelRatio;
         canvas.width = viewport.width * pixelRatio;
@@ -15160,6 +15216,7 @@ app.get("/private/view-secure", requireJwt, async (req, res) => {
 
         renderTask = page.render(renderContext);
         await renderTask.promise;
+        page.cleanup();
         
         isRendering = false;
         document.getElementById("page-input").value = num;
@@ -15168,7 +15225,10 @@ app.get("/private/view-secure", requireJwt, async (req, res) => {
         document.getElementById("next").disabled = num >= pdfDoc.numPages;
         localStorage.setItem(docKey, String(num));
       } catch (err) {
-        if (err.name === "RenderingCancelledException") return;
+        if (err.name === "RenderingCancelledException") {
+          isRendering = false;
+          return;
+        }
         isRendering = false;
         console.error(err);
       }
@@ -15252,7 +15312,13 @@ app.get("/private/view-secure", requireJwt, async (req, res) => {
   }
 
   try {
-    const bunnyResponse = await fetchStreamFromBunny(parsed.type, "private", parsed.filename);
+    const rangeHeader = req.get("range");
+    const bunnyResponse = await fetchStreamFromBunny(
+      parsed.type,
+      "private",
+      parsed.filename,
+      rangeHeader ? { Range: rangeHeader } : {}
+    );
     await pipeBunnyStreamToResponse({
       req,
       res,
