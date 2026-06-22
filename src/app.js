@@ -17,6 +17,9 @@ const helmet = require("helmet");
 const { Pool } = require("pg");
 const rateLimit = require("express-rate-limit");
 const ExcelJS = require("exceljs");
+const {
+  createYeniAsyaHaberPortaliNotificationRouter,
+} = require("./newsPortalRssNotificationController");
 
 const PORT = process.env.PORT || 3001;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
@@ -16543,6 +16546,12 @@ app.post("/admin/notifications/send", requireJwtOrServiceAuth, async (req, res) 
     });
   }
 });
+
+app.use(
+  createYeniAsyaHaberPortaliNotificationRouter(express, {
+    authMiddleware: requireJwtOrServiceAuth,
+  })
+);
 
 app.post("/mail/order-summary", requireJwt, async (req, res) => {
   const requestId = crypto.randomUUID();

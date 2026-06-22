@@ -7,7 +7,11 @@
   "scripts": {
     "start": "node src/app.js",
     "dev": "nodemon src/app.js",
-    "repair:missing-newspaper-access": "node scripts/repair_missing_newspaper_access.js"
+    "repair:missing-newspaper-access": "node scripts/repair_missing_newspaper_access.js",
+    "news-portal:check": "node scripts/news_portal_rss_notifications.js check",
+    "news-portal:dispatch": "node scripts/news_portal_rss_notifications.js dispatch",
+    "news-portal:run": "node scripts/news_portal_rss_notifications.js run",
+    "news-portal:start": "node scripts/news_portal_rss_notifications.js start"
   },
   "dependencies": {
     "axios": "^1.13.5",
