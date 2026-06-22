@@ -15227,8 +15227,8 @@ app.get("/private/view-secure", async (req, res) => {
     :root { color-scheme: dark; --chrome-bg: rgba(18,22,30,0.95); --border: #2a3345; --pill-bg: #1e2533; --accent: #4f8cff; }
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #0b0d11; color: #e2e8f0; font-family: "Inter", system-ui, -apple-system, sans-serif; overflow: hidden; }
-    .chrome { position: fixed; top: 0; left: 0; right: 0; height: 60px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; background: var(--chrome-bg); border-bottom: 1px solid var(--border); backdrop-filter: blur(12px); z-index: 100; }
-    .title { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; opacity: 0.8; }
+    .chrome { position: fixed; top: 0; left: 0; right: 0; height: 60px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 16px; background: var(--chrome-bg); border-bottom: 1px solid var(--border); backdrop-filter: blur(12px); z-index: 100; }
+    .toolbar-spacer { flex: 1 1 0; min-width: 0; }
     .pill-group { display: flex; align-items: center; gap: 8px; background: var(--pill-bg); padding: 4px; border-radius: 12px; border: 1px solid var(--border); }
     button { cursor: pointer; background: transparent; border: none; color: #fff; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; border-radius: 8px; transition: all 0.2s; font-size: 18px; }
     button:hover { background: rgba(255,255,255,0.1); }
@@ -15371,7 +15371,7 @@ app.get("/private/view-secure", async (req, res) => {
 </head>
 <body>
   <div class="chrome">
-    <div class="title">${parsed.filename}</div>
+    <div class="toolbar-spacer"></div>
     <div class="pill-group">
       <button id="prev" title="Önceki">&#8592;</button>
       <form id="page-form" class="page-info">
