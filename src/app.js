@@ -1538,6 +1538,20 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use(
+  "/pdfjs-legacy",
+  express.static(path.join(PUBLIC_ROOT, "pdfjs-legacy"), {
+    maxAge: "14d",
+    immutable: true,
+    setHeaders: (res, filePath) => {
+      res.removeHeader("X-Frame-Options");
+      if (filePath.endsWith(".html")) {
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+        res.setHeader("Content-Security-Policy", `frame-ancestors ${FRAME_ANCESTORS_DIRECTIVE}`);
+      }
+    },
+  })
+);
 app.use(express.static(PUBLIC_ROOT));
 
 app.get("/privacy", (req, res) => {
@@ -15216,6 +15230,19 @@ app.get("/private/view-secure", async (req, res) => {
   const corsHeaders = buildCorsHeaders(req);
 
   if (preferViewer) {
+    const rawPdfUrl = `${req.path}?token=${encodeURIComponent(token)}&render=raw`;
+    const viewerUrl = `/pdfjs-legacy/web/viewer.html?file=${encodeURIComponent(rawPdfUrl)}${
+      pageParam ? `#page=${pageParam}` : ""
+    }`;
+    res.removeHeader("X-Frame-Options");
+    logPdfRequest({
+      ...logBase,
+      status: 302,
+      outcome: "success",
+      message: "Redirecting to PDF.js legacy viewer.",
+    });
+    return res.redirect(302, viewerUrl);
+
     const rawUrl = `${req.path}?token=${encodeURIComponent(token)}&render=raw`;
     const html = `<!doctype html>
 <html lang="tr">
