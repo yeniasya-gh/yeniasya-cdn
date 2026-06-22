@@ -207,6 +207,21 @@ const CDN_PUBLIC_HOST = String(process.env.CDN_PUBLIC_HOST || "cdn.yeniasyadijit
   .replace(/^https?:\/\//i, "")
   .replace(/\/.*$/, "")
   .toLowerCase();
+const PDF_ACCESS_TOKEN_TTL_MIN_RAW = Number(
+  process.env.PDF_ACCESS_TOKEN_TTL_MIN || process.env.VIEW_TOKEN_TTL_MIN || "5"
+);
+const PDF_ACCESS_TOKEN_TTL_MIN =
+  Number.isFinite(PDF_ACCESS_TOKEN_TTL_MIN_RAW) && PDF_ACCESS_TOKEN_TTL_MIN_RAW > 0
+    ? PDF_ACCESS_TOKEN_TTL_MIN_RAW
+    : 5;
+const PDF_ACCESS_DIRECT_CDN =
+  String(process.env.PDF_ACCESS_DIRECT_CDN || "true").toLowerCase() !== "false";
+const BUNNY_CDN_TOKEN_AUTH_KEY = String(
+  process.env.BUNNY_CDN_TOKEN_AUTH_KEY ||
+    process.env.BUNNY_TOKEN_AUTH_KEY ||
+    process.env.BUNNY_SECURITY_KEY ||
+    ""
+).trim();
 const BUNNY_HTTP_TIMEOUT_MS = Number(process.env.BUNNY_HTTP_TIMEOUT_MS || "20000");
 const BUNNY_HTTP_RETRIES = Number(process.env.BUNNY_HTTP_RETRIES || "1");
 const BUNNY_HTTP_RETRY_BASE_DELAY_MS = Number(
@@ -14156,6 +14171,59 @@ const verifyViewToken = (token) => {
   }
 };
 
+const getViewTokenTtlMinutes = () =>
+  Number.isFinite(VIEW_TOKEN_TTL_MIN) && VIEW_TOKEN_TTL_MIN > 0 ? VIEW_TOKEN_TTL_MIN : 5;
+
+const buildPrivateViewTokenData = (parsed, ttlMinutes = getViewTokenTtlMinutes()) => {
+  if (!VIEW_TOKEN_SECRET) return null;
+  const exp = Date.now() + ttlMinutes * 60_000;
+  const payload = { path: `/private/${parsed.type}/${parsed.filename}`, exp };
+  const token = signViewToken(payload);
+  return {
+    url: `/private/view-secure?token=${encodeURIComponent(token)}`,
+    token,
+    expiresAt: new Date(exp).toISOString(),
+    expiresMs: exp,
+    ttlMinutes,
+  };
+};
+
+const buildSignedBunnyCdnUrl = (parsed, expiresSeconds) => {
+  if (!PDF_ACCESS_DIRECT_CDN || !BUNNY_CDN_TOKEN_AUTH_KEY) return null;
+  const host = CDN_PUBLIC_HOST || BUNNY_SETTINGS.cdnUrl;
+  if (!host) return null;
+  const filename = encodeURIComponent(decodePathSegment(parsed.filename));
+  const cdnPath = `/${parsed.type}/private/${filename}`;
+  const token = crypto
+    .createHash("md5")
+    .update(`${BUNNY_CDN_TOKEN_AUTH_KEY}${cdnPath}${expiresSeconds}`)
+    .digest("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "");
+  return `https://${host}${cdnPath}?token=${token}&expires=${expiresSeconds}`;
+};
+
+const buildPrivatePdfAccessData = (parsed) => {
+  const ttlMinutes = PDF_ACCESS_TOKEN_TTL_MIN;
+  const expiresMs = Date.now() + ttlMinutes * 60_000;
+  const expiresSeconds = Math.floor(expiresMs / 1000);
+  const directUrl = buildSignedBunnyCdnUrl(parsed, expiresSeconds);
+  const viewer = buildPrivateViewTokenData(parsed, ttlMinutes);
+
+  if (!directUrl && !viewer) return null;
+
+  return {
+    ok: true,
+    mode: directUrl ? "direct_cdn" : "secure_viewer",
+    url: directUrl || viewer.url,
+    directUrl,
+    viewerUrl: viewer?.url || null,
+    expiresAt: new Date(expiresMs).toISOString(),
+    ttlMinutes,
+  };
+};
+
 const sanitizeFilename = (value) => {
   const raw = String(value || "").replace(/[\r\n]/g, "");
   const cleaned = raw.replace(/["\\]/g, "");
@@ -15049,21 +15117,47 @@ app.post("/private/view-token", requireJwt, (req, res) => {
   if (!VIEW_TOKEN_SECRET) {
     return res.status(500).json({ ok: false, error: "VIEW_TOKEN_SECRET missing." });
   }
-  const ttlMinutes =
-    Number.isFinite(VIEW_TOKEN_TTL_MIN) && VIEW_TOKEN_TTL_MIN > 0
-      ? VIEW_TOKEN_TTL_MIN
-      : 5;
-  const exp = Date.now() + ttlMinutes * 60_000;
-  const payload = { path: `/private/${parsed.type}/${parsed.filename}`, exp };
-  const token = signViewToken(payload);
-  const url = `/private/view-secure?token=${encodeURIComponent(token)}`;
+  const tokenData = buildPrivateViewTokenData(parsed);
   return res.json({
     ok: true,
-    url,
-    token,
-    expiresAt: new Date(exp).toISOString(),
-    ttlMinutes,
+    url: tokenData.url,
+    token: tokenData.token,
+    expiresAt: tokenData.expiresAt,
+    ttlMinutes: tokenData.ttlMinutes,
   });
+});
+
+app.post("/private/pdf-access", requireJwt, (req, res) => {
+  const rawPath = req.body?.path || req.body?.pdf || req.body?.file;
+  const parsed = parsePrivatePath(rawPath);
+  if (!parsed) {
+    return res.status(400).json({
+      ok: false,
+      error: "path must be like /private/<type>/<file.pdf>",
+    });
+  }
+
+  const accessData = buildPrivatePdfAccessData(parsed);
+  if (!accessData) {
+    return res.status(500).json({
+      ok: false,
+      error: "PDF access service is not configured.",
+    });
+  }
+
+  logPdfRequest({
+    req,
+    scope: "private",
+    route: "/private/pdf-access",
+    action: "create-access-url",
+    type: parsed.type,
+    filename: parsed.filename,
+    status: 200,
+    outcome: "success",
+    message: `PDF access URL issued with ${accessData.mode}.`,
+  });
+
+  return res.json(accessData);
 });
 
 app.get("/private/view-secure", async (req, res) => {
