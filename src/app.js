@@ -15236,7 +15236,11 @@ app.get("/private/view-secure", async (req, res) => {
     button:disabled { opacity: 0.3; cursor: not-allowed; }
     .zoom-val { font-size: 13px; font-weight: 600; min-width: 45px; text-align: center; color: var(--accent); }
     .canvas-wrap { position: absolute; inset: 60px 0 0 0; overflow: auto; display: flex; justify-content: center; align-items: flex-start; scroll-behavior: smooth; -webkit-overflow-scrolling: touch; }
-    #pdf-canvas { margin: 20px auto 40px auto; box-shadow: 0 20px 50px rgba(0,0,0,0.5); border-radius: 4px; background: #fff; transition: transform 0.1s ease-out; }
+    .page-shell { position: relative; margin: 20px auto 40px auto; box-shadow: 0 20px 50px rgba(0,0,0,0.5); border-radius: 4px; background: #fff; overflow: hidden; }
+    #pdf-canvas { display: block; background: #fff; transition: transform 0.1s ease-out; }
+    .textLayer { position: absolute; inset: 0; overflow: hidden; opacity: 1; line-height: 1; text-align: initial; text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0; z-index: 2; }
+    .textLayer span, .textLayer br { color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0 0; }
+    .textLayer ::selection { background: rgba(79, 140, 255, 0.28); }
     .page-info { display: flex; align-items: center; gap: 4px; font-size: 13px; font-weight: 500; }
     #page-input { background: rgba(255,255,255,0.05); border: 1px solid var(--border); color: #fff; padding: 4px 0; border-radius: 6px; width: 40px; text-align: center; font-size: 13px; }
     #status { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--accent); color: white; padding: 8px 16px; border-radius: 20px; font-size: 12px; font-weight: 600; box-shadow: 0 10px 20px rgba(0,0,0,0.3); display: none; z-index: 1000; }
@@ -15253,11 +15257,14 @@ app.get("/private/view-secure", async (req, res) => {
     let pageNum = startPage || Number(localStorage.getItem(docKey)) || 1;
     let isRendering = false;
     let renderTask = null;
+    let textLayerTask = null;
     let scale = 1.25;
     let currentRotation = 0;
 
     const canvas = document.getElementById("pdf-canvas");
     const ctx = canvas.getContext("2d", { alpha: false });
+    const pageShell = document.getElementById("page-shell");
+    const textLayer = document.getElementById("text-layer");
 
     async function init() {
       try {
@@ -15292,6 +15299,10 @@ app.get("/private/view-secure", async (req, res) => {
       if (isRendering && renderTask) {
         renderTask.cancel();
       }
+      if (textLayerTask) {
+        textLayerTask.cancel();
+        textLayerTask = null;
+      }
       isRendering = true;
       pageNum = num;
       
@@ -15307,6 +15318,12 @@ app.get("/private/view-secure", async (req, res) => {
         canvas.width = viewport.width * pixelRatio;
         canvas.style.height = viewport.height + "px";
         canvas.style.width = viewport.width + "px";
+        pageShell.style.height = viewport.height + "px";
+        pageShell.style.width = viewport.width + "px";
+        textLayer.innerHTML = "";
+        textLayer.style.setProperty("--scale-factor", viewport.scale);
+        textLayer.style.height = viewport.height + "px";
+        textLayer.style.width = viewport.width + "px";
 
         const renderContext = {
           canvasContext: ctx,
@@ -15315,7 +15332,14 @@ app.get("/private/view-secure", async (req, res) => {
         };
 
         renderTask = page.render(renderContext);
-        await renderTask.promise;
+        const textContent = await page.getTextContent();
+        textLayerTask = pdfjsLib.renderTextLayer({
+          textContentSource: textContent,
+          container: textLayer,
+          viewport
+        });
+        await Promise.all([renderTask.promise, textLayerTask.promise]);
+        textLayerTask = null;
         page.cleanup();
         
         isRendering = false;
@@ -15325,7 +15349,7 @@ app.get("/private/view-secure", async (req, res) => {
         document.getElementById("next").disabled = num >= pdfDoc.numPages;
         localStorage.setItem(docKey, String(num));
       } catch (err) {
-        if (err.name === "RenderingCancelledException") {
+        if (err.name === "RenderingCancelledException" || err.name === "AbortException") {
           isRendering = false;
           return;
         }
@@ -15387,7 +15411,10 @@ app.get("/private/view-secure", async (req, res) => {
     </div>
   </div>
   <div class="canvas-wrap" id="canvas-wrap">
-    <canvas id="pdf-canvas"></canvas>
+    <div class="page-shell" id="page-shell">
+      <canvas id="pdf-canvas"></canvas>
+      <div class="textLayer" id="text-layer"></div>
+    </div>
   </div>
   <div id="status"></div>
 </body>
