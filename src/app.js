@@ -150,7 +150,9 @@ const FRAME_ANCESTORS = (process.env.ALLOWED_FRAME_ANCESTORS || "")
   .map((v) => v.trim())
   .filter(Boolean);
 const FRAME_ANCESTORS_DIRECTIVE =
-  FRAME_ANCESTORS.length === 0 ? "'none'" : FRAME_ANCESTORS.join(" ");
+  FRAME_ANCESTORS.length === 0
+    ? "'self' https://yeniasyadijital.com https://www.yeniasyadijital.com"
+    : FRAME_ANCESTORS.join(" ");
 const PUBLIC_ROOT = path.join(__dirname, "..", "public");
 const MAIL_SETTINGS = {
   host: process.env.MAIL_HOST || "",
@@ -15057,6 +15059,7 @@ app.get("/private/view-file", requireJwtOrServiceAuth, async (req, res) => {
     const dataUrl = `data:application/pdf;base64,${base64}`;
     const safeTitle = parsed.filename.replace(/"/g, "");
 
+    res.removeHeader("X-Frame-Options");
     res.set({
       ...corsHeaders,
       "Content-Type": "text/html; charset=utf-8",
@@ -15390,6 +15393,7 @@ app.get("/private/view-secure", async (req, res) => {
 </body>
 </html>`;
 
+    res.removeHeader("X-Frame-Options");
     res.set({
       ...corsHeaders,
       "Content-Type": "text/html; charset=utf-8",
