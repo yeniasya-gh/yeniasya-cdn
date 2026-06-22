@@ -1,0 +1,221 @@
+.toolbarButton.yaToolButton::before {
+  content: none;
+}
+
+.toolbarButton.yaToolButton {
+  width: 44px;
+}
+
+.toolbarButton.yaToolButton > span {
+  display: block;
+  position: static;
+  width: auto;
+  height: auto;
+  overflow: visible;
+  clip: auto;
+  margin: 0;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 32px;
+  text-align: center;
+}
+
+.toolbarButton.yaToolButton.is-active {
+  background-color: rgba(0, 0, 0, 0.18);
+}
+
+#yaReaderPanel {
+  position: fixed;
+  top: 40px;
+  right: 0;
+  bottom: 0;
+  z-index: 10000;
+  width: min(360px, 92vw);
+  background: #f7f7f7;
+  border-left: 1px solid rgba(0, 0, 0, 0.25);
+  box-shadow: -10px 0 24px rgba(0, 0, 0, 0.28);
+  color: #1f2933;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(105%);
+  transition: transform 160ms ease;
+}
+
+#yaReaderPanel.is-open {
+  transform: translateX(0);
+}
+
+.yaReaderPanelHeader {
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 12px;
+  background: #31343a;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.yaReaderPanelClose {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  font-size: 18px;
+  line-height: 28px;
+  cursor: pointer;
+}
+
+.yaReaderPanelBody {
+  flex: 1;
+  overflow: auto;
+  padding: 12px;
+}
+
+.yaReaderCurrent {
+  margin-bottom: 8px;
+  color: #4b5563;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+#yaReaderNoteInput {
+  width: 100%;
+  min-height: 92px;
+  resize: vertical;
+  border: 1px solid #c8cdd4;
+  border-radius: 4px;
+  padding: 10px;
+  color: #111827;
+  background: #fff;
+  font: 13px/1.4 sans-serif;
+}
+
+.yaReaderActions {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0 14px;
+}
+
+.yaReaderAction {
+  flex: 1;
+  border: 1px solid #9aa3af;
+  border-radius: 4px;
+  background: #fff;
+  color: #111827;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.yaReaderAction.primary {
+  border-color: #2f68d8;
+  background: #2f68d8;
+  color: #fff;
+}
+
+.yaReaderSectionTitle {
+  margin: 18px 0 8px;
+  color: #111827;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.yaReaderEmpty {
+  padding: 10px;
+  border: 1px dashed #c8cdd4;
+  border-radius: 4px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.yaReaderItem {
+  border: 1px solid #d8dde4;
+  border-radius: 5px;
+  background: #fff;
+  margin-bottom: 8px;
+  padding: 9px;
+}
+
+.yaReaderItemTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+
+.yaReaderPageButton,
+.yaReaderDelete {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.yaReaderPageButton {
+  color: #1f5cc4;
+  padding: 0;
+}
+
+.yaReaderDelete {
+  color: #9b1c1c;
+}
+
+.yaReaderText {
+  color: #26313f;
+  font-size: 13px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.page .yaPageToolBadges {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 6;
+  display: flex;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.yaPageToolBadge {
+  min-width: 22px;
+  height: 22px;
+  border-radius: 11px;
+  background: rgba(47, 104, 216, 0.92);
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 22px;
+  text-align: center;
+}
+
+.yaPageToolBadge.bookmark {
+  background: rgba(214, 126, 0, 0.94);
+}
+
+@media (max-width: 640px) {
+  #yaReaderPanel {
+    top: 32px;
+    width: 100vw;
+  }
+
+  .toolbarButton.yaToolButton {
+    width: 38px;
+  }
+
+  .toolbarButton.yaToolButton > span {
+    font-size: 10px;
+  }
+}

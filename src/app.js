@@ -15231,9 +15231,10 @@ app.get("/private/view-secure", async (req, res) => {
 
   if (preferViewer) {
     const rawPdfUrl = `${req.path}?token=${encodeURIComponent(token)}&render=raw`;
-    const viewerUrl = `/pdfjs-legacy/web/viewer.html?file=${encodeURIComponent(rawPdfUrl)}${
-      pageParam ? `#page=${pageParam}` : ""
-    }`;
+    const documentKey = `${parsed.type}/${parsed.filename}`;
+    const viewerUrl = `/pdfjs-legacy/web/viewer.html?file=${encodeURIComponent(
+      rawPdfUrl
+    )}&doc=${encodeURIComponent(documentKey)}${pageParam ? `#page=${pageParam}` : ""}`;
     res.removeHeader("X-Frame-Options");
     logPdfRequest({
       ...logBase,
