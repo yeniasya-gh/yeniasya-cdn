@@ -269,11 +269,8 @@
     if (window.__yaPdfPinchZoomBound) return;
     window.__yaPdfPinchZoomBound = true;
 
-    const minScale = 0.2;
-    const maxScale = 5;
     let pinch = null;
 
-    const clampScale = (value) => Math.max(minScale, Math.min(maxScale, value));
     const getDistance = (touches) => {
       const dx = touches[0].clientX - touches[1].clientX;
       const dy = touches[0].clientY - touches[1].clientY;
@@ -302,7 +299,8 @@
       }
     };
     const setScaleWithoutJump = (viewer, scale) => {
-      const nextScale = clampScale(scale);
+      if (!Number.isFinite(scale) || scale <= 0) return viewer.currentScale || 1;
+      const nextScale = scale;
       if (typeof viewer._setScaleUpdatePages === "function") {
         viewer._setScaleUpdatePages(nextScale, String(nextScale), true, false);
       } else {
@@ -361,8 +359,7 @@
 
         stopNativePinch(event);
         const ratio = getDistance(event.touches) / pinch.startDistance;
-        const nextScale = clampScale(pinch.startScale * ratio);
-        if (Math.abs(nextScale - pinch.lastScale) < 0.01) return;
+        const nextScale = pinch.startScale * ratio;
         pinch.lastScale = setScaleWithoutJump(viewer, nextScale);
         window.requestAnimationFrame(restoreAnchor);
       },
