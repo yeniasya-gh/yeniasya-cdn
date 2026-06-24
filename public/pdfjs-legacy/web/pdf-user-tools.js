@@ -265,6 +265,136 @@
     eventBus._on("scalechanging", () => window.setTimeout(renderPageBadges, 60));
   };
 
+  const bindPinchZoom = () => {
+    if (window.__yaPdfPinchZoomBound) return;
+    window.__yaPdfPinchZoomBound = true;
+
+    const minScale = 0.2;
+    const maxScale = 5;
+    let pinch = null;
+
+    const clampScale = (value) => Math.max(minScale, Math.min(maxScale, value));
+    const getDistance = (touches) => {
+      const dx = touches[0].clientX - touches[1].clientX;
+      const dy = touches[0].clientY - touches[1].clientY;
+      return Math.sqrt(dx * dx + dy * dy);
+    };
+    const getMidpoint = (touches) => ({
+      x: (touches[0].clientX + touches[1].clientX) / 2,
+      y: (touches[0].clientY + touches[1].clientY) / 2,
+    });
+    const getViewer = () => window.PDFViewerApplication?.pdfViewer || null;
+    const getContainer = () => document.getElementById("viewerContainer");
+    const isInsideContainer = (point, container) => {
+      const rect = container.getBoundingClientRect();
+      return (
+        point.x >= rect.left &&
+        point.x <= rect.right &&
+        point.y >= rect.top &&
+        point.y <= rect.bottom
+      );
+    };
+    const stopNativePinch = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === "function") {
+        event.stopImmediatePropagation();
+      }
+    };
+    const setScaleWithoutJump = (viewer, scale) => {
+      const nextScale = clampScale(scale);
+      if (typeof viewer._setScaleUpdatePages === "function") {
+        viewer._setScaleUpdatePages(nextScale, String(nextScale), true, false);
+      } else {
+        viewer.currentScaleValue = String(nextScale);
+      }
+      return nextScale;
+    };
+    const restoreAnchor = () => {
+      if (!pinch) return;
+      const container = getContainer();
+      if (!container) return;
+      container.scrollLeft = pinch.contentX * pinch.lastScale - pinch.localX;
+      container.scrollTop = pinch.contentY * pinch.lastScale - pinch.localY;
+    };
+
+    const container = getContainer();
+    if (container) {
+      container.style.touchAction = "pan-x pan-y";
+      container.style.webkitOverflowScrolling = "touch";
+    }
+
+    document.addEventListener(
+      "touchstart",
+      (event) => {
+        if (event.touches.length !== 2) return;
+        const viewer = getViewer();
+        const container = getContainer();
+        if (!viewer || !container) return;
+        const point = getMidpoint(event.touches);
+        if (!isInsideContainer(point, container)) return;
+
+        stopNativePinch(event);
+        const rect = container.getBoundingClientRect();
+        const startScale = viewer.currentScale || 1;
+        const localX = point.x - rect.left;
+        const localY = point.y - rect.top;
+        pinch = {
+          startDistance: getDistance(event.touches),
+          startScale,
+          lastScale: startScale,
+          localX,
+          localY,
+          contentX: (container.scrollLeft + localX) / startScale,
+          contentY: (container.scrollTop + localY) / startScale,
+        };
+      },
+      { capture: true, passive: false }
+    );
+
+    document.addEventListener(
+      "touchmove",
+      (event) => {
+        if (!pinch || event.touches.length !== 2 || pinch.startDistance <= 0) return;
+        const viewer = getViewer();
+        if (!viewer) return;
+
+        stopNativePinch(event);
+        const ratio = getDistance(event.touches) / pinch.startDistance;
+        const nextScale = clampScale(pinch.startScale * ratio);
+        if (Math.abs(nextScale - pinch.lastScale) < 0.01) return;
+        pinch.lastScale = setScaleWithoutJump(viewer, nextScale);
+        window.requestAnimationFrame(restoreAnchor);
+      },
+      { capture: true, passive: false }
+    );
+
+    const clearPinch = (event) => {
+      if (!event || event.touches.length < 2) {
+        pinch = null;
+      }
+    };
+    document.addEventListener("touchend", clearPinch, {
+      capture: true,
+      passive: false,
+    });
+    document.addEventListener(
+      "touchcancel",
+      () => {
+        pinch = null;
+      },
+      { capture: true, passive: false }
+    );
+    document.addEventListener("gesturestart", stopNativePinch, {
+      capture: true,
+      passive: false,
+    });
+    document.addEventListener("gesturechange", stopNativePinch, {
+      capture: true,
+      passive: false,
+    });
+  };
+
   const init = () => {
     if (document.getElementById("yaReaderPanel")) return;
     const toolsButton = document.getElementById("secondaryToolbarToggle");
@@ -286,6 +416,7 @@
 
     bindPanelEvents();
     bindViewerEvents();
+    bindPinchZoom();
     renderLists();
   };
 
