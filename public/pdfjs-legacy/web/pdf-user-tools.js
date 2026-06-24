@@ -308,12 +308,12 @@
       }
       return nextScale;
     };
-    const restoreAnchor = () => {
-      if (!pinch) return;
+    const restoreAnchor = (anchor) => {
+      if (!anchor) return;
       const container = getContainer();
       if (!container) return;
-      container.scrollLeft = pinch.contentX * pinch.lastScale - pinch.localX;
-      container.scrollTop = pinch.contentY * pinch.lastScale - pinch.localY;
+      container.scrollLeft = anchor.contentX * anchor.lastScale - anchor.localX;
+      container.scrollTop = anchor.contentY * anchor.lastScale - anchor.localY;
     };
 
     const container = getContainer();
@@ -361,7 +361,9 @@
         const ratio = getDistance(event.touches) / pinch.startDistance;
         const nextScale = pinch.startScale * ratio;
         pinch.lastScale = setScaleWithoutJump(viewer, nextScale);
-        window.requestAnimationFrame(restoreAnchor);
+        const anchor = { ...pinch };
+        restoreAnchor(anchor);
+        window.requestAnimationFrame(() => restoreAnchor(anchor));
       },
       { capture: true, passive: false }
     );
