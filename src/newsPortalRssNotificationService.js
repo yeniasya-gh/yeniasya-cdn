@@ -26,6 +26,7 @@ class NewsPortalRssNotificationService {
     this.stateFile =
       options.stateFile || process.env.NEWS_PORTAL_STATE_FILE || DEFAULT_STATE_FILE;
     this.delayRange = options.delayRange || readDelayRange();
+    this.deliveryWindow = options.deliveryWindow || readDeliveryWindow();
     const dedicatedServiceAccountPath =
       options.serviceAccountPath || process.env.SONDAKIKA_FIREBASE_SERVICE_ACCOUNT;
     const dedicatedServiceAccountJson =
@@ -93,7 +94,7 @@ class NewsPortalRssNotificationService {
       );
       if (newItems.length > 0) {
         const selected = chooseRandom(newItems);
-        const scheduledAt = randomScheduledAt(this.now(), this.delayRange);
+        const scheduledAt = firstAllowedScheduledAt(this.now(), this.deliveryWindow);
         pending.push(createPendingNotification(selected, scheduledAt));
         existingPendingIds.add(selected.articleId);
         categoriesWithPending.add(categorySlug);
@@ -106,10 +107,17 @@ class NewsPortalRssNotificationService {
     }
 
     state.seenByCategory = seenByCategory;
-    state.pendingNotifications = [
+    const newlyScheduledIds = new Set(pending.map((item) => item.articleId));
+    state.pendingNotifications = spacePendingNotifications(
+      [
       ...(state.pendingNotifications || []),
       ...pending,
-    ].sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt));
+      ],
+      this.now(),
+      this.delayRange,
+      this.deliveryWindow,
+      getLastSentAt(state)
+    );
     state.updatedAt = this.now().toISOString();
 
     if (persist && !dryRun) {
@@ -122,9 +130,11 @@ class NewsPortalRssNotificationService {
       fetchedCount: items.length,
       categoryCount: Object.keys(grouped).length,
       scheduledCount: pending.length,
-      scheduled: pending,
+      scheduled: state.pendingNotifications.filter((item) =>
+        newlyScheduledIds.has(item.articleId)
+      ),
       skipped,
-      rules: notificationRules(this.delayRange),
+      rules: notificationRules(this.delayRange, this.deliveryWindow),
     };
   }
 
@@ -132,14 +142,42 @@ class NewsPortalRssNotificationService {
     const dryRun = options.dryRun === true;
     const persist = options.persist !== false;
     const state = await this.readState();
-    const nowIso = this.now().toISOString();
+    const now = this.now();
+    const nowIso = now.toISOString();
     const pending = state.pendingNotifications || [];
     const due = pending.filter((item) => item.scheduledAt <= nowIso);
     const future = pending.filter((item) => item.scheduledAt > nowIso);
     const sent = [];
     const failed = [];
 
-    for (const notification of due) {
+    if (!isWithinDeliveryWindow(now, this.deliveryWindow)) {
+      state.pendingNotifications = spacePendingNotifications(
+        pending,
+        nextDeliveryWindowStart(now, this.deliveryWindow),
+        this.delayRange,
+        this.deliveryWindow,
+        getLastSentAt(state)
+      );
+      state.updatedAt = nowIso;
+      if (persist && state.pendingNotifications.length > 0) {
+        await this.writeState(state);
+      }
+      return {
+        dryRun,
+        dueCount: due.length,
+        sentCount: 0,
+        failedCount: 0,
+        sent,
+        failed,
+        outsideDeliveryWindow: true,
+        deliveryWindow: formatDeliveryWindow(this.deliveryWindow),
+      };
+    }
+
+    const dispatchable = due.slice(0, 1);
+    const deferredDue = due.slice(1);
+
+    for (const notification of dispatchable) {
       try {
         const response = await this.fcmClient.sendTopicMessage({
           topic: notification.topic,
@@ -161,8 +199,12 @@ class NewsPortalRssNotificationService {
       }
     }
 
-    state.pendingNotifications = future.sort((a, b) =>
-      a.scheduledAt.localeCompare(b.scheduledAt)
+    state.pendingNotifications = spacePendingNotifications(
+      [...future, ...deferredDue, ...failed],
+      now,
+      this.delayRange,
+      this.deliveryWindow,
+      sent.length > 0 ? now : getLastSentAt(state)
     );
     state.sentNotifications = [
       ...sent.map((item) => ({
@@ -176,6 +218,9 @@ class NewsPortalRssNotificationService {
       })),
       ...(state.sentNotifications || []),
     ].slice(0, 500);
+    if (sent.length > 0) {
+      state.lastSentAt = nowIso;
+    }
     state.updatedAt = nowIso;
 
     if (persist && (!dryRun || sent.length === 0)) {
@@ -187,8 +232,10 @@ class NewsPortalRssNotificationService {
       dueCount: due.length,
       sentCount: sent.length,
       failedCount: failed.length,
+      deferredCount: deferredDue.length,
       sent,
       failed,
+      deliveryWindow: formatDeliveryWindow(this.deliveryWindow),
     };
   }
 
@@ -203,6 +250,7 @@ class NewsPortalRssNotificationService {
         seenByCategory: parsed.seenByCategory || {},
         pendingNotifications: parsed.pendingNotifications || [],
         sentNotifications: parsed.sentNotifications || [],
+        lastSentAt: parsed.lastSentAt || null,
         updatedAt: parsed.updatedAt || null,
       };
     } catch (error) {
@@ -233,6 +281,7 @@ function createEmptyState() {
     seenByCategory: {},
     pendingNotifications: [],
     sentNotifications: [],
+    lastSentAt: null,
     updatedAt: null,
   };
 }
@@ -346,11 +395,15 @@ function buildNotificationCondition(topic) {
   return `'breaking_all' in topics || '${normalizedTopic}' in topics`;
 }
 
-function notificationRules(delayRange = readDelayRange()) {
+function notificationRules(
+  delayRange = readDelayRange(),
+  deliveryWindow = readDeliveryWindow()
+) {
   return {
     rssUrl: DEFAULT_RSS_URL,
     checkFrequency: "hourly",
     dispatchFrequency: "every_minute",
+    deliveryWindow: formatDeliveryWindow(deliveryWindow),
     target: "fcm_topic_per_category",
     topicPattern: "feed_<category-slug>",
     firstRun: "seed_existing_items_without_sending",
@@ -363,6 +416,11 @@ function notificationRules(delayRange = readDelayRange()) {
       min: delayRange[0],
       max: delayRange[1],
     },
+    dispatchPolicy: {
+      maxPerDispatch: 1,
+      newItems: "schedule_immediately_when_inside_delivery_window",
+      pendingBacklog: "spread_with_random_gap_inside_delivery_window",
+    },
     duplicatePrevention: {
       seenArticleIdsPerCategory: 120,
       sentHistoryLimit: 500,
@@ -371,7 +429,10 @@ function notificationRules(delayRange = readDelayRange()) {
 }
 
 async function fetchRssItems(rssUrl) {
-  const response = await fetch(rssUrl, {
+  const response = await fetchWithRetry(rssUrl, {
+    attempts: 3,
+    timeoutMs: 20_000,
+    retryDelayMs: 2_000,
     headers: {
       "user-agent": "YeniAsyaHaberPortaliBackend/1.0 RSS notifier",
       accept: "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
@@ -381,6 +442,36 @@ async function fetchRssItems(rssUrl) {
     throw new Error(`RSS_FETCH_FAILED ${response.status}`);
   }
   return parseRssItems(await response.text());
+}
+
+async function fetchWithRetry(url, options = {}) {
+  const attempts = Math.max(1, Number(options.attempts || 1));
+  const timeoutMs = Math.max(1_000, Number(options.timeoutMs || 20_000));
+  const retryDelayMs = Math.max(0, Number(options.retryDelayMs || 0));
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, {
+        headers: options.headers,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) break;
+      await sleep(retryDelayMs * attempt);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw lastError || new Error("RSS_FETCH_FAILED");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseRssItems(xml) {
@@ -459,6 +550,160 @@ function randomScheduledAt(now, range) {
   return new Date(now.getTime() + offset * 60_000);
 }
 
+function firstAllowedScheduledAt(now, deliveryWindow = readDeliveryWindow()) {
+  return isWithinDeliveryWindow(now, deliveryWindow)
+    ? new Date(now.getTime())
+    : nextDeliveryWindowStart(now, deliveryWindow);
+}
+
+function spacePendingNotifications(
+  pending,
+  now,
+  range,
+  deliveryWindow = readDeliveryWindow(),
+  lastSentAt = null
+) {
+  const sorted = [...(pending || [])].sort((a, b) =>
+    String(a.scheduledAt || "").localeCompare(String(b.scheduledAt || ""))
+  );
+  const spaced = [];
+  let cursor = lastSentAt instanceof Date && !Number.isNaN(lastSentAt.getTime())
+    ? lastSentAt
+    : null;
+  const floor = now instanceof Date ? now : new Date(now);
+
+  for (const notification of sorted) {
+    let scheduledAt = parseDateOrFallback(notification.scheduledAt, floor);
+    if (scheduledAt < floor) {
+      scheduledAt = new Date(floor.getTime());
+    }
+    scheduledAt = clampToDeliveryWindow(scheduledAt, deliveryWindow);
+
+    if (cursor) {
+      const earliest = randomScheduledAt(cursor, range);
+      if (scheduledAt < earliest) {
+        scheduledAt = clampToDeliveryWindow(earliest, deliveryWindow);
+      }
+    }
+
+    cursor = scheduledAt;
+    spaced.push({
+      ...notification,
+      scheduledAt: scheduledAt.toISOString(),
+    });
+  }
+
+  return spaced.sort((a, b) => a.scheduledAt.localeCompare(b.scheduledAt));
+}
+
+function parseDateOrFallback(value, fallback) {
+  const parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed;
+  }
+  return new Date(fallback.getTime());
+}
+
+function clampToDeliveryWindow(value, deliveryWindow = readDeliveryWindow()) {
+  const date = parseDateOrFallback(value, new Date());
+  if (isWithinDeliveryWindow(date, deliveryWindow)) {
+    return date;
+  }
+  return nextDeliveryWindowStart(date, deliveryWindow);
+}
+
+function isWithinDeliveryWindow(date, deliveryWindow = readDeliveryWindow()) {
+  const minutes = date.getHours() * 60 + date.getMinutes();
+  const { startMinutes, endMinutes } = deliveryWindow;
+  if (startMinutes === endMinutes) return true;
+  if (startMinutes < endMinutes) {
+    return minutes >= startMinutes && minutes < endMinutes;
+  }
+  return minutes >= startMinutes || minutes < endMinutes;
+}
+
+function nextDeliveryWindowStart(date, deliveryWindow = readDeliveryWindow()) {
+  const next = new Date(date.getTime());
+  const minutes = next.getHours() * 60 + next.getMinutes();
+  const { startMinutes, endMinutes } = deliveryWindow;
+
+  if (startMinutes === endMinutes) {
+    return next;
+  }
+
+  if (startMinutes < endMinutes) {
+    if (minutes < startMinutes) {
+      setLocalMinutesOfDay(next, startMinutes);
+      return next;
+    }
+    next.setDate(next.getDate() + 1);
+    setLocalMinutesOfDay(next, startMinutes);
+    return next;
+  }
+
+  if (minutes >= endMinutes && minutes < startMinutes) {
+    setLocalMinutesOfDay(next, startMinutes);
+    return next;
+  }
+  next.setDate(next.getDate() + 1);
+  setLocalMinutesOfDay(next, startMinutes);
+  return next;
+}
+
+function setLocalMinutesOfDay(date, minutesOfDay) {
+  date.setHours(Math.floor(minutesOfDay / 60), minutesOfDay % 60, 0, 0);
+}
+
+function readDeliveryWindow() {
+  const raw = process.env.NEWS_PORTAL_DELIVERY_WINDOW || "08:00,00:00";
+  const [startRaw, endRaw] = raw.split(",");
+  return {
+    startMinutes: parseClockMinutes(startRaw || "08:00"),
+    endMinutes: normalizeEndClockMinutes(parseClockMinutes(endRaw || "00:00")),
+  };
+}
+
+function parseClockMinutes(value) {
+  const [hourRaw, minuteRaw] = String(value || "").trim().split(":");
+  const hour = Number.parseInt(hourRaw || "0", 10);
+  const minute = Number.parseInt(minuteRaw || "0", 10);
+  if (!Number.isFinite(hour) || hour < 0 || hour > 24) return 0;
+  if (!Number.isFinite(minute) || minute < 0 || minute > 59) return 0;
+  return Math.min(24 * 60, hour * 60 + minute);
+}
+
+function normalizeEndClockMinutes(minutes) {
+  return minutes === 0 ? 24 * 60 : minutes;
+}
+
+function formatDeliveryWindow(deliveryWindow = readDeliveryWindow()) {
+  return `${formatClockMinutes(deliveryWindow.startMinutes)}-${formatClockMinutes(
+    deliveryWindow.endMinutes === 24 * 60 ? 0 : deliveryWindow.endMinutes
+  )}`;
+}
+
+function formatClockMinutes(minutes) {
+  const normalized = ((minutes % (24 * 60)) + 24 * 60) % (24 * 60);
+  return `${String(Math.floor(normalized / 60)).padStart(2, "0")}:${String(
+    normalized % 60
+  ).padStart(2, "0")}`;
+}
+
+function getLastSentAt(state) {
+  const explicit = parseDateOrNull(state && state.lastSentAt);
+  if (explicit) return explicit;
+  const lastHistory = (state && state.sentNotifications || [])
+    .map((item) => parseDateOrNull(item.sentAt))
+    .filter(Boolean)
+    .sort((a, b) => b.getTime() - a.getTime())[0];
+  return lastHistory || null;
+}
+
+function parseDateOrNull(value) {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 function createServiceAccountJwt(serviceAccount, nowSeconds) {
   const header = { alg: "RS256", typ: "JWT" };
   const claims = {
@@ -481,7 +726,7 @@ function readDelayRange() {
   const raw =
     process.env.NEWS_PORTAL_RANDOM_DELAY_MINUTES ||
     process.env.NEWS_PORTAL_DELAY_MINUTES ||
-    "5,55";
+    "8,18";
   const [minRaw, maxRaw] = raw.split(",");
   const min = Number.parseInt(minRaw || "5", 10);
   const max = Number.parseInt(maxRaw || "55", 10);
@@ -613,9 +858,12 @@ module.exports = {
   fetchRssItems,
   groupByCategory,
   notificationRules,
+  firstAllowedScheduledAt,
   buildNotificationCondition,
+  isWithinDeliveryWindow,
   normalizeCategorySlug,
   parseRssItem,
   parseRssItems,
   randomScheduledAt,
+  spacePendingNotifications,
 };
