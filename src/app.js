@@ -828,6 +828,16 @@ const bunnyRequest = async (config, { retries = BUNNY_HTTP_RETRIES } = {}) => {
 
 const PUBLIC_TYPES = ["kitap", "gazete", "dergi", "ek", "slider", "profil"];
 const PRIVATE_TYPES = ["kitap", "gazete", "dergi", "ek"];
+const LEGACY_FILE_TYPE_ALIASES = {
+  book: "kitap",
+  books: "kitap",
+  magazine: "dergi",
+  magazines: "dergi",
+  newspaper: "gazete",
+  newspapers: "gazete",
+  supplement: "ek",
+  supplements: "ek",
+};
 const MANAGED_CDN_HOSTS = Array.from(
   new Set(
     [BUNNY_SETTINGS.cdnUrl, CDN_PUBLIC_HOST]
@@ -837,6 +847,11 @@ const MANAGED_CDN_HOSTS = Array.from(
 );
 
 const normalizeManagedFilePath = (value) => String(value || "").replace(/\/{2,}/g, "/");
+
+const normalizeFileType = (value) => {
+  const raw = String(value || "").trim().toLowerCase();
+  return LEGACY_FILE_TYPE_ALIASES[raw] || raw;
+};
 
 const decodePathSegment = (value) => {
   try {
@@ -878,16 +893,16 @@ const parseManagedFileReference = (input) => {
   const privateAliasMatch = normalizedPath.match(/^\/private\/([a-z0-9_-]+)\/([^/]+)$/i);
 
   if (directMatch) {
-    type = directMatch[1].toLowerCase();
+    type = normalizeFileType(directMatch[1]);
     scope = directMatch[2].toLowerCase();
     filename = directMatch[3];
   } else if (routedMatch) {
     scope = routedMatch[1].toLowerCase();
-    type = routedMatch[2].toLowerCase();
+    type = normalizeFileType(routedMatch[2]);
     filename = routedMatch[3];
   } else if (privateAliasMatch) {
     scope = "private";
-    type = privateAliasMatch[1].toLowerCase();
+    type = normalizeFileType(privateAliasMatch[1]);
     filename = privateAliasMatch[2];
   } else {
     return null;
@@ -919,10 +934,10 @@ const parsePrivatePath = (input) => {
   const m2 = cleaned.match(/^\/?([a-z0-9_-]+)\/private\/([^/]+)$/i);
 
   if (m1) {
-    type = m1[1].toLowerCase();
+    type = normalizeFileType(m1[1]);
     filename = m1[2];
   } else if (m2) {
-    type = m2[1].toLowerCase();
+    type = normalizeFileType(m2[1]);
     filename = m2[2];
   } else {
     return null;
