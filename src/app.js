@@ -951,8 +951,10 @@ const parsePrivatePath = (input) => {
   if (!type || !filename) return null;
 
   if (!PRIVATE_TYPES.includes(type)) return null;
+  const decodedFilename = decodePathSegment(filename);
+  if (!decodedFilename || /[/?#]/.test(decodedFilename)) return null;
 
-  return { type, filename };
+  return { type, filename: decodedFilename };
 };
 
 const sanitizeUrlForLog = (urlLike) => {
