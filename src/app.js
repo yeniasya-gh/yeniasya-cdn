@@ -932,6 +932,7 @@ const parsePrivatePath = (input) => {
 
   const m1 = cleaned.match(/^\/?private\/([a-z0-9_-]+)\/([^/]+)$/i);
   const m2 = cleaned.match(/^\/?([a-z0-9_-]+)\/private\/([^/]+)$/i);
+  const barePdfMatch = cleaned.match(/^\/?([^/]+\.pdf)$/i);
 
   if (m1) {
     type = normalizeFileType(m1[1]);
@@ -939,6 +940,9 @@ const parsePrivatePath = (input) => {
   } else if (m2) {
     type = normalizeFileType(m2[1]);
     filename = m2[2];
+  } else if (barePdfMatch) {
+    type = "kitap";
+    filename = barePdfMatch[1];
   } else {
     return null;
   }
